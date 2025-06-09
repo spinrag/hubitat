@@ -1,6 +1,6 @@
 # Spinrag Hubitat Drivers
 
-This repository contains custom Hubitat Elevation drivers developed and maintained by [Chris Ogden](https://github.com/spinrag) / Spinrag, LLC. These drivers are designed to enable integrations and capabilities not natively available in Hubitat — with a focus on local execution, stability, and simplicity.
+This repository contains custom Hubitat Elevation drivers developed and maintained by [Chris Ogden](https://github.com/ChrisOgden) / [spinrag](https://github.com/spinrag). These drivers are designed to enable integrations and capabilities not natively available in Hubitat — with a focus on local execution, stability, and simplicity.
 
 ---
 
@@ -60,4 +60,4 @@ Contributions and feedback are welcome!
 
 ---
 
-© 2025 Spinrag, LLC • Developed by [Chris Ogden](https://github.com/spinrag)
+© 2025 Spinrag, LLC • Developed by [Chris Ogden](https://github.com/ChrisOgden) / [spinrag](https://github.com/spinrag)

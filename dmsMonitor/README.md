@@ -66,7 +66,7 @@ Hubitat does not have a native way to alert you if it goes offline, crashes, or 
 
 ## 📜 License
 
-Apache 2.0 License. See the driver header for full terms.
+MIT License
 
 ---
 

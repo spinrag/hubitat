@@ -99,7 +99,7 @@ You cannot (currently) update multiple records in one driver instance — doing 
 
 ## 📜 License
 
-MIT License. See the `LICENSE` file for details.
+MIT License
 
 ---
 
