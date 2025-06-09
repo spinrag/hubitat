@@ -46,7 +46,7 @@ Alternatively, use the raw URLs in the `packageManifest.json` files if installin
 
 ## 📜 License
 
-- All drivers are licensed under the [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0)
+- All drivers are licensed under the [MIT License](https://opensource.org/license/mit)
 - See individual driver files for details
 
 ---

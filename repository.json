@@ -1,0 +1,17 @@
+{
+	"author": "Chris Ogden / spinrag",
+	"gitHubUrl": "https://github.com/spinrag",
+	"payPalUrl": "https://www.paypal.com/donate/?hosted_button_id=KMSQ9MZKEA9AN",	
+	"packages": [
+		{
+			"name": "DMS Monitor (Dead Man's Snitch)",
+			"description": "Sends scheduled heartbeat pings to Dead Man's Snitch to confirm that the Hubitat hub and internet connection are alive.",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dmsMonitor/packageManifest.json"
+		},
+		{
+			"name": "DNS Made Easy Updater",
+			"description": "Updates a DNS Made Easy A record with your public IP using Hubitat.",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json"
+		}
+	]
+}
