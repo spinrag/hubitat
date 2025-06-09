@@ -1,0 +1,13 @@
+{
+	"packages": [
+		{
+			"id": "dmsMonitor",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dmsMonitor/packageManifest.json"
+		},
+		{
+			"id": "dnsMadeEasyUpdater",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json"
+		}
+	]
+}
+  

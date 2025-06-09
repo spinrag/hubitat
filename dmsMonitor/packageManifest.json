@@ -1,0 +1,21 @@
+{
+	"packageName": "DMS Monitor (Dead Man's Snitch)",
+	"author": "Chris Ogden",
+	"namespace": "spinrag",
+	"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dmsMonitor/packageManifest.json",
+	"description": "Sends periodic heartbeat pings to Dead Man's Snitch to confirm that the Hubitat hub and internet connection are alive.",
+	"category": "System Monitoring",
+	"tags": ["heartbeat", "dead man's snitch", "hub monitor", "internet watchdog", "spinrag", "dms", "watchdog"],
+	"version": "1.0.0",
+	"drivers": [
+		{
+			"id": "dmsMonitor",
+			"name": "DMS Monitor (Dead Man's Snitch)",
+			"namespace": "spinrag",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dmsMonitor/driver.groovy",
+			"required": true,
+			"description": "Monitors internet and hub health by pinging a Dead Man's Snitch endpoint on a fixed schedule."
+		}
+	]
+}
+	

@@ -1,0 +1,21 @@
+{
+	"packageName": "DNS Made Easy Updater",
+	"author": "Chris Ogden",
+	"namespace": "spinrag",
+	"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json",
+	"description": "Updates a DNS Made Easy A record with your public IP using Hubitat.",
+	"category": "Networking",
+	"tags": ["ddns", "dns", "ip updater", "networking", "spinrag", "dns made easy"],
+	"version": "1.0.0",
+	"drivers": [
+		{
+			"id": "dnsMadeEasyUpdater",
+			"name": "DNS Made Easy Updater",
+			"namespace": "spinrag",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/driver.groovy",
+			"required": true,
+			"description": "Driver that updates DNS Made Easy A records with your current public IP."
+		}
+	]
+  }
+  
