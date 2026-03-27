@@ -478,10 +478,20 @@ void reconcileDoorCodes(Map bookings) {
 
     if (i == 0) {
         log.debug 'reconcileDoorCodes: No codes to reconcile'
+        atomicState.reconcileRetries = 0
         scheduleEvents(bookings)
     } else {
-        log.debug "reconcileDoorCodes: ${i} codes to reconcile"
-        runIn(++i * 60, 'reconcileDoorCodes', [ overwrite: true ])
+        int retries = (atomicState.reconcileRetries ?: 0) + 1
+        int maxRetries = 10
+        if (retries > maxRetries) {
+            log.warn "reconcileDoorCodes: max retries (${maxRetries}) reached, stopping retry loop"
+            atomicState.reconcileRetries = 0
+            scheduleEvents(bookings)
+        } else {
+            log.debug "reconcileDoorCodes: ${i} codes to reconcile (retry ${retries}/${maxRetries})"
+            atomicState.reconcileRetries = retries
+            runIn(++i * 60, 'reconcileDoorCodes', [ overwrite: true ])
+        }
     }
 }
 
@@ -890,6 +900,7 @@ Map apiSync() {
         log.debug "apiSync ${request.JSON}"
 
         atomicState.bookings = helperGetBookings(request.JSON)
+        atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
@@ -917,6 +928,7 @@ Map apiSyncPatch() {
         def combined = atomicState.bookings + request.JSON
 
         atomicState.bookings = helperGetBookings(combined)
+        atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
