@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.2.0-cto' } // major.minor.patch[-prerelease] 
+String getSbAppVersion() { '1.3.0' } // major.minor.patch[-prerelease] 
 
 import groovy.json.JsonOutput
 
