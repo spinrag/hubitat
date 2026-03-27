@@ -482,7 +482,7 @@ void reconcileDoorCodes(Map bookings) {
         scheduleEvents(bookings)
     } else {
         int retries = (atomicState.reconcileRetries ?: 0) + 1
-        int maxRetries = 10
+        int maxRetries = 4
         if (retries > maxRetries) {
             log.warn "reconcileDoorCodes: max retries (${maxRetries}) reached, stopping retry loop"
             atomicState.reconcileRetries = 0
