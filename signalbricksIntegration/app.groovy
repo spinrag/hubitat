@@ -490,7 +490,7 @@ void reconcileDoorCodes(Map bookings) {
         } else {
             log.debug "reconcileDoorCodes: ${i} codes to reconcile (retry ${retries}/${maxRetries})"
             atomicState.reconcileRetries = retries
-            runIn(++i * 60, 'reconcileDoorCodes', [ overwrite: true ])
+            runIn(++i * 180, 'reconcileDoorCodes', [ overwrite: true ])
         }
     }
 }
