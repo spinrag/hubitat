@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.0' } // major.minor.patch[-prerelease] 
+String getSbAppVersion() { '1.3.1' } // major.minor.patch[-prerelease]
 
 import groovy.json.JsonOutput
 
@@ -128,7 +128,12 @@ void appButtonHandler(String btnName) {
             unsubscribe()
             unschedule()
             state.lastVersion = sbAppVersion
-            state.bookings = [:]
+            atomicState.bookings = [:]
+            atomicState.codeAssignments = [:]
+            atomicState.reconcileRetries = 0
+            // Re-establish subscriptions so codeChangedHandler still fires
+            // for any locks the user touches manually after the reset.
+            subscribeToEvents()
             break
         // Send a test webhook
         case 'btnTest':
@@ -269,16 +274,12 @@ void SyncState()
 
 void SyncState(Map bookings)
 {
-    // Only call if we've successfully connected to SignalBricks
-    if (atomicState.sbId) {
-        subscribeToEvents()
-        scheduleEvents(bookings)
-        refreshDoorCodes()
-    }
-    else {
-        unsubscribe()
-        unschedule()
-    }
+    // Subscriptions and schedules drive local door-code reconciliation and
+    // must run regardless of SignalBricks registration. Outbound posting is
+    // gated separately inside webhook().
+    subscribeToEvents()
+    scheduleEvents(bookings)
+    refreshDoorCodes()
 }
 
 // Subscribe to events for all locks
@@ -482,7 +483,10 @@ void reconcileDoorCodes(Map bookings) {
         scheduleEvents(bookings)
     } else {
         int retries = (atomicState.reconcileRetries ?: 0) + 1
-        int maxRetries = 4
+        // Per-code retry now lives inside trySetCode/verifySetCode (capped at
+        // sbMaxSetCodeAttempts), so this outer loop only needs to be a safety
+        // net for missed codeChangedHandler events. Raised from 4 to 20.
+        int maxRetries = 20
         if (retries > maxRetries) {
             log.warn "reconcileDoorCodes: max retries (${maxRetries}) reached, stopping retry loop"
             atomicState.reconcileRetries = 0
@@ -495,6 +499,12 @@ void reconcileDoorCodes(Map bookings) {
     }
 }
 
+// Maximum trySetCode attempts per (lockId, codePosition). Z-Wave can silently
+// drop setCode commands; we re-issue with backoff until codeChangedHandler
+// confirms ('added'/'changed') or this cap is hit. Keep this bounded so a
+// genuinely unreachable lock doesn't loop forever.
+int getSbMaxSetCodeAttempts() { 6 }
+
 void trySetCode(Map data) {
     log.debug "trySetCode (${data})"
 
@@ -505,6 +515,9 @@ void trySetCode(Map data) {
         return
     }
 
+    int attempt = (data.attempt ?: 0) + 1
+    int maxAttempts = sbMaxSetCodeAttempts
+
     lock.setCode(data.codePosition, data.code, data.codeName)
 
     // Track the assignment in state (lock drivers may not preserve code names)
@@ -514,10 +527,55 @@ void trySetCode(Map data) {
     assignments[lockKey]["${data.codePosition}"] = [
         bookingId: data.codeName?.find(/ORB\d+/) ?: 'unknown',
         code: data.code,
-        codeName: data.codeName
+        codeName: data.codeName,
+        attempt: attempt,
+        maxAttempts: maxAttempts,
+        confirmed: false,
     ]
     atomicState.codeAssignments = assignments
-    log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition}"
+    log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt}/${maxAttempts})"
+
+    // Schedule verification. If codeChangedHandler doesn't flip confirmed=true
+    // by the time this fires, verifySetCode re-issues setCode (until cap).
+    if (attempt < maxAttempts) {
+        Map retryData = [
+            lockId: data.lockId,
+            codePosition: data.codePosition,
+            code: data.code,
+            codeName: data.codeName,
+            attempt: attempt,
+        ]
+        // Backoff grows linearly with attempt #
+        runIn(60 + (attempt * 30), 'verifySetCode', [ overwrite: false, data: retryData ])
+    } else {
+        log.warn "trySetCode: max attempts (${maxAttempts}) reached for lock ${data.lockId} pos ${data.codePosition} — giving up"
+    }
+}
+
+// Verify that a previously-issued setCode actually took. If codeChangedHandler
+// already flipped confirmed=true, no-op. Otherwise, re-issue trySetCode (which
+// increments the attempt counter and reschedules another verify).
+void verifySetCode(Map data) {
+    log.debug "verifySetCode (${data})"
+
+    Map assignments = atomicState.codeAssignments ?: [:]
+    String lockKey = "${data.lockId}"
+    Map lockAssignments = assignments[lockKey] ?: [:]
+    Map a = lockAssignments["${data.codePosition}"]
+
+    // Assignment cleared (deleted, reset, or replaced) — stop retrying
+    if (!a) {
+        log.debug "verifySetCode: assignment cleared, stopping retry"
+        return
+    }
+
+    if (a.confirmed) {
+        log.debug "verifySetCode: already confirmed for lock ${data.lockId} pos ${data.codePosition}"
+        return
+    }
+
+    log.warn "verifySetCode: not confirmed for lock ${data.lockId} pos ${data.codePosition} after attempt ${a.attempt} — retrying"
+    trySetCode(data)
 }
 
 void tryDeleteCode(Map data) {
@@ -542,16 +600,19 @@ void tryDeleteCode(Map data) {
     }
 }
 
-// Send outbound webhook
+// Send outbound webhook to the SignalBricks platform.
+// When the hub isn't registered with SignalBricks (no sbId — current default
+// in the dispatcher-only deployment), we silently skip posting. We must NOT
+// unsubscribe()/unschedule() here: those operate app-wide and would also tear
+// down lock event subscriptions (codeChangedHandler — which confirms/retries
+// failed setCode calls) and any pending trySetCode/tryDeleteCode runIn jobs.
+// That bug caused atomicState.codeAssignments to drift optimistic while the
+// underlying locks never received the codes.
 void webhook(e) {
     log.debug "webhook: ${e.name}"
 
-    // Don't if we don't have an SignalBricks Id
-    // Authentication would fail anyway
     if (!state.sbId) {
-        log.debug "webhook: No SignalBricks ID"
-        unsubscribe()
-        unschedule()
+        log.debug "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
         return
     }
 
@@ -602,12 +663,30 @@ void codeChangedHandler(e) {
             if (assignment) {
                 if (e.value == 'added' || e.value == 'changed') {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
-                } else if (e.value == 'failed') {
-                    log.warn "codeChangedHandler: FAILED to set code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
-                    // Remove failed assignment so reconcile retries
-                    lockAssignments.remove(pos)
+                    assignment.confirmed = true
+                    lockAssignments[pos] = assignment
                     assignments[lockId] = lockAssignments
                     atomicState.codeAssignments = assignments
+                } else if (e.value == 'failed') {
+                    int attempt = (assignment.attempt ?: 0)
+                    int maxAttempts = (assignment.maxAttempts ?: sbMaxSetCodeAttempts)
+                    if (attempt < maxAttempts) {
+                        log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} (attempt ${attempt}/${maxAttempts}) — retrying"
+                        // Trigger an immediate retry rather than waiting for verifySetCode
+                        Map retryData = [
+                            lockId: lockId,
+                            codePosition: data.codeNumber instanceof Number ? data.codeNumber : pos.toInteger(),
+                            code: assignment.code,
+                            codeName: assignment.codeName,
+                            attempt: attempt,
+                        ]
+                        runIn(30, 'trySetCode', [ overwrite: false, data: retryData ])
+                    } else {
+                        log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} — max attempts reached, giving up"
+                        lockAssignments.remove(pos)
+                        assignments[lockId] = lockAssignments
+                        atomicState.codeAssignments = assignments
+                    }
                 } else if (e.value == 'deleted') {
                     log.info "codeChangedHandler: confirmed delete at pos ${pos} on lock ${lockId}"
                 }
