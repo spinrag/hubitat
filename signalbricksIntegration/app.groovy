@@ -68,9 +68,12 @@ preferences {
                 paragraph 'Please configure the locks before connecting to SignalBricks.'
             }
         }
+
+        section(title: 'Diagnostics') {
+            href(name: 'hrefDebug', title: 'Debug', description: 'API links, manual reconcile, reset state', page: 'debug')
+        }
     }
 
-    // Debug page must be navigated to manually
     page(name: 'debug', title: 'Debug')
 }
 
