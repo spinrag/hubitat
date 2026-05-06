@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.1' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.3.2' } // major.minor.patch[-prerelease]
 
 import groovy.json.JsonOutput
 
@@ -502,11 +502,12 @@ void reconcileDoorCodes(Map bookings) {
     }
 }
 
-// Maximum trySetCode attempts per (lockId, codePosition). Z-Wave can silently
-// drop setCode commands; we re-issue with backoff until codeChangedHandler
-// confirms ('added'/'changed') or this cap is hit. Keep this bounded so a
-// genuinely unreachable lock doesn't loop forever.
-int getSbMaxSetCodeAttempts() { 6 }
+// Maximum delay between trySetCode retries (seconds). Backoff grows linearly
+// with attempt # but is capped here so a stubborn lock keeps retrying at a
+// reasonable cadence rather than hours apart. There is NO cap on attempt
+// count — match upstream OwnerRez behavior of retrying until the lock
+// confirms (or the assignment is cleared by reconcile/btnReset/delete).
+int getSbMaxRetryDelaySec() { 600 }
 
 void trySetCode(Map data) {
     log.debug "trySetCode (${data})"
@@ -519,7 +520,6 @@ void trySetCode(Map data) {
     }
 
     int attempt = (data.attempt ?: 0) + 1
-    int maxAttempts = sbMaxSetCodeAttempts
 
     lock.setCode(data.codePosition, data.code, data.codeName)
 
@@ -532,27 +532,23 @@ void trySetCode(Map data) {
         code: data.code,
         codeName: data.codeName,
         attempt: attempt,
-        maxAttempts: maxAttempts,
         confirmed: false,
     ]
     atomicState.codeAssignments = assignments
-    log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt}/${maxAttempts})"
+    log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt})"
 
     // Schedule verification. If codeChangedHandler doesn't flip confirmed=true
-    // by the time this fires, verifySetCode re-issues setCode (until cap).
-    if (attempt < maxAttempts) {
-        Map retryData = [
-            lockId: data.lockId,
-            codePosition: data.codePosition,
-            code: data.code,
-            codeName: data.codeName,
-            attempt: attempt,
-        ]
-        // Backoff grows linearly with attempt #
-        runIn(60 + (attempt * 30), 'verifySetCode', [ overwrite: false, data: retryData ])
-    } else {
-        log.warn "trySetCode: max attempts (${maxAttempts}) reached for lock ${data.lockId} pos ${data.codePosition} — giving up"
-    }
+    // by the time this fires, verifySetCode re-issues setCode. Loop terminates
+    // only when the lock confirms or the assignment is cleared.
+    Map retryData = [
+        lockId: data.lockId,
+        codePosition: data.codePosition,
+        code: data.code,
+        codeName: data.codeName,
+        attempt: attempt,
+    ]
+    int delay = Math.min(60 + (attempt * 30), sbMaxRetryDelaySec)
+    runIn(delay, 'verifySetCode', [ overwrite: false, data: retryData ])
 }
 
 // Verify that a previously-issued setCode actually took. If codeChangedHandler
@@ -672,24 +668,16 @@ void codeChangedHandler(e) {
                     atomicState.codeAssignments = assignments
                 } else if (e.value == 'failed') {
                     int attempt = (assignment.attempt ?: 0)
-                    int maxAttempts = (assignment.maxAttempts ?: sbMaxSetCodeAttempts)
-                    if (attempt < maxAttempts) {
-                        log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} (attempt ${attempt}/${maxAttempts}) — retrying"
-                        // Trigger an immediate retry rather than waiting for verifySetCode
-                        Map retryData = [
-                            lockId: lockId,
-                            codePosition: data.codeNumber instanceof Number ? data.codeNumber : pos.toInteger(),
-                            code: assignment.code,
-                            codeName: assignment.codeName,
-                            attempt: attempt,
-                        ]
-                        runIn(30, 'trySetCode', [ overwrite: false, data: retryData ])
-                    } else {
-                        log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} — max attempts reached, giving up"
-                        lockAssignments.remove(pos)
-                        assignments[lockId] = lockAssignments
-                        atomicState.codeAssignments = assignments
-                    }
+                    log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} (attempt ${attempt}) — retrying"
+                    // Trigger an immediate retry rather than waiting for verifySetCode
+                    Map retryData = [
+                        lockId: lockId,
+                        codePosition: data.codeNumber instanceof Number ? data.codeNumber : pos.toInteger(),
+                        code: assignment.code,
+                        codeName: assignment.codeName,
+                        attempt: attempt,
+                    ]
+                    runIn(30, 'trySetCode', [ overwrite: false, data: retryData ])
                 } else if (e.value == 'deleted') {
                     log.info "codeChangedHandler: confirmed delete at pos ${pos} on lock ${lockId}"
                 }
