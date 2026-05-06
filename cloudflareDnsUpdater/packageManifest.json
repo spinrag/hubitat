@@ -1,0 +1,20 @@
+{
+	"packageName": "Cloudflare DNS Updater",
+	"author": "Chris Ogden",
+	"namespace": "spinrag",
+	"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/cloudflareDnsUpdater/packageManifest.json",
+	"description": "Updates an existing Cloudflare A or AAAA record with the hub's current public IP using a scoped API token. Update-only — never creates new records.",
+	"category": "Networking",
+	"tags": ["ddns", "dns", "cloudflare", "ip updater", "networking", "spinrag"],
+	"version": "1.0.0",
+	"drivers": [
+		{
+			"id": "cloudflareDnsUpdater",
+			"name": "Cloudflare DNS Updater",
+			"namespace": "spinrag",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/cloudflareDnsUpdater/driver.groovy",
+			"required": true,
+			"description": "Driver that updates an existing Cloudflare DNS record with the hub's current public IP."
+		}
+	]
+}

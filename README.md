@@ -29,6 +29,18 @@ Sends scheduled heartbeat pings to [Dead Man's Snitch](https://deadmanssnitch.co
 
 ---
 
+### 🔹 [Cloudflare DNS Updater](cloudflareDnsUpdater/README.md) — *driver*
+Updates an **existing** Cloudflare A or AAAA record with your current public IP. Same use case as the DNS Made Easy Updater, but for Cloudflare zones.
+
+- Uses a **scoped** Cloudflare API token (Zone:DNS:Edit on a single zone)
+- Update-only — refuses to create new records, warns explicitly when no matching record exists
+- Caches record ID after first lookup; skips API calls when IP is unchanged
+- Documented security model — see the README for what is and isn't protected
+
+📂 [`cloudflareDnsUpdater`](cloudflareDnsUpdater/)
+
+---
+
 ### 🔹 SignalBricks Integration — *app*
 Manages short-term-rental door codes on Z-Wave / Zigbee locks, driven by booking data pushed in from an external dispatcher (OwnerRez or compatible). Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -53,6 +65,7 @@ The two drivers above are compatible with [Hubitat Package Manager](https://hubi
 3. Search for:
    - `"DNS Made Easy Updater"`
    - `"DMS Monitor"`
+   - `"Cloudflare DNS Updater"`
 4. Follow prompts to install and configure
 
 Alternatively, use the raw URLs in the `packageManifest.json` files if installing manually. The SignalBricks app must be installed manually (see above).
