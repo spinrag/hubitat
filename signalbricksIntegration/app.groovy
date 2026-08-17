@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.2' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.3.3' } // major.minor.patch[-prerelease]
 
 import groovy.json.JsonOutput
 
@@ -452,10 +452,19 @@ void reconcileDoorCodes(Map bookings) {
 
                 // Is the booking missing from the list of codes
                 if (!sbCodes[bookingId]) {
-                    log.debug "reconcileDoorCodes: trySetCode ${booking}"
+                    // Get the next available code position. If the lock has no free
+                    // slot >= minCodePosition, availableCodePositions is exhausted and
+                    // returns null -> casting to int throws (GroovyCastException) and
+                    // aborts the whole reconcile. Guard it: warn and skip this booking.
+                    def nextPosition = availableCodePositions[index]
+                    if (nextPosition == null) {
+                        log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
+                        return // continue to next booking
+                    }
+                    index++
+                    int codePosition = nextPosition
 
-                    // Get the next available code position
-                    int codePosition = availableCodePositions[index++]
+                    log.debug "reconcileDoorCodes: trySetCode ${booking}"
 
                     // Create the code
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
@@ -1215,23 +1224,20 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
         }
 
         if (existing.name.contains('ORB')) {
-            // Match to existing SignalBricks code
-            String[] parts = existing.name.split('-')
-            String bId = parts[idAtEnd ? 1 : 0]
-            if (codeNamePrefix != '' && codeNamePrefix != null) {
-                log.debug('Strip prefix')
-                String strippedId = bId.substring(bId.indexOf('ORB'))
-                bId = strippedId
-            } else {
-                log.debug('Skip removing prefix')
-            }
-            String bookingId = bId
-            if (bookings && bookings.containsKey(bookingId)) {
-                // Only warn if the bookings overlap check-in to check-out
-                Map otherBooking = bookings[bookingId]
-                log.debug "helperHasDuplicateCode: checking active booking ${otherBooking}"
-                // Other booking is already active, so we only need to check that the check-out date is after the check-in date
-                return otherBooking.checkOut > booking.checkIn
+            // Extract the booking id with a regex (hyphen-safe) instead of splitting
+            // on '-', which threw when the guest name contained a hyphen (the id
+            // landed past parts[1], so substring(indexOf('ORB')) == substring(-1)).
+            // SignalBricks keys bookings by BARE digits, so capture group 1.
+            def m = (existing.name =~ /ORB(\d+)/)
+            if (m.find()) {
+                String bookingId = m.group(1)
+                if (bookings && bookings.containsKey(bookingId)) {
+                    // Only warn if the bookings overlap check-in to check-out
+                    Map otherBooking = bookings[bookingId]
+                    log.debug "helperHasDuplicateCode: checking active booking ${otherBooking}"
+                    // Other booking already active - only need check-out after check-in
+                    return otherBooking.checkOut > booking.checkIn
+                }
             }
         }
 
