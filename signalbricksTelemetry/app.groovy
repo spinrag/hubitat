@@ -29,14 +29,14 @@ import groovy.transform.Field
 @Field static final String OAUTH_CLIENT_ID = 'signalbricks-hubitat-telemetry'
 @Field static final String HUBITAT_STATE_REDIRECT = 'https://cloud.hubitat.com/oauth/stateredirect'
 @Field static final String DOCS_URL = 'https://github.com/spinrag/hubitat/blob/main/signalbricksTelemetry/README.md'
-// Keys whose values are door codes (PINs). Compared case-insensitively with
-// non-alphanumerics removed, so `code`, `usedCode`, `lock_codes`, `PIN` all
-// match, while `codeName` / `codeNumber` (slot and name) are kept. Lock drivers
-// put the code used in `data` on unlock, e.g. {"3":{"name":"Guest","code":"1234"}}.
-@Field static final Set<String> SECRET_KEYS = [
-    'code', 'codes', 'pin', 'pins', 'pincode', 'passcode', 'lockcode', 'lockcodes',
-    'usedcode', 'usercode', 'accesscode', 'doorcode', 'keypadcode',
-] as Set
+// Door-code (PIN) keys, matched exactly on the whole key, case-insensitively
+// (never substrings: errorCode, statusCode, codeNumber, codeName pass through).
+// Same rules as the platform's redactSecrets (signalbricks/platform#387).
+@Field static final Set<String> ALWAYS_SECRET_KEYS = ['pin', 'passcode', 'lockcodes', 'usedpin', 'door_codes', 'doorcodes'] as Set
+// `code` is ambiguous (PIN vs an error code), so it is only removed in lock
+// context: lock events, or a per-slot lock-code map {"3":{"name":"Guest","code":"1234"}}.
+@Field static final Set<String> LOCK_CONTEXT_SECRET_KEYS = ['code', 'usedcode'] as Set
+@Field static final Set<String> LOCK_EVENT_NAMES = ['lock', 'unlock', 'codechanged', 'lastcodename', 'lockcodes'] as Set
 
 definition(
     name: 'SignalBricks Telemetry',
@@ -171,7 +171,7 @@ void eventHandler(evt) {
         displayName: evt.displayName,
         source: evt.source,
         value: evt.value,
-        data: sanitizeData(evt.data),
+        data: sanitizeData(evt.data, evt.name),
         descriptionText: evt.descriptionText,
         isStateChange: evt.isStateChange,
         type: evt.type,
@@ -193,28 +193,39 @@ void eventHandler(evt) {
 }
 
 // Door codes (PINs) must never leave the hub. `evt.data` is a JSON string;
-// parse it and drop every secret key at any depth (slot numbers and code
-// names stay). Anything that isn't parseable JSON is dropped entirely rather
-// than sent raw. Applied to every event, not just locks.
-String sanitizeData(String raw) {
+// parse it and drop secret keys at any depth (slot numbers, code names, error
+// and status fields stay). Anything that isn't parseable JSON is dropped
+// entirely rather than sent raw. Applied to every event, not just locks.
+String sanitizeData(String raw, String eventName) {
     if (!raw) return null
     try {
-        return JsonOutput.toJson(stripSecrets(parseJson(raw)))
+        Boolean lockContext = LOCK_EVENT_NAMES.contains(eventName?.toLowerCase())
+        return JsonOutput.toJson(stripSecrets(parseJson(raw), lockContext))
     } catch (Exception e) {
         return null
     }
 }
 
-def stripSecrets(obj) {
+def stripSecrets(obj, Boolean lockContext) {
     if (obj instanceof Map) {
-        return obj.findAll { k, v -> !isSecretKey(k) }.collectEntries { k, v -> [(k): stripSecrets(v)] }
+        Boolean lockHere = lockContext || isLockCodeMap(obj)
+        return obj.findAll { k, v -> !isSecretKey(k, lockHere) }
+            .collectEntries { k, v -> [(k): stripSecrets(v, lockHere)] }
     }
-    if (obj instanceof List) return obj.collect { stripSecrets(it) }
+    if (obj instanceof List) return obj.collect { stripSecrets(it, lockContext) }
     return obj
 }
 
-Boolean isSecretKey(key) {
-    return SECRET_KEYS.contains(key.toString().toLowerCase().replaceAll(/[^a-z0-9]/, ''))
+Boolean isSecretKey(key, Boolean lockContext) {
+    String k = key.toString().toLowerCase()
+    return ALWAYS_SECRET_KEYS.contains(k) || (lockContext && LOCK_CONTEXT_SECRET_KEYS.contains(k))
+}
+
+// {"3":{"name":"Guest","code":"1234"}}: Hubitat's per-slot lock-code map.
+Boolean isLockCodeMap(Map obj) {
+    return !obj.isEmpty() && obj.every { k, v ->
+        k.toString() ==~ /\d+/ && v instanceof Map && v.keySet().any { it.toString().toLowerCase() == 'code' }
+    }
 }
 
 void postCallback(resp, Map data) {
