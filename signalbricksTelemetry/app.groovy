@@ -10,7 +10,8 @@
  * SignalBricks as the OAuth provider: "Connect to SignalBricks" opens the
  * SignalBricks portal, the user picks the organization/property/hub, and
  * Hubitat cloud forwards the authorization code to this app's /oauthCallback
- * mapping, which exchanges it for an ingestion token.
+ * mapping, which exchanges it for an ingestion token. The app is a public
+ * OAuth client and uses PKCE (S256); there is no client secret.
  *
  * Runs alongside the SignalBricks Integration (lock-code) app; the two are
  * independent.
@@ -23,10 +24,9 @@ import groovy.transform.Field
 
 @Field static final String APP_VERSION = '1.0.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
+// Public OAuth client (this source is public): no client secret. Each connect
+// is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
 @Field static final String OAUTH_CLIENT_ID = 'signalbricks-hubitat-telemetry'
-// Distributed in public source, so this is an app identifier rather than a
-// secret; each connection still requires a signed-in SignalBricks admin.
-@Field static final String OAUTH_CLIENT_SECRET = 'sggljDWsFqEcrWn3bBOjoCq7Sw9mg7ak'
 @Field static final String HUBITAT_STATE_REDIRECT = 'https://cloud.hubitat.com/oauth/stateredirect'
 @Field static final String DOCS_URL = 'https://github.com/spinrag/hubitat/blob/main/signalbricksTelemetry/README.md'
 
@@ -211,28 +211,57 @@ Boolean ensureAccessToken() {
     }
 }
 
+// PKCE (RFC 7636): code_verifier = 96 hex chars from three random UUIDs
+// (java.util.UUID.randomUUID() is backed by SecureRandom; ~366 bits). Hex is
+// within the unreserved charset and 96 is within the 43-128 length limit.
+String newCodeVerifier() {
+    return (1..3).collect { UUID.randomUUID().toString().replace('-', '') }.join('')
+}
+
+// code_challenge = BASE64URL(SHA-256(verifier)) without padding (S256 only; never `plain`).
+String codeChallengeFor(String verifier) {
+    byte[] digest = java.security.MessageDigest.getInstance('SHA-256').digest(verifier.getBytes('US-ASCII'))
+    return digest.encodeBase64().toString().replace('+', '-').replace('/', '_').replace('=', '')
+}
+
 String connectUrl() {
-    String cbState = "${getHubUID()}/apps/${app.id}/oauthCallback?access_token=${state.accessToken}"
+    // One verifier per connect attempt; kept until the callback uses it, so
+    // page re-renders don't invalidate a link the user already opened.
+    if (!state.pkceVerifier) state.pkceVerifier = newCodeVerifier()
+
+    // Same stateredirect pattern as other published Hubitat OAuth apps.
+    // SECURITY: stateRedirect contains this app's access token; never log it
+    // (or this URL).
+    String stateRedirect = URLEncoder.encode("${getHubUID()}/apps/${app.id}/oauthCallback?access_token=${state.accessToken}", 'UTF-8')
     Map query = [
         client_id: OAUTH_CLIENT_ID,
         redirect_uri: HUBITAT_STATE_REDIRECT,
         response_type: 'code',
-        state: cbState,
+        code_challenge: codeChallengeFor(state.pkceVerifier),
+        code_challenge_method: 'S256',
         hub_uid: getHubUID(),
         app_id: app.id.toString(),
         version: APP_VERSION,
         location: location?.name ?: '',
     ]
     String qs = query.collect { k, v -> "${k}=${URLEncoder.encode(v.toString(), 'UTF-8')}" }.join('&')
-    return "${SB_PORTAL_URL}/oauth/hubitat/authorize?${qs}"
+    return "${SB_PORTAL_URL}/oauth/hubitat/authorize?${qs}&state=${stateRedirect}"
 }
 
+// Never log `params` here: it carries the authorization code and this app's access_token.
 def oauthCallback() {
     String code = params.code
+    String verifier = state.pkceVerifier
+    // Single use: the next connect attempt gets a fresh verifier.
+    state.remove('pkceVerifier')
     if (params.error || !code) {
         String reason = params.error ?: 'no authorization code returned'
         log.warn "SignalBricks connect cancelled: ${reason}"
         return renderPage('Not connected', "SignalBricks did not authorize this hub (${escapeHtml(reason)}). You can close this window and try again from the app.")
+    }
+    if (!verifier) {
+        state.lastError = 'Connect session expired; start again from the app'
+        return renderPage('Not connected', 'This connect link is no longer valid. Close this window and click Connect to SignalBricks again in the app.')
     }
 
     Map tokenParams = [
@@ -244,7 +273,7 @@ def oauthCallback() {
             code: code,
             redirect_uri: HUBITAT_STATE_REDIRECT,
             client_id: OAUTH_CLIENT_ID,
-            client_secret: OAUTH_CLIENT_SECRET,
+            code_verifier: verifier,
         ]),
         timeout: 20,
     ]
