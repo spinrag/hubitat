@@ -56,6 +56,17 @@ Manages short-term-rental door codes on Z-Wave / Zigbee locks, driven by booking
 
 ---
 
+### 🔹 [SignalBricks Telemetry](signalbricksTelemetry/README.md) — *app*
+Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app.
+
+- One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste.
+- Never subscribes to `lockCodes`, never sends PINs, never controls devices
+- Non-blocking `asynchttpPost` delivery
+
+📂 [`signalbricksTelemetry`](signalbricksTelemetry/)
+
+---
+
 ## 🛠 Installation via Hubitat Package Manager (HPM)
 
 The two drivers above are compatible with [Hubitat Package Manager](https://hubitatpackagemanager.hubitatcommunity.com/):
@@ -66,6 +77,7 @@ The two drivers above are compatible with [Hubitat Package Manager](https://hubi
    - `"DNS Made Easy Updater"`
    - `"DMS Monitor"`
    - `"Cloudflare DNS Updater"`
+   - `"SignalBricks"` (SignalBricks Telemetry)
 4. Follow prompts to install and configure
 
 Alternatively, use the raw URLs in the `packageManifest.json` files if installing manually. The SignalBricks app must be installed manually (see above).

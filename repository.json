@@ -12,6 +12,13 @@
 			"name": "DNS Made Easy Updater",
 			"description": "Updates a DNS Made Easy A record with your public IP using Hubitat.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json"
+		},
+		{
+			"name": "SignalBricks Telemetry",
+			"description": "Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Never sends device commands or lock PINs.",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksTelemetry/packageManifest.json",
+			"category": "Integrations",
+			"tags": ["Cloud", "Locks", "Doors & Windows", "Temperature & Humidity", "Monitoring"]
 		}
 	]
 }
