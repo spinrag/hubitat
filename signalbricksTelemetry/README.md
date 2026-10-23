@@ -46,7 +46,7 @@ Each event is sent with `asynchttpPost` to the SignalBricks ingestion API (`http
 
 ## Privacy
 
-- **No PINs.** The app never subscribes to `lockCodes` and never reads or sends lock codes. `lastCodeName` is the *name* of the code that was used (for example, a guest or booking label), not the code.
+- **Door codes (PINs) are never sent; only the code slot/name used.** The app never subscribes to `lockCodes`. Lock drivers include the code used in an unlock event's `data`. Before sending any event, the app removes every code/PIN field from `data` (keeping slot numbers and code names) and drops `data` entirely if it can't be parsed. `lastCodeName` is the *name* of the code that was used (for example, a guest or booking label), not the code.
 - **Read-only.** The app sends no device commands and exposes no device-control endpoints. Its only endpoint is the one-time `/oauthCallback` used during Connect.
 - **No shared secret.** Connect uses OAuth with PKCE (S256), so the app doesn't need to store a client secret. The hub's own app access token in the OAuth `state` is used only by Hubitat cloud to route the callback, and is never logged.
 - The hub access token used during Connect is rotated immediately after the callback.

@@ -29,6 +29,14 @@ import groovy.transform.Field
 @Field static final String OAUTH_CLIENT_ID = 'signalbricks-hubitat-telemetry'
 @Field static final String HUBITAT_STATE_REDIRECT = 'https://cloud.hubitat.com/oauth/stateredirect'
 @Field static final String DOCS_URL = 'https://github.com/spinrag/hubitat/blob/main/signalbricksTelemetry/README.md'
+// Keys whose values are door codes (PINs). Compared case-insensitively with
+// non-alphanumerics removed, so `code`, `usedCode`, `lock_codes`, `PIN` all
+// match, while `codeName` / `codeNumber` (slot and name) are kept. Lock drivers
+// put the code used in `data` on unlock, e.g. {"3":{"name":"Guest","code":"1234"}}.
+@Field static final Set<String> SECRET_KEYS = [
+    'code', 'codes', 'pin', 'pins', 'pincode', 'passcode', 'lockcode', 'lockcodes',
+    'usedcode', 'usercode', 'accesscode', 'doorcode', 'keypadcode',
+] as Set
 
 definition(
     name: 'SignalBricks Telemetry',
@@ -163,7 +171,7 @@ void eventHandler(evt) {
         displayName: evt.displayName,
         source: evt.source,
         value: evt.value,
-        data: evt.data,
+        data: sanitizeData(evt.data),
         descriptionText: evt.descriptionText,
         isStateChange: evt.isStateChange,
         type: evt.type,
@@ -182,6 +190,31 @@ void eventHandler(evt) {
         timeout: 15,
     ]
     asynchttpPost('postCallback', params, [name: evt.name, deviceId: evt.deviceId])
+}
+
+// Door codes (PINs) must never leave the hub. `evt.data` is a JSON string;
+// parse it and drop every secret key at any depth (slot numbers and code
+// names stay). Anything that isn't parseable JSON is dropped entirely rather
+// than sent raw. Applied to every event, not just locks.
+String sanitizeData(String raw) {
+    if (!raw) return null
+    try {
+        return JsonOutput.toJson(stripSecrets(parseJson(raw)))
+    } catch (Exception e) {
+        return null
+    }
+}
+
+def stripSecrets(obj) {
+    if (obj instanceof Map) {
+        return obj.findAll { k, v -> !isSecretKey(k) }.collectEntries { k, v -> [(k): stripSecrets(v)] }
+    }
+    if (obj instanceof List) return obj.collect { stripSecrets(it) }
+    return obj
+}
+
+Boolean isSecretKey(key) {
+    return SECRET_KEYS.contains(key.toString().toLowerCase().replaceAll(/[^a-z0-9]/, ''))
 }
 
 void postCallback(resp, Map data) {

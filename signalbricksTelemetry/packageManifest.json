@@ -5,7 +5,7 @@
 	"minimumHEVersion": "2.5.0",
 	"dateReleased": "2026-10-23",
 	"documentationLink": "https://github.com/spinrag/hubitat/blob/main/signalbricksTelemetry/README.md",
-	"releaseNotes": "1.0.0 - Initial release. Read-only lock, contact, temperature, humidity and battery telemetry to SignalBricks with an OAuth (PKCE) Connect flow. The hub access token used during Connect is rotated immediately after the callback.",
+	"releaseNotes": "1.0.0 - Initial release. Read-only lock, contact, temperature, humidity and battery telemetry to SignalBricks with an OAuth (PKCE) Connect flow. The hub access token used during Connect is rotated immediately after the callback. Door codes (PINs) are stripped from event data before sending; only the code slot/name used is sent.",
 	"apps": [
 		{
 			"id": "1e0c002c-bb21-4946-af66-ec5c3ea4a5aa",
