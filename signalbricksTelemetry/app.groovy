@@ -250,6 +250,18 @@ String connectUrl() {
 
 // Never log `params` here: it carries the authorization code and this app's access_token.
 def oauthCallback() {
+    Map page = handleOauthCallback()
+    // The access token travelled in the authorize URL's `state`, so copies can
+    // sit in proxy/CDN access logs. /oauthCallback is the only inbound call
+    // this app needs, so replace the token once the callback has run (success
+    // or failure). createAccessToken() invalidates the previous token, the same
+    // behaviour signalbricksIntegration's "Refresh Access Token" button relies
+    // on. The next Connect builds a fresh `state` from the new token.
+    createAccessToken()
+    return page
+}
+
+Map handleOauthCallback() {
     String code = params.code
     String verifier = state.pkceVerifier
     // Single use: the next connect attempt gets a fresh verifier.
