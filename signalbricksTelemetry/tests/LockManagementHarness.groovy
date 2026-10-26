@@ -35,7 +35,11 @@ abstract class HubitatStub extends Script {
     String getFullApiServerUrl() { "https://cloud.hubitat.com/api/${getHubUID()}/apps/42" }
     def parseJson(String s) { new JsonSlurper().parseText(s) }
     String createAccessToken() { state.accessToken = 'tok-' + UUID.randomUUID(); state.accessToken }
-    void asynchttpPost(String cb, Map p, Map d) { posts << [cb: cb, params: p, data: d] }
+    Boolean throwOnPost = false
+    void asynchttpPost(String cb, Map p, Map d) {
+        if (throwOnPost) throw new IllegalArgumentException("post failed: ${p.body}")
+        posts << [cb: cb, params: p, data: d]
+    }
     String decrypt(String s) { throw new RuntimeException('no decrypt') }
 }
 
@@ -586,7 +590,7 @@ check('empty slot: prevName is null', pendingFor(20).prevName == null)
 tick()
 lock3.attrs.lockCodes = groovy.json.JsonOutput.toJson((new JsonSlurper().parseText(lock3.attrs.lockCodes) as Map) + ['20': [code: '91922229']])
 tick()
-check('unnamed foreign code -> slot_changed, not re-sent', results()[-1].d.reason == 'slot_changed' && results()[-1].d.slot == 20 && lock3.calls.count { it[0] == 'setCode' && it[1] == 20 } == 1)
+check('unnamed before and now -> slot_unnamed, not re-sent', results()[-1].d.reason == 'slot_unnamed' && results()[-1].d.slot == 20 && lock3.calls.count { it[0] == 'setCode' && it[1] == 20 } == 1)
 putSlot(20, null, null)
 
 // A driver that throws on re-send fails only that change, never logging the message
@@ -604,6 +608,21 @@ check('driver exception -> failed send_error, dropped', thrown != null && thrown
 check('exception logged by class name only', app.logged.any { it.toString().contains('IllegalStateException') } && !app.logged.any { it.toString().contains('91919191') || it.toString().contains('failed)') && it.toString().contains('setCode(') })
 check('other due change also handled and job rescheduled', results().any { it.d.slot == 21 && it.d.reason == 'send_error' } || (pendingFor(21) != null && verifyJobs().size() == 1))
 app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+
+// Both the check and its cleanup throw: the change is still dropped, nothing rethrown
+lock3.dropCommands = 99
+app.request = [JSON: [slot: 19, code: '91919192', name: 'SBM: Twice']]
+call('apiSetCode')
+tick()
+lock3.throwOnSet = true
+app.throwOnPost = true
+app.logged.clear()
+boolean rethrown = false
+try { tick() } catch (Exception e) { rethrown = true }
+lock3.throwOnSet = false
+app.throwOnPost = false
+check('double failure: not rethrown, change (and code) dropped', !rethrown && pendingFor(19) == null && !verifyJobs())
+check('double failure: logs key + class names only', app.logged.any { it.toString().contains('9:19') && it.toString().contains('IllegalArgumentException') } && !app.logged.any { it.toString().contains('91919192') || it.toString().contains('post failed') })
 
 // Done/update drops changes for locks no longer selected
 lock3.dropCommands = 99
@@ -643,7 +662,7 @@ app.appButtonHandler('btnDisconnect')
 check('disconnect reports and clears', results()[-1].d.reason == 'disconnected' && app.state.pendingCodeChanges == null)
 
 // No code anywhere outside app state
-List codes = ['91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
+List codes = ['91919192', '91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
 String everything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })

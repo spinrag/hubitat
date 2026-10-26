@@ -891,6 +891,9 @@ Map resolvePendingChange(Map p) {
     // Set: it may hold our name or the name it had before the request. An
     // unnamed code never counts as ours (it could be anyone's).
     String current = r.currentName
+    // Unnamed at request time and now: the hub can't tell whose code it is.
+    String requestName = p.action == 'delete' ? p.name : p.prevName
+    if (current == null && requestName == null) return refuse('slot_unnamed', 409, 'the slot holds an unnamed code; send a new request')
     Boolean ours = current != null && (current == p.name || (p.action == 'set' && current == p.prevName))
     if (!ours) return refuse('slot_changed', 409, 'the slot now holds a different code; send a new request')
     return r
@@ -1109,8 +1112,18 @@ void verifyCodeChanges() {
                 // Only the class name: exception messages can carry the
                 // command's arguments, i.e. the code.
                 log.warn "SignalBricks Telemetry: code change check failed for ${key} (${e.class.simpleName})"
-                Map p = pendingCodeChanges()[key]
-                if (p) finishCodeChange(p, 'failed', 'send_error', p.status == 'pending')
+                try {
+                    Map p = pendingCodeChanges()[key]
+                    if (p) finishCodeChange(p, 'failed', 'send_error', p.status == 'pending')
+                } catch (Exception e2) {
+                    // Cleanup failed too: drop the change (and its code) so the
+                    // job doesn't re-run it every second until it expires.
+                    log.warn "SignalBricks Telemetry: dropped code change ${key} after a second error (${e2.class.simpleName})"
+                    Map all = pendingCodeChanges()
+                    all.remove(key)
+                    if (all) state.pendingCodeChanges = all
+                    else state.remove('pendingCodeChanges')
+                }
             }
         }
     } finally {
