@@ -709,7 +709,10 @@ Boolean isBookingName(String name) {
 
 // Validates a /lockConfig body. Returns [config: Map] or [error: String].
 //   { admin: {from, to}, managed: {from, to},
-//     locks: { "<lockId>": { admin?: {from, to}, managed?: {from, to}, adopted?: [slot, ...] } } }
+//     locks: { "<lockId>": { admin?: {from, to}, managed?: {from, to}, adopted?: [slot, ...] }
+//              | { surveyOnly: true } } }
+// A surveyOnly lock (#532) is listed for reading only (/slots, /fingerprints):
+// every write, delete, reveal and retry on it is refused.
 // Ranges must stay within the hub-local ceiling. Adopted slots above it are
 // stored but stay refused until the operator approves them in the app UI.
 Map validateLockConfig(def body) {
@@ -728,6 +731,14 @@ Map validateLockConfig(def body) {
         if (!findCodeLock(lockId)) return [error: "lock ${lockId} is not selected for lock code management"]
         def v = entry.value
         if (!(v instanceof Map)) return [error: "lock ${lockId}: must be an object"]
+        if (v.containsKey('surveyOnly')) {
+            if (!(v.surveyOnly instanceof Boolean)) return [error: "lock ${lockId}: surveyOnly must be true or false"]
+            if (v.surveyOnly) {
+                if (v.keySet().any { it != 'surveyOnly' }) return [error: "lock ${lockId}: surveyOnly can't be combined with admin, managed or adopted"]
+                locksOut[lockId] = [surveyOnly: true]
+                continue
+            }
+        }
         Map lockAdmin = v.admin != null ? parseRange(v.admin) : admin
         Map lockManaged = v.managed != null ? parseRange(v.managed) : managed
         if (!lockAdmin || !lockManaged) return [error: "lock ${lockId}: invalid admin or managed range"]
@@ -792,11 +803,12 @@ Map pendingAdoptedOptions() {
 // lock not listed in config.locks (not onboarded) allows nothing: the global
 // ranges are only defaults for listed locks. Nothing above the ceiling is
 // allowed unless it is an adopted slot the operator approved in the app UI.
+// A surveyOnly lock (listed for reading only) allows nothing.
 String slotClass(String lockId, Integer slot) {
     Map cfg = state.lockConfig
     if (!cfg || slot == null) return null
     Map lockCfg = cfg.locks?.get(lockId)
-    if (!(lockCfg instanceof Map)) return null
+    if (!(lockCfg instanceof Map) || lockCfg.surveyOnly == true) return null
     Integer ceiling = managedCeiling()
     if ((lockCfg.adopted ?: []).collect { it as Integer }.contains(slot)) {
         if (slot <= ceiling || approvedAdoptedKeys().contains("${lockId}:${slot}".toString())) return 'adopted'
@@ -835,6 +847,11 @@ Map readLockCodes(lock) {
     } catch (Exception e) {
         return null
     }
+}
+
+Boolean isSurveyOnly(String lockId) {
+    def l = state.lockConfig?.locks?.get(lockId)
+    return l instanceof Map && l.surveyOnly == true
 }
 
 Integer maxCodesOf(lock) {
@@ -907,7 +924,7 @@ Map apiListSlots() {
         String cls = isBookingName(name) ? null : slotClass(lock.id.toString(), slot)
         [slot: slot, name: name, set: set, allowedAs: cls]
     }.sort { it.slot }
-    return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), slots: slots])
+    return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), surveyOnly: isSurveyOnly(lock.id.toString()), slots: slots])
 }
 
 // HMAC-SHA256(fingerprintKey, code) as lower-case hex, first 16 characters.
@@ -921,8 +938,9 @@ String codeFingerprint(byte[] key, String code) {
 
 // Fingerprints of the occupied slots SignalBricks may manage (slotClass
 // non-null: a listed lock's ranges within the ceiling, or allowed adopted
-// slots), never booking-code names. Unmarked codes in the ranges are included,
-// so onboarding can group them before adopting. Never returns or logs codes.
+// slots), or on a surveyOnly lock every occupied slot within the ceiling;
+// never booking-code names. Unmarked codes are included, so onboarding can
+// group them before adopting. Never returns or logs codes.
 Map apiListFingerprints() {
     if (!lockManagementActive()) return notEnabled()
     if (rateLimited('fingerprintTimes', FINGERPRINT_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
@@ -933,13 +951,16 @@ Map apiListFingerprints() {
     if (codes == null) return jsonResponse([error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'], 409)
     byte[] key = state.fingerprintKey.toString().decodeBase64()
     String lockId = lock.id.toString()
+    Boolean survey = isSurveyOnly(lockId)
+    Integer ceiling = managedCeiling()
     List slots = []
     codes.each { k, v ->
         if (!(k.toString() ==~ /\d{1,4}/) || !(v instanceof Map)) return
         String code = v.code?.toString()
         if (!code) return
         Integer slot = k.toString().toInteger()
-        if (isBookingName(v.name?.toString()) || !slotClass(lockId, slot)) return
+        if (isBookingName(v.name?.toString())) return
+        if (survey ? slot > ceiling : !slotClass(lockId, slot)) return
         slots << [slot: slot, fp: codeFingerprint(key, code)]
     }
     return jsonResponse([lockId: lockId, slots: slots.sort { it.slot }])

@@ -877,6 +877,76 @@ app.params = [lockId: '10', slot: '1']
 check('fp: reveal has its own bucket', app.apiRevealCode().status == 200)
 app.state.fingerprintTimes = []
 
+// Survey-only locks: listed for reading (slots, fingerprints), never written
+def lockD = new FakeLock(id: '13', displayName: 'FpD', name: 'FpD', label: 'FpD')
+lockD.attrs.maxCodes = 250
+lockD.attrs.lockCodes = groovy.json.JsonOutput.toJson([
+    '1': [name: 'Old', code: '12340001'],
+    '2': [name: 'Someone', code: '55550002'],
+    '5': [name: 'ORB9-Guest', code: '55550005'],
+    '6': [name: 'Empty', code: ''],
+    '12': [name: 'SBM: Cleaner', code: '12340012'],
+    '30': [name: 'Above', code: '55550030'],
+])
+app.codeLocks = [lockA, lockB, lockC, lockD]
+fpCodes += ['55550005', '91930003', '91930004']
+app.state.fingerprintTimes = []; app.state.writeTimes = []; app.state.revealTimes = []; app.state.retryTimes = []
+[[surveyOnly: true, adopted: [1]], [surveyOnly: true, admin: [from: 1, to: 10]], [surveyOnly: 'yes'], [surveyOnly: 1]].each { e ->
+    app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': e]]]
+    check("survey: invalid entry ${e} -> 400", fcall('apiSetLockConfig').status == 400 && app.state.lockConfig.locks['13'] == null)
+}
+// A normal lock with a change in flight, then switched to survey-only
+app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': [:]]]]
+fcall('apiSetLockConfig')
+app.params = [lockId: '13']
+app.request = [JSON: [slot: 3, code: '91930003', name: 'SBA: Pending']]
+check('survey: normal lock accepts a set', fcall('apiSetCode').status == 202 && app.state.pendingCodeChanges['13:3'])
+int dSets = lockD.calls.size()
+Map surveyCfg = fpCfg + [locks: fpCfg.locks + ['13': [surveyOnly: true]]]
+app.request = [JSON: surveyCfg]
+def sv = fcall('apiSetLockConfig')
+check('survey: entry accepted and stored as {surveyOnly: true}', sv.status == 200 && body(sv).config.locks['13'] == [surveyOnly: true])
+check('survey: switching drops the in-flight change, reported failed', app.state.pendingCodeChanges?.get('13:3') == null && results().any { it.d.lockId == '13' && it.d.slot == 3 && it.d.reason == 'slot_not_allowed' })
+app.verifyCodeChanges()
+check('survey: verify sends nothing to it', lockD.calls.size() == dSets)
+def svSlots = fcall('apiListSlots')
+check('survey: /slots readable, surveyOnly flag, nothing allowed', svSlots.status == 200 && body(svSlots).surveyOnly == true && body(svSlots).slots.every { it.allowedAs == null } && !svSlots.data.contains('12340001'))
+app.params = [lockId: '10']
+check('survey: other locks report surveyOnly false', body(fcall('apiListSlots')).surveyOnly == false)
+app.params = [lockId: '13']
+def svFp = fcall('apiListFingerprints')
+check('survey: fingerprints for occupied in-ceiling slots, no booking/empty/above', svFp.status == 200 && body(svFp).slots*.slot == [1, 2, 12])
+check('survey: fp comparable with onboarded locks', body(svFp).slots.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001'))
+app.request = [JSON: [slot: 2, code: '91930004', name: 'SBA: Take']]
+def svSet = fcall('apiSetCode')
+check('survey: set on occupied slot -> 403 slot_not_allowed', svSet.status == 403 && body(svSet).error == 'slot_not_allowed')
+app.request = [JSON: [slot: 3, code: '91930004', name: 'SBA: New']]
+check('survey: set on empty slot -> 403', fcall('apiSetCode').status == 403)
+app.request = [JSON: [slot: 12, code: '91930004', name: 'SBM: Cleaner']]
+check('survey: set over SBM: code -> 403', fcall('apiSetCode').status == 403)
+app.params = [lockId: '13', slot: '12']
+app.request = [:]
+check('survey: delete -> 403', body(fcall('apiDeleteCode')).error == 'slot_not_allowed')
+def svRev = app.apiRevealCode()
+check('survey: reveal -> 403, no code', svRev.status == 403 && !svRev.data.contains('12340012'))
+// A held failed change (e.g. from before the switch) can't be retried
+app.state.pendingCodeChanges = ['13:12': [lockId: '13', slot: 12, action: 'set', name: 'SBM: Cleaner', prevName: 'SBM: Cleaner', code: '91930004', requestId: R1, attempts: 3, createdAt: app.now(), status: 'failed', seq: 1]]
+def svRetry = fcall('apiRetryCode')
+check('survey: retry -> 403 and dropped, nothing sent', svRetry.status == 403 && app.state.pendingCodeChanges == null && lockD.calls.size() == dSets)
+// Onboarding replaces the entry with a normal one: writes allowed again
+app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': [:]]]]
+fcall('apiSetLockConfig')
+app.params = [lockId: '13']
+check('survey: switched to normal -> slots allowed', body(fcall('apiListSlots')).slots.find { it.slot == 12 }.allowedAs == 'managed' && body(fcall('apiListSlots')).surveyOnly == false)
+app.request = [JSON: [slot: 3, code: '91930003', name: 'SBA: Onboarded']]
+check('survey: switched to normal -> set ok', fcall('apiSetCode').status == 202)
+check('survey: normal lock fingerprints follow the ranges', body(fcall('apiListFingerprints')).slots*.slot == [1, 2, 12])
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+app.codeLocks = [lockA, lockB, lockC]
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+app.state.fingerprintTimes = []
+
 // Off -> 404
 app.lockManagementEnabled = false
 app.params = [lockId: '10']
