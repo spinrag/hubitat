@@ -137,10 +137,14 @@ Neither the event nor the `202` ever contains the code.
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.2.0", "lockManagement": true}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.2.1", "lockManagement": true}
 ```
 
+Since 1.2.1 it does this only while lock code management is on, or to send a disable (`lockManagement: false`) when an earlier enable may still be stored. A hub that has never used lock code management doesn't register at all.
+
 SignalBricks accepts it only with the ingestion token the Connect flow issued for this hub and app. It stores the endpoint and token encrypted against that hub, and never logs or returns them. The app sends tokens only to an `https://` ingest URL.
+
+Hubs connected before lock code management existed (signalbricks/platform#505) hold a token without that binding. SignalBricks answers their enable with `403 TOKEN_NOT_BOUND_TO_APP`, and their disable with `200` and `reconnect_required: true`, storing nothing and leaving any existing registration as it is (signalbricks/platform#522). In either case the app shows **Reconnect to SignalBricks to enable lock management** and doesn't retry. Reconnect, then turn lock code management on.
 
 ### Encrypted lock codes
 
@@ -169,6 +173,7 @@ It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It 
 
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
 - **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** (turn lock code management off first if it's on).
+- **"Reconnect to SignalBricks to enable lock management"**: this hub was connected before lock code management existed, so its token can't enable it. Turn lock code management off, click **Reconnect to SignalBricks**, then turn it back on and click **Done**. Telemetry keeps working meanwhile.
 - **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
 - **A code change failed** (`lock_code_result` with `result: "failed"`): check the lock is awake and in range of the hub, then retry from SignalBricks. Changes that failed with `not_applied` or `lock_codes_unreadable` can be retried without re-entering the code for 24 hours; other failures need a new request. `Code changes awaiting the lock` in the app shows how many are in progress or failed.
 - **Slots answer `409 lock_codes_unreadable`**: see [Encrypted lock codes](#encrypted-lock-codes).
