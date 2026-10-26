@@ -4,6 +4,13 @@
 	"payPalUrl": "https://www.paypal.com/donate/?hosted_button_id=KMSQ9MZKEA9AN",	
 	"packages": [
 		{
+			"name": "Cloudflare DNS Updater",
+			"description": "Updates an existing Cloudflare A or AAAA record with the hub's current public IP using a scoped API token. Update-only — never creates new records.",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/cloudflareDnsUpdater/packageManifest.json",
+			"category": "Networking",
+			"tags": ["ddns", "dns", "cloudflare", "ip updater", "networking", "spinrag"]
+		},
+		{
 			"name": "DMS Monitor (Dead Man's Snitch)",
 			"description": "Sends scheduled heartbeat pings to Dead Man's Snitch to confirm that the Hubitat hub and internet connection are alive.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dmsMonitor/packageManifest.json"

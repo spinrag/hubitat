@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # groovy:4.0-jdk17, pinned by digest
+  GROOVY_IMAGE: groovy:4.0-jdk17@sha256:28031547378e492f8b555576950aa44e46f94605acc8387b2822c1468bb2fbad
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  harness:
+    name: Harness tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run every */tests/*Harness.groovy against its app
+        run: |
+          shopt -s nullglob
+          harnesses=(*/tests/*Harness.groovy)
+          if [ ${#harnesses[@]} -eq 0 ]; then echo "No harnesses found"; exit 1; fi
+          status=0
+          for h in "${harnesses[@]}"; do
+            dir="${h%%/*}"
+            src="app.groovy"
+            [ -f "$dir/$src" ] || src="driver.groovy"
+            echo "::group::$h ($dir/$src)"
+            set +e
+            out=$(docker run --rm --network none -v "$PWD/$dir:/w:ro" "$GROOVY_IMAGE" \
+              groovy "/w/tests/$(basename "$h")" "/w/$src" 2>&1)
+            rc=$?
+            set -e
+            echo "$out"
+            echo "::endgroup::"
+            if [ $rc -ne 0 ] || grep -q '^FAIL' <<<"$out"; then
+              echo "::error file=$h::harness failed (exit $rc)"
+              status=1
+            fi
+          done
+          exit $status
+
+  groovy-compile:
+    name: Groovy compile check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile every app and driver
+        run: |
+          mapfile -t files < <(git ls-files '*.groovy' ':!:*/tests/*' ':!:.github/*')
+          docker run --rm --network none -v "$PWD:/w:ro" -w /w "$GROOVY_IMAGE" \
+            groovy .github/scripts/groovy-parse-check.groovy "${files[@]}"
+
+  manifests:
+    name: Manifest checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check packageManifest.json and repository.json
+        run: python3 .github/scripts/check-manifests.py
+
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tarball"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan full history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --verbose .'

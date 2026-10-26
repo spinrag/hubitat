@@ -85,6 +85,28 @@ Alternatively, use the raw URLs in the `packageManifest.json` files if installin
 
 ---
 
+## ✅ CI
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`:
+
+- **Harness tests** — every `*/tests/*Harness.groovy` runs against its app in the `groovy:4.0-jdk17` container with networking disabled; any `FAIL` line or non-zero exit fails the build.
+- **Groovy compile check** — every `app.groovy` / `driver.groovy` is compiled as a plain Groovy script ([`groovy-parse-check.groovy`](.github/scripts/groovy-parse-check.groovy)). Hubitat's DSL is just method calls, so no stubs are needed; it catches syntax errors and unresolvable imports, not runtime behaviour.
+- **Manifest checks** — [`check-manifests.py`](.github/scripts/check-manifests.py): manifests and `repository.json` are valid JSON, manifest locations point at files in this repo, each app's version in source matches its `packageManifest.json`, `repository.json` entries point at existing manifests, and every manifest is listed in `repository.json`.
+- **Secret scan** — [gitleaks](https://github.com/gitleaks/gitleaks) over the full git history. Reviewed false positives go in [`.gitleaksignore`](.gitleaksignore).
+
+Run the same checks locally from the repository root:
+
+```bash
+python3 .github/scripts/check-manifests.py
+docker run --rm --network none -v "$PWD:/w:ro" -w /w groovy:4.0-jdk17 \
+  groovy .github/scripts/groovy-parse-check.groovy $(git ls-files '*.groovy' ':!:*/tests/*' ':!:.github/*')
+gitleaks git --redact .
+```
+
+When you bump an app's version, update its `packageManifest.json` in the same change or CI fails.
+
+---
+
 ## 📜 License
 
 - All drivers are licensed under the [MIT License](https://opensource.org/license/mit)
