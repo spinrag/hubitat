@@ -4,7 +4,7 @@ A Hubitat Elevation app that sends read-only device telemetry to [SignalBricks](
 
 It runs alongside the **SignalBricks Integration** (lock-code) app. The two apps are independent. Telemetry never controls devices.
 
-Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional).
+Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results).
 
 ## Requirements
 
@@ -83,7 +83,7 @@ The hub decides which slots may be touched. Anyone holding the app's access toke
 - **Existing codes:** in the admin and managed ranges, a slot holding a code without that range's `SBA:`/`SBM:` marker can't be overwritten, deleted or revealed until it is adopted. Empty slots may be written. `/slots` still reports `allowedAs` (admin/managed) for such slots, based on the range alone, even though writes refuse them (`403 slot_not_managed`) until they are adopted.
 - Codes must be 4 to 10 digits. Slots above the lock's `maxCodes` are refused.
 - **Reveal** returns one slot's code, only for `SBA:`/`SBM:` codes in their ranges or allowed adopted slots, at most 10 times a minute across the app (`429` beyond that).
-- Codes are never logged, never stored by the app and never sent as telemetry. Logs record the lock and slot only.
+- Codes are never logged and never sent as telemetry or in result events. Logs record the lock and slot only. While a set is being verified (and for up to 24 hours if it fails), the app keeps that one code in its own state so it can re-send it. See [Verification and results](#verification-and-results).
 
 Recommended layout (signalbricks/platform#472): admin slots 1–10, managed 11–25, and the booking apps' **Minimum code position** set to 26 so booking codes fill upward from there.
 
@@ -95,20 +95,49 @@ All are served from the hub's cloud endpoint (`https://cloud.hubitat.com/api/<hu
 |---|---|---|
 | `GET` | `/locks` | `{locks: [{id, name, label, maxCodes}]}` |
 | `GET` | `/locks/:id/slots` | `{lockId, maxCodes, slots: [{slot, name, set, allowedAs}]}`. `allowedAs` is `admin`, `managed`, `adopted` or `null`. Never code values. |
-| `POST` | `/locks/:id/codes` | `{slot, code, name}` → `202 {lockId, slot, status: "pending"}`. The lock confirms asynchronously: re-read `/slots`. |
-| `DELETE` | `/locks/:id/codes/:slot` | → `202 {lockId, slot, status: "pending"}` |
+| `POST` | `/locks/:id/codes` | `{slot, code, name, requestId?}` → `202 {lockId, slot, status: "pending", requestId}`. The hub verifies the change and sends a `lock_code_result` event. |
+| `DELETE` | `/locks/:id/codes/:slot` | Optional `?requestId=<uuid>` (or `{requestId}` JSON body) → `202 {lockId, slot, status: "pending", requestId}` |
+| `POST` | `/locks/:id/codes/:slot/retry` | No body needed. Re-sends the hub's own pending or failed change for that slot → `202 {lockId, slot, action, status: "pending", requestId}`. `404 no_pending_change` if nothing is pending (confirmed, superseded, expired or no longer allowed). `409 slot_changed` if the slot now holds someone else's code. |
 | `GET` | `/locks/:id/codes/:slot/reveal` | `{lockId, slot, name, code}`; `429` when rate-limited |
 | `GET` | `/lockConfig` | `{config, ceiling, pendingApproval}`. `config` is `null` until set. `pendingApproval` lists `"<lockId>:<slot>"` adopted slots above the ceiling that the operator hasn't approved. |
 | `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]}}}` replaces the rules and returns the same shape as `GET`. Only locks listed in `locks` (use `{}` to take the default ranges) can be written or revealed. Ranges must not overlap and must stay within 1..ceiling. Lock ids must be selected for lock code management. Otherwise `400` with a message. |
 
-Errors: `400` invalid input, `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot, `409` lock codes unreadable (see below), `429` reveal rate limit.
+Errors: `400` invalid input (including `invalid_request_id`), `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot / `no_pending_change`, `409` lock codes unreadable (see below) or `slot_changed` (retry), `429` reveal, retry or write rate limit, or `too_many_pending`.
+
+### Verification and results
+
+Added in 1.2.0 (signalbricks/platform#520). Z-Wave locks sometimes drop code changes silently, so the hub checks each one itself.
+
+- **Request id.** `POST /codes` and `DELETE /codes/:slot` accept an optional `requestId` (a UUID, any case; stored lower-case). Without one, the hub generates a UUID. Either way it comes back in the `202` and in every result event for that change. Send a new id for each request.
+- **One pending change per lock and slot.** A new set or delete for the same slot replaces the old one, and the old one is reported `superseded` (if it was still being verified). A request that is refused (`400`/`403`/`429`) leaves the existing change alone.
+- **Limits.** Set and delete together are limited to 30 requests a minute across the app (`429 rate_limited`; reveal and retry have their own limits). At most 100 changes can be held at once; past that a new set or delete for another slot gets `429 too_many_pending` (one replacing a held change for the same slot is still allowed).
+- **Verify.** About 30 seconds after the command, the hub re-reads that slot from the lock's `lockCodes` (decrypted as for `/slots`). A set is **confirmed** when the slot holds the expected name **and** the code that was sent. A delete is confirmed when the slot is empty. Names and codes are compared as strings, so `0123` never matches `123`. The one exception: if a driver reports the code as a JSON number (it has then already lost any leading zeros), that number is compared with the sent code without its leading zeros. If it is not confirmed yet, the hub checks again at the attempt's final check: 120 s after attempt 1, 150 s after attempt 2 and 180 s after attempt 3.
+- **Retry.** If the final check fails, the hub re-sends the command, up to **3 attempts in total**. Before each re-send it re-applies the same slot rules as a new request (ceiling, ranges, `SBA:`/`SBM:` names, booking guard). It also checks the slot hasn't been taken over: for a delete, the slot must still hold the name it had at request time; for a set, it must be empty or hold either the requested name or the name it had before the request. A code without a name never counts as the change's own: if the slot had no name at request time and holds an unnamed code now, the reason is `slot_unnamed` (the hub can't tell whose code it is), otherwise `slot_changed`. Neither is re-sent. Otherwise it stops and reports `failed` with `slot_changed` or that rule's error as the reason. A change is settled within about 7.5 minutes of the request.
+- **Retry endpoint.** `POST /locks/:id/codes/:slot/retry` re-sends the hub's stored change. It needs no code, applies the same rules (including the `slot_changed` check), resets the attempt count to 1 and keeps the same `requestId`. If the change can no longer be sent, the endpoint returns the error and drops it (reporting `failed` only if it was still in progress). It is limited to 10 calls a minute across the app (`429`).
+- **Code retention.** A pending set keeps its code in the app's state only, never in logs, events or responses. It is dropped when the change is confirmed, superseded (including by a delete), when lock code management is turned off, on **Disconnect**, or 24 hours after the original request. Changes that failed because the lock didn't apply them (`not_applied`) or its codes couldn't be read (`lock_codes_unreadable`) are kept until then so the retry endpoint can re-send them. Changes that failed for any other reason (the slot is no longer allowed or was taken over, the lock was removed, management turned off, Disconnect) are dropped at once, code included, because a retry could never succeed. A `POST /lockConfig` that stops allowing a slot drops its change too, reporting `failed` (`slot_not_allowed`) if it was in progress. Retries don't extend the 24 hours.
+- **Who can see a pending code.** Hub admins can see the app's state, including a pending set's code, under the app's **App Status** page (the gear icon). That is the same exposure as the lock's own `lockCodes` on its device page, which already shows every code.
+- **Done / app updates** reschedule the checks for changes still in progress. They also drop every held change (failed ones too) for a lock that is no longer selected for lock code management, reporting `failed` (`lock_not_found`) for one still in progress. One scheduled job covers all changes (it runs at the earliest due check), so re-sends and superseded changes don't pile up jobs. If a check throws (for example the driver's `setCode` on a re-send), only that change fails, with reason `send_error`, and is dropped; the log records only the exception's class name, never its message, which could include the code.
+
+Each outcome is sent like a telemetry event: the same ingest URL and ingestion token, `name: "lock_code_result"`, so SignalBricks receives event type `hubitat.lock_code_result`:
+
+```json
+{"id": "lock_code_result:<requestId>:<seq>:<result>", "deviceId": "<lockId>", "name": "lock_code_result", "displayName": "<lock name>", "value": "confirmed", "data": "{\"lockId\":\"7\",\"slot\":3,\"action\":\"set\",\"result\":\"confirmed\",\"attempts\":1,\"requestId\":\"<uuid>\",\"name\":\"SBA: Cleaner\"}", "date": "<UTC ISO time>", "version": "1.2.0"}
+```
+
+`data` (a JSON string, as for telemetry) holds `{lockId, slot, action: "set"|"delete", result: "confirmed"|"failed"|"superseded", attempts, requestId, reason?, name?}`:
+
+- `reason` is set on `failed`: `not_applied` (3 attempts, never confirmed), `lock_codes_unreadable`, `slot_changed` (someone else's code is in the slot now), `slot_unnamed` (an unnamed code is in the slot, as it was at request time), `send_error` (the lock driver threw while re-sending; if even the cleanup fails, the change is dropped without an event), a rule error such as `slot_not_allowed`, `booking_code`, `slot_not_managed`, `name_not_allowed` or `invalid_slot`, `lock_not_found` (lock no longer selected), `lock_management_disabled`, `disconnected` or `expired`. Only `not_applied` and `lock_codes_unreadable` can be retried with the retry endpoint.
+- `name` is included only when it is an `SBA:` or `SBM:` name, never an adopted or booking name.
+- `attempts` is the number of sends so far, counted from the last retry-endpoint call.
+
+Neither the event nor the `202` ever contains the code.
 
 ### Registration
 
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.1.0", "lockManagement": true}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.2.0", "lockManagement": true}
 ```
 
 SignalBricks accepts it only with the ingestion token the Connect flow issued for this hub and app. It stores the endpoint and token encrypted against that hub, and never logs or returns them. The app sends tokens only to an `https://` ingest URL.
@@ -141,6 +170,7 @@ It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It 
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
 - **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** (turn lock code management off first if it's on).
 - **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
+- **A code change failed** (`lock_code_result` with `result: "failed"`): check the lock is awake and in range of the hub, then retry from SignalBricks. Changes that failed with `not_applied` or `lock_codes_unreadable` can be retried without re-entering the code for 24 hours; other failures need a new request. `Code changes awaiting the lock` in the app shows how many are in progress or failed.
 - **Slots answer `409 lock_codes_unreadable`**: see [Encrypted lock codes](#encrypted-lock-codes).
 - Turn on **debug logging** to see each event as it is sent. Debug logging turns itself off after 30 minutes.
 
