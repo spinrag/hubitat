@@ -752,5 +752,230 @@ String everything = (app.posts.collect { it.params.body } + app.logged.collect {
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })
 
+// --- Fingerprints (signalbricks/platform#532) ---
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.approvedAdoptedSlots = null
+app.maxManagedSlot = null
+app.posts.clear(); app.logged.clear(); app.scheduled.clear()
+List fpResponses = []
+def fcall = { String handler -> def r = app."${handler}"(); fpResponses << r; r }
+byte[] keyBytes = (1..32).collect { (byte) (it * 7) } as byte[]
+String KEY = keyBytes.encodeBase64().toString()
+byte[] key2Bytes = (1..32).collect { (byte) (255 - it) } as byte[]
+String KEY2 = key2Bytes.encodeBase64().toString()
+// Independent RFC 2104 HMAC-SHA256 (MessageDigest only), first 16 hex chars
+def hmac16 = { byte[] k, String msg ->
+    def sha = { byte[] b -> java.security.MessageDigest.getInstance('SHA-256').digest(b) }
+    byte[] kk = new byte[64]
+    System.arraycopy(k.length > 64 ? sha(k) : k, 0, kk, 0, Math.min(k.length > 64 ? 32 : k.length, 64))
+    byte[] ipad = kk.collect { (byte) (it ^ 0x36) } as byte[]
+    byte[] opad = kk.collect { (byte) (it ^ 0x5c) } as byte[]
+    sha((opad as List) + (sha(((ipad as List) + (msg.getBytes('UTF-8') as List)) as byte[]) as List) as byte[]).encodeHex().toString().substring(0, 16)
+}
+check('fp: RFC 4231 case 2 vector', app.codeFingerprint('Jefe'.getBytes('UTF-8'), 'what do ya want for nothing?') == '5bdcc146bf60754e')
+check('fp: matches independent HMAC', app.codeFingerprint(keyBytes, '12340001') == hmac16(keyBytes, '12340001'))
+
+def lockA = new FakeLock(id: '10', displayName: 'FpA', name: 'FpA', label: 'FpA')
+lockA.attrs.maxCodes = 250
+lockA.attrs.lockCodes = groovy.json.JsonOutput.toJson([
+    '1': [name: 'SBA: Owner', code: '12340001'],
+    '2': [name: 'Old', code: '55550002'],          // unmarked in admin range: included
+    '3': [name: 'SBA: ORB5', code: '55550003'],     // booking-guard name: excluded
+    '4': [name: 'SBA: Empty', code: ''],            // empty: excluded
+    '12': [name: 'SBM: Cleaner', code: '12340012'],
+    '26': [name: 'Above', code: '55550026'],        // above ceiling, not adopted: excluded
+    '30': [name: 'ORB123', code: '55550030'],       // booking, adopted+approved: excluded
+    '40': [name: 'Legacy', code: '55550040'],       // adopted, not approved: excluded
+    '41': [name: 'Legacy 2', code: '12340001'],     // adopted + approved: included
+])
+def lockB = new FakeLock(id: '11', displayName: 'FpB', name: 'FpB', label: 'FpB')
+lockB.attrs.maxCodes = 250
+lockB.attrs.lockCodes = groovy.json.JsonOutput.toJson([
+    '1': [name: 'Owner renamed', code: '12340001'],
+    '12': [name: 'SBM: Cleaner', code: '99990012'],
+    '13': [name: 'SBM: Numeric', code: 12340012],
+])
+def lockC = new FakeLock(id: '12', displayName: 'FpC', name: 'FpC', label: 'FpC')
+lockC.attrs.lockCodes = groovy.json.JsonOutput.toJson(['1': [name: 'SBA: Owner', code: '12340001']])
+app.codeLocks = [lockA, lockB, lockC]
+List fpCodes = ['12340001', '55550002', '55550003', '12340012', '55550026', '55550030', '55550040', '99990012']
+Map fpCfg = [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['10': [adopted: [30, 40, 41]], '11': [:]]]
+app.state.remove('fingerprintKey'); app.state.fingerprintTimes = []
+
+app.params = [lockId: '10']
+app.request = [JSON: fpCfg]
+check('fp: config without key accepted', fcall('apiSetLockConfig').status == 200)
+def missing = fcall('apiListFingerprints')
+check('fp: no key -> 409 fingerprint_key_missing', missing.status == 409 && body(missing).error == 'fingerprint_key_missing')
+check('fp: GET lockConfig says no key', body(fcall('apiGetLockConfig')).fingerprintKeySet == false)
+[['bad', 'not base64'], [(new byte[16]).encodeBase64().toString(), '16 bytes'], [(new byte[33]).encodeBase64().toString(), '33 bytes'],
+ [KEY.replace('=', ''), 'unpadded'], [' ' + KEY, 'leading space'], [KEY + '\n', 'trailing newline'], [KEY.substring(0, 42) + '_=', 'base64url char'], [12345, 'number']].each { k, why ->
+    app.request = [JSON: fpCfg + [fingerprintKey: k]]
+    def r = fcall('apiSetLockConfig')
+    check("fp: invalid key (${why}) -> 400, nothing stored", r.status == 400 && body(r).error == 'invalid_config' && app.state.fingerprintKey == null && !r.data.contains(k.toString()))
+}
+app.request = [JSON: fpCfg + [fingerprintKey: KEY, locks: ['99': [:]]]]
+check('fp: invalid config with valid key -> 400, key not stored', fcall('apiSetLockConfig').status == 400 && app.state.fingerprintKey == null)
+app.request = [JSON: fpCfg + [fingerprintKey: KEY]]
+def setKey = fcall('apiSetLockConfig')
+check('fp: key accepted, stored, not echoed', setKey.status == 200 && app.state.fingerprintKey == KEY && !setKey.data.contains(KEY) && body(setKey).fingerprintKeySet == true && !body(setKey).config.containsKey('fingerprintKey'))
+def getCfg = fcall('apiGetLockConfig')
+check('fp: GET lockConfig never returns the key', !getCfg.data.contains(KEY) && !getCfg.data.contains('"fingerprintKey"') && body(getCfg).fingerprintKeySet == true)
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+check('fp: POST without key keeps it', app.state.fingerprintKey == KEY)
+app.request = [JSON: fpCfg + [fingerprintKey: null]]
+fcall('apiSetLockConfig')
+check('fp: POST with null key keeps it', app.state.fingerprintKey == KEY)
+app.approvedAdoptedSlots = ['10:30', '10:41']
+
+def fpA = fcall('apiListFingerprints')
+def slotsA = body(fpA).slots
+check('fp: 200 {lockId, slots}', fpA.status == 200 && body(fpA).lockId == '10' && body(fpA).keySet() == ['lockId', 'slots'] as Set)
+check('fp: allowed occupied slots only (no booking, empty, unapproved, above ceiling)', slotsA*.slot == [1, 2, 12, 41])
+check('fp: each entry is {slot, fp} with 16 lower-case hex', slotsA.every { it.keySet() == ['slot', 'fp'] as Set && it.fp ==~ /[0-9a-f]{16}/ })
+check('fp: value is HMAC-SHA256(key, code) truncated', slotsA.find { it.slot == 1 }.fp == hmac16(keyBytes, '12340001'))
+check('fp: same code, same lock -> same fp', slotsA.find { it.slot == 1 }.fp == slotsA.find { it.slot == 41 }.fp)
+check('fp: different codes -> different fp', slotsA*.fp.unique().size() == 3)
+app.params = [lockId: '11']
+def slotsB = body(fcall('apiListFingerprints')).slots
+check('fp: same code across locks -> same fp (name ignored)', slotsB.find { it.slot == 1 }.fp == slotsA.find { it.slot == 1 }.fp)
+check('fp: different code in same slot on another lock -> different fp', slotsB.find { it.slot == 12 }.fp != slotsA.find { it.slot == 12 }.fp)
+check('fp: numeric lockCodes value fingerprints as its digits', slotsB.find { it.slot == 13 }.fp == slotsA.find { it.slot == 12 }.fp)
+app.params = [lockId: '12']
+def fpC = fcall('apiListFingerprints')
+check('fp: un-listed lock -> no slots', fpC.status == 200 && body(fpC).slots == [])
+app.params = [lockId: '999']
+check('fp: unknown lock -> 404', fcall('apiListFingerprints').status == 404)
+app.params = [lockId: '10']
+app.approvedAdoptedSlots = null
+check('fp: approval withdrawn -> adopted slot above ceiling dropped', body(fcall('apiListFingerprints')).slots*.slot == [1, 2, 12])
+app.approvedAdoptedSlots = ['10:30', '10:41']
+String savedCodes = lockA.attrs.lockCodes
+lockA.attrs.lockCodes = 'ENCRYPTEDBLOB'
+def unread = fcall('apiListFingerprints')
+check('fp: unreadable lockCodes -> 409 lock_codes_unreadable', unread.status == 409 && body(unread).error == 'lock_codes_unreadable')
+lockA.attrs.lockCodes = savedCodes
+
+// Rotating the key changes every fingerprint
+app.state.fingerprintTimes = []
+app.request = [JSON: fpCfg + [fingerprintKey: KEY2]]
+fcall('apiSetLockConfig')
+def slotsA2 = body(fcall('apiListFingerprints')).slots
+check('fp: new key replaces old', app.state.fingerprintKey == KEY2 && slotsA2.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001') && slotsA2.find { it.slot == 1 }.fp != slotsA.find { it.slot == 1 }.fp)
+
+// Rate limit: own bucket of 10/min
+app.state.fingerprintTimes = []
+app.state.revealTimes = []
+(1..10).each { fcall('apiListFingerprints') }
+def limited = fcall('apiListFingerprints')
+check('fp: 11th call in a minute -> 429', limited.status == 429 && body(limited).error == 'rate_limited')
+app.params = [lockId: '10', slot: '1']
+check('fp: reveal has its own bucket', app.apiRevealCode().status == 200)
+app.state.fingerprintTimes = []
+
+// Survey-only locks: listed for reading (slots, fingerprints), never written
+def lockD = new FakeLock(id: '13', displayName: 'FpD', name: 'FpD', label: 'FpD')
+lockD.attrs.maxCodes = 250
+lockD.attrs.lockCodes = groovy.json.JsonOutput.toJson([
+    '0': [name: 'Zero', code: '55550000'],
+    '1': [name: 'Old', code: '12340001'],
+    '2': [name: 'Someone', code: '55550002'],
+    '5': [name: 'ORB9-Guest', code: '55550005'],
+    '6': [name: 'Empty', code: ''],
+    '12': [name: 'SBM: Cleaner', code: '12340012'],
+    '30': [name: 'Above', code: '55550030'],
+])
+app.codeLocks = [lockA, lockB, lockC, lockD]
+fpCodes += ['55550000', '55550005', '91930003', '91930004']
+app.state.fingerprintTimes = []; app.state.writeTimes = []; app.state.revealTimes = []; app.state.retryTimes = []
+[[surveyOnly: true, adopted: [1]], [surveyOnly: true, admin: [from: 1, to: 10]], [surveyOnly: 'yes'], [surveyOnly: 1]].each { e ->
+    app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': e]]]
+    check("survey: invalid entry ${e} -> 400", fcall('apiSetLockConfig').status == 400 && app.state.lockConfig.locks['13'] == null)
+}
+// A normal lock with a change in flight, then switched to survey-only
+app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': [:]]]]
+fcall('apiSetLockConfig')
+app.params = [lockId: '13']
+app.request = [JSON: [slot: 3, code: '91930003', name: 'SBA: Pending']]
+check('survey: normal lock accepts a set', fcall('apiSetCode').status == 202 && app.state.pendingCodeChanges['13:3'])
+int dSets = lockD.calls.size()
+Map surveyCfg = fpCfg + [locks: fpCfg.locks + ['13': [surveyOnly: true]]]
+app.request = [JSON: surveyCfg]
+def sv = fcall('apiSetLockConfig')
+check('survey: entry accepted and stored as {surveyOnly: true}', sv.status == 200 && body(sv).config.locks['13'] == [surveyOnly: true])
+check('survey: switching drops the in-flight change, reported failed', app.state.pendingCodeChanges?.get('13:3') == null && results().any { it.d.lockId == '13' && it.d.slot == 3 && it.d.reason == 'slot_not_allowed' })
+app.verifyCodeChanges()
+check('survey: verify sends nothing to it', lockD.calls.size() == dSets)
+def svSlots = fcall('apiListSlots')
+check('survey: /slots readable, surveyOnly flag, nothing allowed', svSlots.status == 200 && body(svSlots).surveyOnly == true && body(svSlots).slots.every { it.allowedAs == null } && !svSlots.data.contains('12340001'))
+app.params = [lockId: '10']
+check('survey: other locks report surveyOnly false', body(fcall('apiListSlots')).surveyOnly == false)
+app.params = [lockId: '13']
+def svFp = fcall('apiListFingerprints')
+check('survey: fingerprints for occupied in-ceiling slots, no booking/empty/above', svFp.status == 200 && body(svFp).slots*.slot == [1, 2, 12])
+check('survey: info log names lock and count, no fp or code', app.logged.any { it.toString() == 'SignalBricks Telemetry: fingerprints listed for FpD (3 slots)' } && !app.logged.any { it.toString().contains(body(svFp).slots[0].fp) || it.toString().contains('12340001') })
+check('survey: fp comparable with onboarded locks', body(svFp).slots.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001'))
+app.request = [JSON: [slot: 2, code: '91930004', name: 'SBA: Take']]
+def svSet = fcall('apiSetCode')
+check('survey: set on occupied slot -> 403 slot_not_allowed', svSet.status == 403 && body(svSet).error == 'slot_not_allowed')
+app.request = [JSON: [slot: 3, code: '91930004', name: 'SBA: New']]
+check('survey: set on empty slot -> 403', fcall('apiSetCode').status == 403)
+app.request = [JSON: [slot: 12, code: '91930004', name: 'SBM: Cleaner']]
+check('survey: set over SBM: code -> 403', fcall('apiSetCode').status == 403)
+app.params = [lockId: '13', slot: '12']
+app.request = [:]
+check('survey: delete -> 403', body(fcall('apiDeleteCode')).error == 'slot_not_allowed')
+def svRev = app.apiRevealCode()
+check('survey: reveal -> 403, no code', svRev.status == 403 && !svRev.data.contains('12340012'))
+// A held failed change (e.g. from before the switch) can't be retried
+app.state.pendingCodeChanges = ['13:12': [lockId: '13', slot: 12, action: 'set', name: 'SBM: Cleaner', prevName: 'SBM: Cleaner', code: '91930004', requestId: R1, attempts: 3, createdAt: app.now(), status: 'failed', seq: 1]]
+def svRetry = fcall('apiRetryCode')
+check('survey: retry -> 403 and dropped, nothing sent', svRetry.status == 403 && app.state.pendingCodeChanges == null && lockD.calls.size() == dSets)
+// Onboarding replaces the entry with a normal one: writes allowed again
+app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': [:]]]]
+fcall('apiSetLockConfig')
+app.params = [lockId: '13']
+check('survey: switched to normal -> slots allowed', body(fcall('apiListSlots')).slots.find { it.slot == 12 }.allowedAs == 'managed' && body(fcall('apiListSlots')).surveyOnly == false)
+app.request = [JSON: [slot: 3, code: '91930003', name: 'SBA: Onboarded']]
+check('survey: switched to normal -> set ok', fcall('apiSetCode').status == 202)
+check('survey: normal lock fingerprints follow the ranges', body(fcall('apiListFingerprints')).slots*.slot == [1, 2, 12])
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+app.codeLocks = [lockA, lockB, lockC]
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+app.state.fingerprintTimes = []
+
+// Off -> 404
+app.lockManagementEnabled = false
+app.params = [lockId: '10']
+check('fp: lock management off -> 404', fcall('apiListFingerprints').status == 404)
+
+// Disable clears the key; re-enabling needs a new one
+app.state.lockMgmtLastEnabled = true
+app.syncLockManagementEnabled()
+check('fp: key cleared on disable', app.state.fingerprintKey == null && app.state.fingerprintTimes == null)
+app.lockManagementEnabled = true
+app.syncLockManagementEnabled()
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+check('fp: after re-enable -> 409 fingerprint_key_missing', body(fcall('apiListFingerprints')).error == 'fingerprint_key_missing')
+
+// Disconnect clears the key
+app.request = [JSON: fpCfg + [fingerprintKey: KEY]]
+fcall('apiSetLockConfig')
+check('fp: key set again', app.state.fingerprintKey == KEY)
+app.appButtonHandler('btnDisconnect')
+check('fp: key cleared on disconnect', app.state.fingerprintKey == null)
+
+// Neither key nor codes anywhere outside app state
+List keyForms = [KEY, KEY2, keyBytes.encodeHex().toString(), key2Bytes.encodeHex().toString()]
+String fpEverything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + fpResponses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
+check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.contains(it) })
+check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
+
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
