@@ -50,6 +50,42 @@ Use Hubitat Package Manager (HPM) to keep the app up to date. Set this up once o
 
 **Daily check-in (1.3.2).** Once a day the app checks whether it was updated and, if so, re-registers, so a hub that sends few events still reports the new version within a day. Each hub picks its own random time once, never between 2 and 4am (hub time), so hubs don't all call SignalBricks at once; the app page shows it under **Status** as *Daily update check-in at HH:MM*. The check sends nothing when the version hasn't changed, and follows the same rules as re-registering after an event. It is set up on **Done** or **Connect** (or, for a hub updated from 1.3.1, with its next event) and removed on **Disconnect**.
 
+### Beta channel
+
+New releases can go to one or two canary hubs before every other hub. The package has an HPM beta channel: hubs that opt in install [`beta/app.groovy`](beta/app.groovy) instead of [`app.groovy`](app.groovy) while a beta is out, and go back to the stable code when it is promoted. Other hubs never see the beta.
+
+**Opt a hub in** (on the canary hub only):
+
+1. Open **Hubitat Package Manager** → **Package Manager Settings**.
+2. Under **General**, turn on **When updating, install pre-release versions**.
+3. In **Choose which app/packages to enable Beta/Early Access code**, select **SignalBricks Telemetry** only. The beta setting is per package, so other packages on the hub stay on their stable releases.
+4. Click **Done**. Keep auto-update for SignalBricks Telemetry on (see [Updating](#updating)) so the hub takes each beta as soon as HPM's daily check sees it, or run **Update** in HPM to take it now.
+
+While a beta is out, HPM's **Install** page also shows **Install beta package** for a new install; turning it on does steps 2 and 3 for you. To leave the beta channel, remove **SignalBricks Telemetry** from that package list. Turning **install pre-release versions** off alone is not enough: HPM keeps the list and still installs the beta files for packages on it. The hub moves back to stable with the next stable release.
+
+Opting in while no beta is out changes nothing: the beta copy is then identical to the stable release.
+
+**Caveat (HPM behaviour).** If HPM updates SignalBricks Telemetry while a beta is out, it records the package as "beta" on any hub that has **install pre-release versions** on for any package, even when SignalBricks Telemetry is not on that hub's list. Such a hub can show the beta's version as installed while it runs the stable code. It still takes the next stable release whose version is at least the beta's. Hubs with pre-releases off are not affected. The app page (*Version …*) and SignalBricks always show the code that actually runs.
+
+**How it works.** The manifest's app entry has a `betaLocation` pointing at `beta/app.groovy` on `main`. A beta is "out" when the manifest has a `betaVersion`: opted-in hubs are offered that version, with `betaReleaseNotes`, and install the beta file. Without a `betaVersion`, every hub gets `app.groovy`.
+
+**Cut a beta** (one PR):
+
+1. Make the change in `beta/app.groovy` and set its `APP_VERSION` to the beta version.
+2. In `packageManifest.json` set `betaVersion` to that version and `betaReleaseNotes` to its notes. Leave `version`, `releaseNotes` and `app.groovy` alone.
+3. Pick a `betaVersion` HPM will offer: HPM compares versions part by part and only offers a beta when **every** part is at least the same part of `version`. After 1.3.2, `1.3.3` and `1.4.2` work; `1.4.0` does not (HPM would quietly install the stable code instead). CI rejects a `betaVersion` HPM would skip.
+4. To ship a fix to a beta that is already out, change `beta/app.groovy` again and raise `betaVersion`, so opted-in hubs see an update.
+
+**Promote a beta** (one PR):
+
+1. Copy `beta/app.groovy` over `app.groovy`. The two files are now identical.
+2. Set `version` to the beta's version, set `dateReleased`, and add its notes at the top of `releaseNotes`.
+3. **Remove `betaVersion` and `betaReleaseNotes`.** Keep `betaLocation`. Opted-in hubs then get the stable code of the same version and leave the beta. Don't set `betaVersion` equal to `version`: HPM then keeps offering hubs with pre-releases turned on the same update every day. CI rejects it.
+
+**Drop a beta** without releasing it: copy `app.groovy` over `beta/app.groovy` and remove `betaVersion` and `betaReleaseNotes`. Hubs that took the beta go back to stable with the next stable release whose version is at least the dropped beta's.
+
+**Stable-only release while no beta is out:** change `app.groovy` and bump `version` as usual, and copy the result to `beta/app.groovy` in the same PR. CI checks that `beta/app.groovy` has `betaVersion` while a beta is out and is identical to `app.groovy` otherwise, and runs the harness against both files. A stable fix while a beta is out changes only `app.groovy` (and the beta, if it needs the fix too); CI says if `betaVersion` must then be raised.
+
 ## Events sent
 
 | Devices | Attributes |
@@ -200,7 +236,7 @@ docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-
   groovy /w/tests/LockManagementHarness.groovy /w/app.groovy
 ```
 
-It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It checks behaviour in the stub only, not on a real hub.
+It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It checks behaviour in the stub only, not on a real hub. Pass `/w/beta/app.groovy` instead to test the [beta copy](#beta-channel); CI runs both.
 
 ## Privacy
 

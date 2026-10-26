@@ -89,9 +89,9 @@ Alternatively, use the raw URLs in the `packageManifest.json` files if installin
 
 GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`:
 
-- **Harness tests** — every `*/tests/*Harness.groovy` runs against its app in the `groovy:4.0-jdk17` container with networking disabled; any `FAIL` line or non-zero exit fails the build.
+- **Harness tests** — every `*/tests/*Harness.groovy` runs against its app (and its `beta/` copy, if any) in the `groovy:4.0-jdk17` container with networking disabled; any `FAIL` line or non-zero exit fails the build.
 - **Groovy compile check** — every `app.groovy` / `driver.groovy` is compiled as a plain Groovy script ([`groovy-parse-check.groovy`](.github/scripts/groovy-parse-check.groovy)). Hubitat's DSL is just method calls, so no stubs are needed; it catches syntax errors and unresolvable imports, not runtime behaviour.
-- **Manifest checks** — [`check-manifests.py`](.github/scripts/check-manifests.py): manifests and `repository.json` are valid JSON, manifest locations point at files in this repo, each app's version in source matches its `packageManifest.json`, `repository.json` entries point at existing manifests, and every manifest is listed in `repository.json`.
+- **Manifest checks** — [`check-manifests.py`](.github/scripts/check-manifests.py): manifests and `repository.json` are valid JSON, manifest locations point at files in this repo, each app's version in source matches its `packageManifest.json`, beta channel fields are consistent (a `betaLocation` file carries `betaVersion`, or is identical to the stable file when no beta is out; `betaVersion` has `betaReleaseNotes` and is one HPM will offer), `repository.json` entries point at existing manifests, and every manifest is listed in `repository.json`.
 - **Secret scan** — [gitleaks](https://github.com/gitleaks/gitleaks) over the full git history. Reviewed false positives go in [`.gitleaksignore`](.gitleaksignore).
 
 Run the same checks locally from the repository root:

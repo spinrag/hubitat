@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Run every */tests/*Harness.groovy against its app
+      - name: Run every */tests/*Harness.groovy against its app (and its beta copy)
         run: |
           shopt -s nullglob
           harnesses=(*/tests/*Harness.groovy)
@@ -37,18 +37,22 @@ jobs:
             dir="${h%%/*}"
             src="app.groovy"
             [ -f "$dir/$src" ] || src="driver.groovy"
-            echo "::group::$h ($dir/$src)"
-            set +e
-            out=$(docker run --rm --network none -v "$PWD/$dir:/w:ro" "$GROOVY_IMAGE" \
-              groovy "/w/tests/$(basename "$h")" "/w/$src" 2>&1)
-            rc=$?
-            set -e
-            echo "$out"
-            echo "::endgroup::"
-            if [ $rc -ne 0 ] || grep -q '^FAIL' <<<"$out"; then
-              echo "::error file=$h::harness failed (exit $rc)"
-              status=1
-            fi
+            srcs=("$src")
+            [ -f "$dir/beta/$src" ] && srcs+=("beta/$src")
+            for s in "${srcs[@]}"; do
+              echo "::group::$h ($dir/$s)"
+              set +e
+              out=$(docker run --rm --network none -v "$PWD/$dir:/w:ro" "$GROOVY_IMAGE" \
+                groovy "/w/tests/$(basename "$h")" "/w/$s" 2>&1)
+              rc=$?
+              set -e
+              echo "$out"
+              echo "::endgroup::"
+              if [ $rc -ne 0 ] || grep -q '^FAIL' <<<"$out"; then
+                echo "::error file=$h::harness failed against $dir/$s (exit $rc)"
+                status=1
+              fi
+            done
           done
           exit $status
 
