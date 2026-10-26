@@ -12,7 +12,7 @@
  * reveal one code at a time. The hub enforces which slots may be touched:
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
  * but only up to a ceiling set in this app's UI; adopted slots above it need
- * the operator's approval in the UI. Slots holding ORB<n> booking codes are
+ * the operator's approval in the UI. Slots whose name contains ORB (booking codes) are
  * always refused, and created names must carry SBA:/SBM: and never "ORB".
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
@@ -200,13 +200,20 @@ void updated() {
     }
 }
 
-// On an on -> off flip: rotate the access token (the one SignalBricks holds
+// On an off -> on flip: rotate the access token before it is registered, so
+// an older token (e.g. from an abandoned Reconnect link) never becomes the
+// live lock token. On an on -> off flip: rotate it (the one SignalBricks holds
 // stops working), drop the slot rules and tell the platform. Returns true when
 // it just handled a disable (and so already registered).
 Boolean syncLockManagementEnabled() {
     Boolean enabled = lockManagementEnabled == true
     Boolean wasEnabled = state.lockMgmtLastEnabled == true
     state.lockMgmtLastEnabled = enabled
+    if (!wasEnabled && enabled) {
+        log.info 'SignalBricks Telemetry: lock code management turned on; access token rotated'
+        createAccessToken()
+        return false
+    }
     if (!wasEnabled || enabled) return false
     log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
     createAccessToken()
@@ -586,9 +593,11 @@ Boolean rangesOverlap(Map a, Map b) {
     return a.from <= b.to && b.from <= a.to
 }
 
-// Booking codes from the SignalBricks Integration / OwnerRez apps.
+// Booking codes from the SignalBricks Integration / OwnerRez apps. Any name
+// containing "ORB" (any case), matching the write rule and stock OwnerRez's
+// prefix claim.
 Boolean isBookingName(String name) {
-    return name != null && (name =~ /(?i)ORB\d+/).find()
+    return name != null && name.toUpperCase().contains('ORB')
 }
 
 // Validates a /lockConfig body. Returns [config: Map] or [error: String].
@@ -733,6 +742,13 @@ Map apiSetLockConfig() {
     Map result = validateLockConfig(request.JSON)
     if (result.error) return jsonResponse([error: 'invalid_config', message: result.error], 400)
     state.lockConfig = result.config
+    // Approvals only cover adopted slots the current config still lists.
+    List stillAdopted = adoptedAboveCeiling()
+    List kept = approvedAdoptedKeys().findAll { stillAdopted.contains(it) }
+    if (kept.size() != approvedAdoptedKeys().size()) {
+        if (kept) app.updateSetting('approvedAdoptedSlots', [type: 'enum', value: kept])
+        else app.removeSetting('approvedAdoptedSlots')
+    }
     log.info 'SignalBricks Telemetry: lock slot rules updated'
     return jsonResponse([config: result.config, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
 }
@@ -765,7 +781,7 @@ Map apiListSlots() {
 // Common checks for write/delete/reveal. Returns [lock, slot, slotClass,
 // codes, currentName] or [response]. Refuses:
 //   - slots outside admin/managed/approved-adopted (and above the ceiling)
-//   - any slot whose current name is a booking code (ORB<digits>)
+//   - any slot whose current name contains ORB (booking codes)
 //   - in the admin/managed ranges, a slot holding a code without that
 //     range's SBA:/SBM: marker (existing codes must be adopted first);
 //     an empty slot may be written (`allowEmpty`), not deleted or revealed.
