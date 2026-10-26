@@ -72,9 +72,14 @@ While lock code management is on, **Reconnect to SignalBricks** is hidden, becau
 The hub decides which slots may be touched. Anyone holding the app's access token (SignalBricks, or someone who stole it) can only reach what the operator allowed in the app UI:
 
 - **Ceiling (local only):** *Highest slot SignalBricks may manage*, default 25, is set only in the app UI. `POST /lockConfig` is refused (`400`) if the admin or managed range goes above it. Lowering the ceiling later immediately refuses slots above it. Raising it automatically allows any adopted slots that fall under the new ceiling, without a separate approval.
-- **Allowed slots** = admin range ∪ managed range (both ≤ ceiling) ∪ the lock's adopted slots. Adopted slots at or below the ceiling are allowed. Adopted slots **above** it stay refused until the operator approves them in the app UI. The API can never approve them. Each `POST /lockConfig` drops approvals for slots the new config no longer lists as adopted. Before a config exists, every write and reveal is refused. Any other slot gets `403`.
-- **Booking codes:** any slot whose current name contains `ORB` (any case) is always refused for write, delete and reveal, even if adopted and approved. This matches the write rule and stock OwnerRez's prefix claim.
-- **Names:** a code set in the admin range must be named `SBA: …`, in the managed range `SBM: …`. Adopted slots (existing codes recorded in place at onboarding) keep their current names. Every name must be 1–64 printable ASCII characters and must not contain `ORB` (any case), so the booking apps' name matching can never claim it.
+- **Allowed slots** = admin range ∪ managed range (both ≤ ceiling) ∪ the lock's adopted slots. Adopted slots at or below the ceiling are allowed. Adopted slots **above** it stay refused until the operator approves them in the app UI. The API can never approve them. Each `POST /lockConfig` drops approvals for slots the new config no longer lists as adopted. Before a config exists, every write and reveal is refused. **A lock that isn't listed in the config's `locks` allows nothing.** The global `admin`/`managed` ranges are only defaults for listed locks, so locks that haven't been onboarded can't be touched even with the app token. Any other slot gets `403`.
+- **Booking codes:** any slot whose current name has an upper-case `ORB` at the start or right after a space or hyphen (case-sensitive `(^|[\s-])ORB`) is always refused for write, delete and reveal, even if adopted and approved. Refused examples:
+  - `ORB123-Guest` (signalbricksIntegration's default naming with an empty prefix)
+  - `GT: ORB123-Guest`
+  - the idAtEnd forms `Guest-ORB12345` (signalbricksIntegration) and `Guest -ORB12345` (OwnerRez fork)
+
+  `Forbes`, `Orbit` and `orb123` are not booking codes. The SignalBricks platform applies the same rule.
+- **Names:** a code set in the admin range must be named `SBA: …`, in the managed range `SBM: …`. Adopted slots (existing codes recorded in place at onboarding) keep their current names. Every name must be 1–64 printable ASCII characters. It must not have an upper-case `ORB` at the start or after a space or hyphen, and must not contain an upper-case `ORB` followed by a digit anywhere (`ORB\d`, case-sensitive). signalbricksIntegration claims any name containing `ORB` plus digits, so such a name could be taken over or deleted by the booking app. `SBA: Forbes`, `SBA: Orbit`, `SBA: FORBES` and `SBA: orb123` are fine. `SBA: ORB1`, `SBA:ORB12`, `SBA: Guest-ORB12` and `SBM:x-ORB5` are refused.
 - **Existing codes:** in the admin and managed ranges, a slot holding a code without that range's `SBA:`/`SBM:` marker can't be overwritten, deleted or revealed until it is adopted. Empty slots may be written. `/slots` still reports `allowedAs` (admin/managed) for such slots, based on the range alone, even though writes refuse them (`403 slot_not_managed`) until they are adopted.
 - Codes must be 4 to 10 digits. Slots above the lock's `maxCodes` are refused.
 - **Reveal** returns one slot's code, only for `SBA:`/`SBM:` codes in their ranges or allowed adopted slots, at most 10 times a minute across the app (`429` beyond that).
@@ -94,7 +99,7 @@ All are served from the hub's cloud endpoint (`https://cloud.hubitat.com/api/<hu
 | `DELETE` | `/locks/:id/codes/:slot` | → `202 {lockId, slot, status: "pending"}` |
 | `GET` | `/locks/:id/codes/:slot/reveal` | `{lockId, slot, name, code}`; `429` when rate-limited |
 | `GET` | `/lockConfig` | `{config, ceiling, pendingApproval}`. `config` is `null` until set. `pendingApproval` lists `"<lockId>:<slot>"` adopted slots above the ceiling that the operator hasn't approved. |
-| `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]}}}` replaces the rules and returns the same shape as `GET`. Ranges must not overlap and must stay within 1..ceiling. Lock ids must be selected for lock code management. Otherwise `400` with a message. |
+| `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]}}}` replaces the rules and returns the same shape as `GET`. Only locks listed in `locks` (use `{}` to take the default ranges) can be written or revealed. Ranges must not overlap and must stay within 1..ceiling. Lock ids must be selected for lock code management. Otherwise `400` with a message. |
 
 Errors: `400` invalid input, `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot, `409` lock codes unreadable (see below), `429` reveal rate limit.
 
@@ -111,6 +116,17 @@ SignalBricks accepts it only with the ingestion token the Connect flow issued fo
 ### Encrypted lock codes
 
 Some newer lock drivers can store `lockCodes` encrypted (a driver preference such as *Encrypt lock codes*). The app decrypts them with the hub's `decrypt()` when the platform provides it to apps. If it can't, `/slots` and `/reveal` answer `409 lock_codes_unreadable`: turn off code encryption in that lock's driver preferences, or leave that lock out of lock code management.
+
+## Development
+
+`tests/LockManagementHarness.groovy` exercises the lock-management handlers against a stubbed Hubitat sandbox, with fake locks and codes. It is not loaded by Hubitat or HPM. Run it from the repository root with Docker:
+
+```bash
+docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
+  groovy /w/tests/LockManagementHarness.groovy /w/app.groovy
+```
+
+It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It checks behaviour in the stub only, not on a real hub.
 
 ## Privacy
 
