@@ -75,6 +75,9 @@ import groovy.transform.Field
 @Field static final List<Integer> CODE_FINAL_CHECK_SECONDS = [120, 150, 180]
 @Field static final long PENDING_CODE_TTL_MS = 24L * 60 * 60 * 1000
 @Field static final int RETRY_LIMIT_PER_MIN = 10
+// Set + delete requests across the app, and the most changes held at once.
+@Field static final int WRITE_LIMIT_PER_MIN = 30
+@Field static final int MAX_PENDING_CODE_CHANGES = 100
 @Field static final java.util.regex.Pattern REQUEST_ID = ~/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
 
 definition(
@@ -246,6 +249,7 @@ Boolean syncLockManagementEnabled() {
     state.remove('lockConfig')
     state.remove('revealTimes')
     state.remove('retryTimes')
+    state.remove('writeTimes')
     app.removeSetting('approvedAdoptedSlots')
     registerWithPlatform(false)
     return true
@@ -790,6 +794,7 @@ Map apiSetLockConfig() {
         if (kept) app.updateSetting('approvedAdoptedSlots', [type: 'enum', value: kept])
         else app.removeSetting('approvedAdoptedSlots')
     }
+    dropDisallowedCodeChanges()
     log.info 'SignalBricks Telemetry: lock slot rules updated'
     return jsonResponse([config: result.config, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
 }
@@ -853,7 +858,7 @@ Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
         return refuse('slot_not_managed', 403, "slot holds a code without the ${prefix} marker; adopt it first")
     }
     if (!occupied && !allowEmpty) return refuse('slot_empty', 404)
-    return [lock: lock, slot: slot, slotClass: cls, codes: codes, currentName: currentName]
+    return [lock: lock, slot: slot, slotClass: cls, codes: codes, currentName: currentName, occupied: occupied]
 }
 
 // Name and slot rules for a set. Checked on the request and again before
@@ -875,10 +880,17 @@ Map resolveSet(def lockIdRaw, def slotRaw, String name) {
     return r
 }
 
-// Re-send checks: a delete may find the slot already empty (then the check
-// confirms it).
+// Re-send checks (automatic re-sends and the retry endpoint): the same rules
+// as a new request, and the slot must not have been taken over since. A
+// delete may find the slot already empty (then the check confirms it).
 Map resolvePendingChange(Map p) {
-    return p.action == 'set' ? resolveSet(p.lockId, p.slot, p.name) : resolveAllowedSlot(p.lockId, p.slot, true)
+    Map r = p.action == 'set' ? resolveSet(p.lockId, p.slot, p.name) : resolveAllowedSlot(p.lockId, p.slot, true)
+    if (r.response || !r.occupied) return r
+    // Delete: the slot must still hold the name it had at request time.
+    // Set: it may hold our name or the name it had before the request.
+    Boolean ours = r.currentName == p.name || (p.action == 'set' && r.currentName == p.prevName)
+    if (!ours) return refuse('slot_changed', 409, 'the slot now holds a different code; send a new request')
+    return r
 }
 
 // Optional request id from the platform (a UUID), echoed in the response and
@@ -900,6 +912,18 @@ Boolean rateLimited(String key, int limit) {
     return limited
 }
 
+// Checks shared by set and delete once the request is valid: the pending cap
+// (a change replacing one for the same slot doesn't count) and the write rate
+// limit. Returns a response, or null to go ahead.
+Map writeRefusal(lock, Integer slot) {
+    Map all = pendingCodeChanges()
+    if (!all.containsKey(pendingKey(lock.id.toString(), slot)) && all.size() >= MAX_PENDING_CODE_CHANGES) {
+        return jsonResponse([error: 'too_many_pending', message: "at most ${MAX_PENDING_CODE_CHANGES} code changes can be pending; retry later"], 429)
+    }
+    if (rateLimited('writeTimes', WRITE_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    return null
+}
+
 // Body {slot, code, name, requestId?}. The hub verifies the change and
 // reports a lock_code_result event; /slots shows the lock's current state.
 Map apiSetCode() {
@@ -913,7 +937,9 @@ Map apiSetCode() {
     String name = body.name?.toString()?.trim()
     Map r = resolveSet(params.lockId, body.slot, name)
     if (r.response) return r.response
-    startCodeChange(r.lock, r.slot, 'set', name, code, rid.id)
+    Map refusal = writeRefusal(r.lock, r.slot)
+    if (refusal) return refusal
+    startCodeChange(r, 'set', name, code, rid.id)
     log.info "SignalBricks Telemetry: setCode requested on ${r.lock.displayName} slot ${r.slot}"
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
@@ -934,7 +960,9 @@ Map apiDeleteCode() {
     if (rid.response) return rid.response
     Map r = resolveAllowedSlot(params.lockId, params.slot, false)
     if (r.response) return r.response
-    startCodeChange(r.lock, r.slot, 'delete', r.currentName, null, rid.id)
+    Map refusal = writeRefusal(r.lock, r.slot)
+    if (refusal) return refusal
+    startCodeChange(r, 'delete', r.currentName, null, rid.id)
     log.info "SignalBricks Telemetry: deleteCode requested on ${r.lock.displayName} slot ${r.slot}"
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
@@ -950,9 +978,13 @@ Map apiRetryCode() {
     Integer slot = parseSlot(params.slot)
     if (slot == null) return jsonResponse([error: 'invalid_slot'], 400)
     Map p = pendingCodeChanges()[pendingKey(lock.id.toString(), slot)]
-    if (!p) return jsonResponse([error: 'no_pending_change', message: 'nothing pending for this slot (confirmed, superseded or expired)'], 404)
+    if (!p) return jsonResponse([error: 'no_pending_change', message: 'nothing pending for this slot (confirmed, superseded, expired or no longer allowed)'], 404)
     Map r = resolvePendingChange(p)
-    if (r.response) return r.response
+    if (r.response) {
+        // It can never be re-sent: report it once (if still in flight) and drop it.
+        if (r.error != 'lock_codes_unreadable') finishCodeChange(p, 'failed', r.error, p.status == 'pending')
+        return r.response
+    }
     p.attempts = 0
     p.status = 'pending'
     p.remove('reason')
@@ -977,12 +1009,17 @@ Map apiRevealCode() {
 // --- Set/delete verification (#520) ---
 //
 // state.pendingCodeChanges: "<lockId>:<slot>" -> {lockId, slot, action, name,
-// code (set only), requestId, attempts, createdAt, status, seq}. One per lock
-// and slot. `status` is pending (being verified) or failed (kept for the retry
-// endpoint). Entries go on confirm, supersede, disable/disconnect or 24h after
-// createdAt. The code lives only here: never log it, return it or report it.
-// `seq` changes on every send, so checks scheduled for an older send (or a
-// superseded change) find a different seq and do nothing.
+// prevName (the slot's name at request time), code (set only), requestId,
+// attempts, createdAt, status, seq, checkAt, check}. One per lock and slot,
+// at most MAX_PENDING_CODE_CHANGES. `status` is pending (being verified) or
+// failed (kept only while the retry endpoint could still succeed). Entries go
+// on confirm, supersede, disable/disconnect, when the slot stops being
+// allowed, or 24h after createdAt. The code lives only here: never log it,
+// return it or report it. (Hub admins can see app state on App Status, as
+// they can see lockCodes on the device page.)
+//
+// One verifyCodeChanges job is scheduled for the earliest `checkAt`, so
+// re-sends and superseded changes never stack scheduled jobs.
 
 String pendingKey(String lockId, Integer slot) {
     return "${lockId}:${slot}".toString()
@@ -992,26 +1029,34 @@ Map pendingCodeChanges() {
     return (state.pendingCodeChanges ?: [:]) as Map
 }
 
-// Reassigned on every change so Hubitat persists the nested map.
+// Reassigned on every change so Hubitat persists the nested map. Also
+// reschedules the expiry and verification jobs.
 void savePendingCodeChanges(Map all) {
     if (all) {
         state.pendingCodeChanges = all
         long next = all.values().collect { it.createdAt as long }.min() + PENDING_CODE_TTL_MS
-        runIn(Math.max(1L, (long) ((next - now()) / 1000) + 1), 'expirePendingCodeChanges')
+        runIn(secondsUntil(next), 'expirePendingCodeChanges')
     } else {
         state.remove('pendingCodeChanges')
         unschedule('expirePendingCodeChanges')
     }
+    List due = all.values().findAll { it.status == 'pending' }.collect { it.checkAt as long }
+    if (due) runIn(secondsUntil(due.min()), 'verifyCodeChanges')
+    else unschedule('verifyCodeChanges')
 }
 
-void startCodeChange(lock, Integer slot, String action, String name, String code, String requestId) {
+long secondsUntil(long atMs) {
+    return Math.max(1L, (long) Math.ceil((atMs - now()) / 1000.0d))
+}
+
+void startCodeChange(Map r, String action, String name, String code, String requestId) {
     expirePendingCodeChanges()
-    String lockId = lock.id.toString()
-    Map old = pendingCodeChanges()[pendingKey(lockId, slot)]
+    String lockId = r.lock.id.toString()
+    Map old = pendingCodeChanges()[pendingKey(lockId, r.slot)]
     if (old?.status == 'pending' && old.requestId != requestId) reportCodeResult(old, 'superseded', null)
-    Map p = [lockId: lockId, slot: slot, action: action, name: name, requestId: requestId, attempts: 0, createdAt: now(), status: 'pending']
+    Map p = [lockId: lockId, slot: r.slot, action: action, name: name, prevName: r.currentName, requestId: requestId, attempts: 0, createdAt: now(), status: 'pending']
     if (code) p.code = code
-    sendCodeChange(p, lock)
+    sendCodeChange(p, r.lock)
 }
 
 // Sends the command, stores the change and schedules its first check.
@@ -1021,14 +1066,22 @@ void sendCodeChange(Map p, lock) {
     state.codeChangeSeq = p.seq
     if (p.action == 'set') lock.setCode(p.slot as Integer, p.code, p.name)
     else lock.deleteCode(p.slot as Integer)
+    p.check = 1
+    p.checkAt = now() + CODE_FIRST_CHECK_SECONDS * 1000L
     Map all = pendingCodeChanges()
     all[pendingKey(p.lockId, p.slot as Integer)] = p
     savePendingCodeChanges(all)
-    scheduleCodeCheck(p, 1, CODE_FIRST_CHECK_SECONDS)
 }
 
-void scheduleCodeCheck(Map p, int check, int seconds) {
-    runIn(seconds, 'verifyCodeChange', [data: [key: pendingKey(p.lockId, p.slot as Integer), seq: p.seq, check: check], overwrite: false])
+// Codes are compared as strings, never as numbers ("0123" != "123"). A driver
+// that reports the code as a JSON number has already lost leading zeros, so
+// then the number is compared with the sent code minus its leading zeros.
+Boolean sameCode(def actual, String expected) {
+    if (actual == null || expected == null) return false
+    if (actual instanceof Number) {
+        return new BigDecimal(actual.toString()).toPlainString() == expected.replaceFirst(/^0+(?=\d)/, '')
+    }
+    return actual.toString() == expected
 }
 
 // Set: the slot holds the expected name and code. Delete: the slot is empty.
@@ -1036,57 +1089,86 @@ Boolean codeChangeApplied(Map p, Map codes) {
     def entry = codes[p.slot.toString()]
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
     if (p.action == 'delete') return !occupied
-    return occupied && entry.name?.toString() == p.name && entry.code.toString() == p.code
+    return occupied && entry.name?.toString() == p.name?.toString() && sameCode(entry.code, p.code?.toString())
 }
 
-// Scheduled check. check 1 (30s after a send) confirms early; check 2 (the
-// final one for that attempt) re-sends, or fails after CODE_MAX_ATTEMPTS.
-void verifyCodeChange(Map data) {
+// Scheduled: runs every check that is due, then schedules the next one.
+void verifyCodeChanges() {
     expirePendingCodeChanges()
-    Map p = pendingCodeChanges()[data?.key]
-    if (!p || p.status != 'pending' || (p.seq as long) != (data.seq as long)) return
+    long due = now() + 1000L
+    pendingCodeChanges().findAll { k, p -> p.status == 'pending' && (p.checkAt as long) <= due }.keySet().each { verifyCodeChange(it) }
+    savePendingCodeChanges(pendingCodeChanges())
+}
+
+// Check 1 (30s after a send) confirms early; check 2 (the attempt's final
+// check) re-sends, or fails after CODE_MAX_ATTEMPTS.
+void verifyCodeChange(String key) {
+    Map p = pendingCodeChanges()[key]
+    if (!p || p.status != 'pending') return
     def lock = findCodeLock(p.lockId)
     if (!lockManagementActive() || !lock) {
-        finishCodeChange(p, 'failed', lock ? 'lock_management_disabled' : 'lock_not_found')
+        finishCodeChange(p, 'failed', lock ? 'lock_management_disabled' : 'lock_not_found', true)
         return
     }
     Map codes = readLockCodes(lock)
     if (codes != null && codeChangeApplied(p, codes)) {
-        finishCodeChange(p, 'confirmed', null)
+        finishCodeChange(p, 'confirmed', null, true)
         return
     }
     int attempts = p.attempts as Integer
-    if ((data.check as Integer) == 1) {
+    if ((p.check as Integer) == 1) {
         int finalAt = CODE_FINAL_CHECK_SECONDS[Math.min(attempts, CODE_FINAL_CHECK_SECONDS.size()) - 1]
-        scheduleCodeCheck(p, 2, finalAt - CODE_FIRST_CHECK_SECONDS)
+        p.check = 2
+        p.checkAt = (p.checkAt as long) + (finalAt - CODE_FIRST_CHECK_SECONDS) * 1000L
+        Map all = pendingCodeChanges()
+        all[key] = p
+        savePendingCodeChanges(all)
         return
     }
     if (attempts >= CODE_MAX_ATTEMPTS) {
-        finishCodeChange(p, 'failed', codes == null ? 'lock_codes_unreadable' : 'not_applied')
+        finishCodeChange(p, 'failed', codes == null ? 'lock_codes_unreadable' : 'not_applied', true)
         return
     }
-    // Re-send only while the slot is still allowed.
+    // Re-send only while the slot is still allowed and still ours.
     Map r = resolvePendingChange(p)
     if (r.response) {
-        finishCodeChange(p, 'failed', r.error)
+        finishCodeChange(p, 'failed', r.error, true)
         return
     }
     log.info "SignalBricks Telemetry: ${p.action} not applied yet on ${lock.displayName} slot ${p.slot}; re-sending (attempt ${attempts + 1})"
     sendCodeChange(p, lock)
 }
 
-// Confirmed changes are dropped; failed ones stay (with any code) so the
-// retry endpoint can re-send them until they expire.
-void finishCodeChange(Map p, String result, String reason) {
-    reportCodeResult(p, result, reason)
+// Failed reasons the retry endpoint can still fix; any other failure drops
+// the change (and its code).
+@Field static final Set<String> RETRYABLE_FAILURES = ['not_applied', 'lock_codes_unreadable'] as Set
+
+// Reports the outcome (when `report`) and stores the change's final state:
+// confirmed or permanently failed changes are dropped, retryable failures are
+// kept for the retry endpoint until they expire.
+void finishCodeChange(Map p, String result, String reason, Boolean report) {
+    if (report) reportCodeResult(p, result, reason)
     Map all = pendingCodeChanges()
     String key = pendingKey(p.lockId, p.slot as Integer)
-    if (result == 'failed') {
+    if (result == 'failed' && RETRYABLE_FAILURES.contains(reason)) {
         p.status = 'failed'
         p.reason = reason
         all[key] = p
     } else {
         all.remove(key)
+    }
+    savePendingCodeChanges(all)
+}
+
+// After POST /lockConfig: drop changes whose slot is no longer allowed (an
+// in-flight one is reported failed), since they could never be re-sent.
+void dropDisallowedCodeChanges() {
+    Map all = pendingCodeChanges()
+    Map gone = all.findAll { k, p -> slotClass(p.lockId, p.slot as Integer) == null }
+    if (!gone) return
+    gone.each { k, p ->
+        if (p.status == 'pending') reportCodeResult(p, 'failed', 'slot_not_allowed')
+        all.remove(k)
     }
     savePendingCodeChanges(all)
 }
@@ -1109,7 +1191,10 @@ void expirePendingCodeChanges() {
 void resumePendingCodeChanges() {
     expirePendingCodeChanges()
     Map all = pendingCodeChanges()
-    all.values().findAll { it.status == 'pending' }.each { scheduleCodeCheck(it, 1, CODE_FIRST_CHECK_SECONDS) }
+    all.values().findAll { it.status == 'pending' }.each {
+        it.check = 1
+        it.checkAt = now() + CODE_FIRST_CHECK_SECONDS * 1000L
+    }
     savePendingCodeChanges(all)
 }
 
@@ -1118,7 +1203,6 @@ void resumePendingCodeChanges() {
 void abandonPendingCodeChanges(String reason) {
     pendingCodeChanges().values().findAll { it.status == 'pending' }.each { reportCodeResult(it, 'failed', reason) }
     savePendingCodeChanges([:])
-    unschedule('verifyCodeChange')
 }
 
 // Sent like a telemetry event (same ingest URL and token), so it arrives as

@@ -271,7 +271,7 @@ app.lockManagementEnabled = false
 int before = app.posts.findAll { it.cb == 'registerCallback' }.size()
 check('in-flight changes exist before disable', app.state.pendingCodeChanges?.values()?.any { it.status == 'pending' })
 check('sync handled disable', app.syncLockManagementEnabled() == true)
-check('pending changes (and codes) dropped on disable', app.state.pendingCodeChanges == null && !app.scheduled.any { it.handler == 'verifyCodeChange' })
+check('pending changes (and codes) dropped on disable', app.state.pendingCodeChanges == null && !app.scheduled.any { it.handler == 'verifyCodeChanges' })
 check('in-flight changes reported failed on disable', app.posts.any { it.params.body?.contains('lock_management_disabled') })
 check('token rotated on disable', app.state.accessToken != oldToken)
 check('rules cleared on disable', app.state.lockConfig == null && app.approvedAdoptedSlots == null)
@@ -305,6 +305,7 @@ def cfg9 = [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['9': 
 app.request = [JSON: cfg9]
 check('config with lock 9 accepted', app.apiSetLockConfig().status == 200)
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
+app.fakeNow = System.currentTimeMillis()
 app.state.remove('pendingCodeChanges'); app.state.retryTimes = []
 List responses = []
 def call = { String handler -> def r = app."${handler}"(); responses << r; r }
@@ -314,14 +315,16 @@ def results = {
         b + [d: new JsonSlurper().parseText(b.data)]
     }
 }
-// Runs the next scheduled verification check; returns its data.
+// Moves the clock to the scheduled verification job and runs it; returns the job.
 def tick = {
-    def job = app.scheduled.find { it.handler == 'verifyCodeChange' }
+    def job = app.scheduled.find { it.handler == 'verifyCodeChanges' }
     if (!job) return null
     app.scheduled.remove(job)
-    app.verifyCodeChange(job.data)
+    app.fakeNow += (job.secs as long) * 1000L
+    app.verifyCodeChanges()
     job
 }
+def verifyJobs = { app.scheduled.findAll { it.handler == 'verifyCodeChanges' } }
 def pendingFor = { Integer slot -> app.state.pendingCodeChanges?.get("9:${slot}".toString()) }
 String R1 = '3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b'
 
@@ -332,13 +335,13 @@ def setResp = call('apiSetCode')
 check('set 202 echoes platform requestId (lower-cased)', setResp.status == 202 && body(setResp).requestId == R1)
 check('set response has no code', !setResp.data.contains('90903333') && !body(setResp).containsKey('code'))
 check('pending kept with code in state', pendingFor(3)?.code == '90903333' && pendingFor(3).attempts == 1 && pendingFor(3).requestId == R1)
-check('first check scheduled at 30s', app.scheduled.find { it.handler == 'verifyCodeChange' }?.secs == 30)
+check('first check scheduled at 30s', verifyJobs()*.secs == [30])
 check('expiry scheduled ~24h', app.scheduled.find { it.handler == 'expirePendingCodeChanges' }?.secs >= 86399)
 tick()
 def r1 = results()[-1]
 check('confirmed result event', r1.name == 'lock_code_result' && r1.value == 'confirmed' && r1.deviceId == '9')
 check('confirmed payload', r1.d == [lockId: '9', slot: 3, action: 'set', result: 'confirmed', attempts: 1, requestId: R1, name: 'SBA: Cleaner'])
-check('confirmed change cleared', pendingFor(3) == null && !app.scheduled.any { it.handler == 'verifyCodeChange' })
+check('confirmed change cleared', pendingFor(3) == null && !verifyJobs())
 check('result sent to ingest URL with ingestion token', app.posts[-1].params.uri == 'https://ingest.test/v1/webhooks/hubitat' && app.posts[-1].params.headers.Authorization == 'Bearer ingest-fake')
 
 // Request ids
@@ -362,9 +365,8 @@ lock3.dropCommands = 1
 app.request = [JSON: [slot: 4, code: '90904444', name: 'SBA: Plumber']]
 call('apiSetCode')
 int n = results().size()
-def j1 = tick()
-def finalJob = app.scheduled.find { it.handler == 'verifyCodeChange' }
-check('not applied at 30s: final check at 120s', j1.data.check == 1 && finalJob.secs == 90 && finalJob.data.check == 2 && results().size() == n)
+tick()
+check('not applied at 30s: final check at 120s', pendingFor(4).check == 2 && verifyJobs()*.secs == [90] && results().size() == n)
 tick()
 check('re-sent after attempt 1', lock3.calls.count { it == ['setCode', 4, 'SBA: Plumber'] } == 2 && pendingFor(4).attempts == 2)
 tick()
@@ -378,8 +380,7 @@ List finalDelays = []
 while (true) {
     def job = tick()
     if (!job) break
-    def next = app.scheduled.find { it.handler == 'verifyCodeChange' }
-    if (next?.data?.check == 2) finalDelays << next.secs
+    if (pendingFor(5)?.status == 'pending' && pendingFor(5).check == 2) finalDelays << verifyJobs()[0].secs
 }
 def failed = results()[-1]
 check('failed after 3 attempts', failed.value == 'failed' && failed.d.attempts == 3 && failed.d.reason == 'not_applied')
@@ -416,11 +417,12 @@ call('apiSetCode')
 tick()
 app.request = [JSON: [admin: [from: 1, to: 5], managed: [from: 11, to: 25], locks: ['9': [adopted: [20]]]]]
 app.apiSetLockConfig()
+check('narrowed rules: in-flight change reported failed', results()[-1].value == 'failed' && results()[-1].d.reason == 'slot_not_allowed' && results()[-1].d.attempts == 1)
+check('narrowed rules: change (and code) dropped', pendingFor(6) == null)
 tick()
-check('not re-sent when slot no longer allowed', results()[-1].value == 'failed' && results()[-1].d.reason == 'slot_not_allowed' && results()[-1].d.attempts == 1)
 check('only one send', lock3.calls.count { it[0] == 'setCode' && it[1] == 6 } == 1)
 app.params = [lockId: '9', slot: '6']
-check('retry refused by the same rules', call('apiRetryCode').status == 403)
+check('retry after narrowing -> 404', call('apiRetryCode').status == 404)
 app.request = [JSON: cfg9]
 app.apiSetLockConfig()
 
@@ -469,20 +471,117 @@ app.params = [lockId: '9']
 app.request = [JSON: [slot: 8, code: '90908888', name: 'SBA: Resume']]
 call('apiSetCode')
 app.initialize()
-def resumed = app.scheduled.find { it.handler == 'verifyCodeChange' }
-check('initialize resumes verification', resumed?.data?.key == '9:8' && app.scheduled.any { it.handler == 'expirePendingCodeChanges' })
+check('initialize resumes verification', verifyJobs()*.secs == [30] && pendingFor(8).check == 1 && app.scheduled.any { it.handler == 'expirePendingCodeChanges' })
 
 // Expiry: a failed change goes after 24h; one still in flight is reported failed
 while (tick()) {}
 check('slot 8 failed', pendingFor(8)?.status == 'failed')
 app.request = [JSON: [slot: 9, code: '90909999', name: 'SBA: Late']]
 call('apiSetCode')
-app.fakeNow = System.currentTimeMillis() + 24L * 60 * 60 * 1000 + 1000
+app.fakeNow += 24L * 60 * 60 * 1000 + 1000
 app.expirePendingCodeChanges()
 check('expired in-flight change reported failed', results()[-1].value == 'failed' && results()[-1].d.reason == 'expired' && results()[-1].d.slot == 9)
 check('expired changes (and codes) cleared', app.state.pendingCodeChanges == null && !app.scheduled.any { it.handler == 'expirePendingCodeChanges' })
 app.params = [lockId: '9', slot: '8']
 check('retry after expiry -> 404', call('apiRetryCode').status == 404)
+
+// Slot taken over since the request (#520 review): no re-send, change dropped
+def putSlot = { Integer slot, String name, def code ->
+    Map m = new JsonSlurper().parseText(lock3.attrs.lockCodes) as Map
+    if (name == null) m.remove(slot.toString()) else m[slot.toString()] = [name: name, code: code]
+    lock3.attrs.lockCodes = groovy.json.JsonOutput.toJson(m)
+}
+app.state.writeTimes = []
+lock3.dropCommands = 99
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 11, code: '91911111', name: 'SBM: Temp']]
+call('apiSetCode')
+tick()
+putSlot(11, 'SBM: Other', '91919999')
+tick()
+check('set: slot taken by another name -> failed slot_changed', results()[-1].value == 'failed' && results()[-1].d.reason == 'slot_changed' && results()[-1].d.slot == 11)
+check('set: not re-sent, change dropped', lock3.calls.count { it[0] == 'setCode' && it[1] == 11 } == 1 && pendingFor(11) == null)
+putSlot(12, 'SBM: Old', '91912222')
+app.params = [lockId: '9', slot: '12']
+call('apiDeleteCode')
+tick()
+putSlot(12, 'SBM: New', '91912223')
+tick()
+check('delete: slot renamed since request -> failed slot_changed', results()[-1].d.reason == 'slot_changed' && results()[-1].d.action == 'delete' && pendingFor(12) == null)
+check('delete: not re-sent', lock3.calls.count { it == ['deleteCode', 12] } == 1)
+// Set over an existing SBM: code: the slot may still hold its earlier name
+putSlot(14, 'SBM: Before', '91914440')
+lock3.dropCommands = 1
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 14, code: '91914444', name: 'SBM: After']]
+call('apiSetCode')
+tick(); tick(); tick()
+check('set: slot still holding its earlier name is re-sent and confirmed', results()[-1].value == 'confirmed' && results()[-1].d.attempts == 2)
+// Retry endpoint refuses (and drops) a failed change whose slot changed
+lock3.dropCommands = 99
+app.request = [JSON: [slot: 13, code: '91913333', name: 'SBM: Retry']]
+call('apiSetCode')
+while (tick()) {}
+check('slot 13 failed and kept', pendingFor(13)?.status == 'failed')
+putSlot(13, 'SBM: Someone', '91913334')
+int nRes = results().size()
+app.params = [lockId: '9', slot: '13']
+def chResp = call('apiRetryCode')
+check('retry on changed slot -> 409 slot_changed', chResp.status == 409 && body(chResp).error == 'slot_changed')
+check('retry on changed slot: dropped, failure not re-reported', pendingFor(13) == null && results().size() == nRes)
+lock3.dropCommands = 0
+
+// Lock removed from lock code management: failed and dropped
+lock3.dropCommands = 99
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 15, code: '91915555', name: 'SBM: Gone']]
+call('apiSetCode')
+app.codeLocks = [lock, lock2]
+tick()
+check('lock no longer selected -> failed lock_not_found, dropped', results()[-1].d.reason == 'lock_not_found' && pendingFor(15) == null)
+app.codeLocks = [lock, lock2, lock3]
+lock3.dropCommands = 0
+
+// Cap on pending changes
+Map full = [:]
+(1..99).each { full["9:${200 + it}".toString()] = [lockId: '9', slot: 200 + it, action: 'delete', requestId: R1, attempts: 3, createdAt: app.now(), status: 'failed', seq: 1] }
+full['9:16'] = [lockId: '9', slot: 16, action: 'delete', requestId: R1, attempts: 3, createdAt: app.now(), status: 'failed', seq: 1]
+app.state.pendingCodeChanges = full
+app.request = [JSON: [slot: 17, code: '91917777', name: 'SBM: Cap']]
+def capResp = call('apiSetCode')
+check('100 pending -> 429 too_many_pending', capResp.status == 429 && body(capResp).error == 'too_many_pending')
+app.request = [JSON: [slot: 16, code: '91916666', name: 'SBM: Replace']]
+check('replacing a pending slot is allowed at the cap', call('apiSetCode').status == 202 && pendingFor(16).code == '91916666')
+app.state.remove('pendingCodeChanges')
+app.scheduled.clear()
+
+// Write rate limit (30/min, separate from reveal/retry)
+lock3.applyCommands = false
+app.state.writeTimes = []
+app.request = [JSON: [slot: 17, code: '91917777', name: 'SBM: Rate']]
+(1..30).each { call('apiSetCode') }
+check('31st set in a minute -> 429', call('apiSetCode').status == 429)
+check('one pending change and one check job per slot after 30 sets', app.state.pendingCodeChanges.size() == 1 && verifyJobs().size() == 1)
+app.params = [lockId: '9', slot: '17']
+check('retry has its own bucket', call('apiRetryCode').status == 202)
+app.fakeNow += 61000L
+app.params = [lockId: '9']
+check('write limit resets after a minute', call('apiSetCode').status == 202)
+app.state.remove('pendingCodeChanges')
+app.scheduled.clear()
+lock3.applyCommands = true
+
+// Code comparison: strings, numbers only as the driver reported them
+check('sameCode: string match', app.sameCode('01234', '01234'))
+check('sameCode: string leading zero differs', !app.sameCode('1234', '01234'))
+check('sameCode: numeric report vs leading-zero code', app.sameCode(1234, '01234'))
+check('sameCode: numeric report exact', app.sameCode(1234, '1234') && !app.sameCode(12345, '1234'))
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 18, code: '01818', name: 'SBM: Zero']]
+call('apiSetCode')
+putSlot(18, 'SBM: Zero', 1818)
+tick()
+check('numeric lockCodes value confirms a leading-zero code', results()[-1].value == 'confirmed' && results()[-1].d.slot == 18)
 app.fakeNow = null
 
 // Disconnect drops pending changes too
@@ -493,7 +592,7 @@ app.appButtonHandler('btnDisconnect')
 check('disconnect reports and clears', results()[-1].d.reason == 'disconnected' && app.state.pendingCodeChanges == null)
 
 // No code anywhere outside app state
-List codes = ['90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
+List codes = ['91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
 String everything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })
