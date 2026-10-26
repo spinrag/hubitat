@@ -601,6 +601,10 @@ Boolean rangesOverlap(Map a, Map b) {
 // "Forbes" or "Orbit" don't match. Known gap: the idAtEnd forms
 // "Guest-ORB<id>" and "Guest -ORB<id>" don't match either.
 @Field static final java.util.regex.Pattern BOOKING_NAME = ~/(^|\s)ORB/
+// Stricter rule for names SignalBricks writes: signalbricksIntegration claims
+// any name with "ORB" followed by digits anywhere (helperOnlySbCodes), so such
+// a name could be taken over or deleted by the booking app.
+@Field static final java.util.regex.Pattern CLAIMABLE_NAME = ~/ORB\d/
 
 Boolean isBookingName(String name) {
     return name != null && BOOKING_NAME.matcher(name).find()
@@ -825,8 +829,11 @@ Map apiSetCode() {
     if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
         return jsonResponse([error: 'invalid_name', message: "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters"], 400)
     }
-    // Never create a name the booking guard (and the booking apps) would read as a booking code.
-    if (isBookingName(name)) return jsonResponse([error: 'name_not_allowed', message: 'names must not have an upper-case ORB at the start or after a space'], 403)
+    // Never create a name the booking guard would read as a booking code, or
+    // one signalbricksIntegration would claim (ORB followed by a digit anywhere).
+    if (isBookingName(name) || CLAIMABLE_NAME.matcher(name).find()) {
+        return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space'], 403)
+    }
     Map r = resolveAllowedSlot(params.lockId, body.slot, true)
     if (r.response) return r.response
     // Created codes carry their class marker; adopted slots keep their name.
