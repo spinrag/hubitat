@@ -18,6 +18,7 @@ abstract class HubitatStub extends Script {
     List posts = []
     def log = [info: { logged << it }, warn: { logged << it }, debug: { logged << it }, error: { logged << it }]
     def app = new FakeApp(this)
+    def location = [name: 'Test', hub: [firmwareVersionString: '2.4.1.177']]
     void definition(Map m) {}
     void preferences(Closure c) {}
     void mappings(Closure c) {}
@@ -976,6 +977,91 @@ List keyForms = [KEY, KEY2, keyBytes.encodeHex().toString(), key2Bytes.encodeHex
 String fpEverything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + fpResponses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.contains(it) })
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
+
+// --- Re-register after an update that didn't run updated() (#539) ---
+String VERSION = '1.3.1'
+def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
+def event = { app.eventHandler(evt) }
+app.posts.clear(); app.logged.clear(); app.scheduled.clear()
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.remove('pendingCodeChanges')
+app.state.registeredVersion = '1.3.0'
+app.state.remove('reregisterAttemptAt')
+app.fakeNow = 1_800_000_000_000L
+event()
+def evBody = new JsonSlurper().parseText(app.posts.find { it.cb == 'postCallback' }.params.body)
+check('version: event carries the app and firmware versions', evBody.version == VERSION && evBody.hubFirmwareVersion == '2.4.1.177')
+check('version: changed version re-registers on the next event', registers().size() == 1 && regBody().version == VERSION && regBody().lockManagement == true)
+check('version: registration carries the hub firmware version', regBody().hubFirmwareVersion == '2.4.1.177')
+event()
+check('version: rate-limited, no second register before the callback', registers().size() == 1)
+app.registerCallback(new FakeResp(status: 500, body: 'not json'), [enabled: true])
+check('version: failed register leaves the version unregistered', app.state.registeredVersion == '1.3.0')
+app.fakeNow += 29L * 60 * 1000
+event()
+check('version: no retry inside 30 minutes', registers().size() == 1)
+app.fakeNow += 2L * 60 * 1000
+app.verifyCodeChanges()
+check('version: scheduled check retries after 30 minutes', registers().size() == 2)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true])
+check('version: success records the registered version', app.state.registeredVersion == VERSION)
+app.fakeNow += 60L * 60 * 1000
+event()
+check('version: same version never re-registers', registers().size() == 2)
+
+// Reconnect-required answer: recorded, so it isn't retried every 30 minutes
+app.state.registeredVersion = '1.3.0'
+app.fakeNow += 60L * 60 * 1000
+event()
+app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden","code":"TOKEN_NOT_BOUND_TO_APP"}'), [enabled: true])
+app.fakeNow += 60L * 60 * 1000
+event()
+check('version: reconnect-required answer not retried', registers().size() == 3 && app.state.registeredVersion == VERSION)
+app.state.remove('lockMgmtReconnectRequired')
+
+// Off and never registered (telemetry only): never registers
+app.posts.clear()
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.state.lockMgmtRegistered = false
+app.state.remove('lockMgmtRegisteredAt')
+app.state.registeredVersion = '1.2.1'
+app.fakeNow += 60L * 60 * 1000
+event()
+check('version: lock management off and unregistered: no register', registers().isEmpty())
+// Off but registered: the disable goes out, as on Done
+app.state.lockMgmtRegistered = true
+event()
+check('version: off but registered: disable sent', registers().size() == 1 && regBody().lockManagement == false && regBody().appAccessToken == null)
+
+// Not connected: nothing
+app.posts.clear()
+app.lockManagementEnabled = true
+app.state.remove('reregisterAttemptAt')
+app.state.remove('sbToken')
+app.verifyCodeChanges()
+check('version: not connected: no register', registers().isEmpty())
+app.state.sbToken = 'ingest-fake'
+
+// A post that throws is logged by class name only (the body has the access token)
+app.throwOnPost = true
+app.logged.clear()
+app.reregisterIfVersionChanged()
+app.throwOnPost = false
+check('version: failed post logged without the token', app.logged.any { it.toString().contains('IllegalArgumentException') } && !app.logged.any { it.toString().contains(app.state.accessToken) })
+
+// No firmware reported: the field is null, registration still goes out
+app.location = null
+app.posts.clear()
+app.registerWithPlatform()
+check('version: no location -> hubFirmwareVersion null', registers().size() == 1 && regBody().hubFirmwareVersion == null)
+
+app.appButtonHandler('btnDisconnect')
+check('version: disconnect clears the registered version', app.state.registeredVersion == null && app.state.reregisterAttemptAt == null)
+check('version: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
