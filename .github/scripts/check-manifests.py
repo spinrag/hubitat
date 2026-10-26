@@ -6,10 +6,11 @@
 - each app's version in its source matches its packageManifest version
   (drivers are checked too when their source declares a version)
 - beta channel: a betaLocation is a file in this repo whose version is the
-  manifest's betaVersion, or its version when no beta is out; a betaVersion
-  needs betaReleaseNotes and must be one HPM offers over version
+  manifest's betaVersion; with no beta out it must be identical to the stable
+  file; a betaVersion needs betaReleaseNotes and must be one HPM offers over version
 - repository.json entries point at existing manifests, and every manifest is listed
 """
+import filecmp
 import json
 import re
 import subprocess
@@ -80,6 +81,8 @@ for path in manifests:
         # HPM installs the stable code instead when compareVersions(betaVersion, version) != -1.
         if beta_version == version:
             errors.append(f"{path}: betaVersion equals version {version}; remove betaVersion and betaReleaseNotes when promoting a beta")
+        elif not all(re.fullmatch(r"\d+(\.\d+)*", re.sub(r"[^\d.]", "", v)) for v in (beta_version, version)):
+            errors.append(f"{path}: malformed version or betaVersion ({version!r}, {beta_version!r}); use dotted numbers like 1.3.3")
         elif hpm_compare(beta_version, version) != -1:
             errors.append(f"{path}: HPM would not offer betaVersion {beta_version} over version {version}; every part of betaVersion must be at least the same part of version")
         if not m.get("betaReleaseNotes"):
@@ -112,14 +115,18 @@ for path in manifests:
             if beta_src not in tracked:
                 errors.append(f"{path}: {kind} betaLocation {entry['betaLocation']!r} is not a file in this repo")
                 continue
-            # Between betas the beta copy is the stable code: HPM installs it on hubs opted in to betas.
-            expected = beta_version or version
+            if not beta_version:
+                # Between betas HPM still installs the beta copy on hubs opted in to betas.
+                if not filecmp.cmp(src, beta_src, shallow=False):
+                    errors.append(f"{beta_src}: beta copy differs from stable while no beta is out; cp {src} {beta_src}")
+                else:
+                    print(f"OK   {beta_src} is identical to {src} (no beta out)")
+                continue
             found = source_version(beta_src)
-            if found != expected:
-                field = "betaVersion" if beta_version else "version (no betaVersion)"
-                errors.append(f"{beta_src}: version {found} does not match {path} {field} {expected}")
+            if found != beta_version:
+                errors.append(f"{beta_src}: version {found} does not match {path} betaVersion {beta_version}")
             else:
-                print(f"OK   {beta_src} version {found} matches {path} {'betaVersion' if beta_version else 'version'}")
+                print(f"OK   {beta_src} version {found} matches {path} betaVersion")
 
 repo = load("repository.json")
 listed = set()
