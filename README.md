@@ -60,8 +60,9 @@ Manages short-term-rental door codes on Z-Wave / Zigbee locks, driven by booking
 Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app.
 
 - One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste.
-- Never subscribes to `lockCodes`, never sends PINs, never controls devices
+- Telemetry never subscribes to `lockCodes`, never sends PINs, never controls devices
 - Non-blocking `asynchttpPost` delivery
+- Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, with hub-side slot enforcement
 
 📂 [`signalbricksTelemetry`](signalbricksTelemetry/)
 

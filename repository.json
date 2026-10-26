@@ -15,7 +15,7 @@
 		},
 		{
 			"name": "SignalBricks Telemetry",
-			"description": "Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Never sends device commands or lock PINs.",
+			"description": "Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks; telemetry never sends lock PINs. Optional, off-by-default lock code management for admin and managed codes.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksTelemetry/packageManifest.json",
 			"category": "Integrations",
 			"tags": ["Cloud", "Locks", "Doors & Windows", "Temperature & Humidity", "Monitoring"]
