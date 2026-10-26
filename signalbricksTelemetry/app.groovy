@@ -13,7 +13,7 @@
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
  * but only up to a ceiling set in this app's UI; adopted slots above it need
  * the operator's approval in the UI. Slots whose name has an upper-case "ORB"
- * at the start or after a space (booking codes) are always refused, and
+ * at the start or after a space or hyphen (booking codes) are always refused, and
  * created names must carry SBA:/SBM: and never such an "ORB".
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
@@ -595,12 +595,13 @@ Boolean rangesOverlap(Map a, Map b) {
 }
 
 // Booking codes from the SignalBricks Integration / OwnerRez apps: an
-// upper-case "ORB" at the start of the name or right after whitespace,
-// case-sensitive. Covers "ORB<id>-Guest" (signalbricksIntegration's default
-// with an empty prefix) and "<prefix> ORB<id>…"; ordinary words such as
-// "Forbes" or "Orbit" don't match. Known gap: the idAtEnd forms
-// "Guest-ORB<id>" and "Guest -ORB<id>" don't match either.
-@Field static final java.util.regex.Pattern BOOKING_NAME = ~/(^|\s)ORB/
+// upper-case "ORB" at the start of the name or right after whitespace or a
+// hyphen, case-sensitive. Covers "ORB<id>-Guest" (signalbricksIntegration's
+// default with an empty prefix), "<prefix> ORB<id>…" and the idAtEnd forms
+// "Guest-ORB<id>" (signalbricksIntegration) and "Guest -ORB<id>" (OwnerRez
+// fork); ordinary words such as "Forbes" or "Orbit" don't match. The platform
+// mirrors this rule (signalbricks/platform#512).
+@Field static final java.util.regex.Pattern BOOKING_NAME = ~/(^|[\s-])ORB/
 // Stricter rule for names SignalBricks writes: signalbricksIntegration claims
 // any name with "ORB" followed by digits anywhere (helperOnlySbCodes), so such
 // a name could be taken over or deleted by the booking app.
@@ -834,7 +835,7 @@ Map apiSetCode() {
     // Never create a name the booking guard would read as a booking code, or
     // one signalbricksIntegration would claim (ORB followed by a digit anywhere).
     if (isBookingName(name) || CLAIMABLE_NAME.matcher(name).find()) {
-        return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space'], 403)
+        return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space or hyphen'], 403)
     }
     Map r = resolveAllowedSlot(params.lockId, body.slot, true)
     if (r.response) return r.response

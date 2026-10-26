@@ -135,8 +135,10 @@ check('guard: Forbes not booking', !app.isBookingName('Forbes'))
 check('guard: ORB123-Guest booking', app.isBookingName('ORB123-Guest'))
 check('guard: GT: ORB123-Guest booking', app.isBookingName('GT: ORB123-Guest'))
 check('guard: orb123 not booking', !app.isBookingName('orb123'))
-check('guard: Guest-ORB123 not matched (known gap)', !app.isBookingName('Guest-ORB123'))
-check('guard: Guest -ORB123 not matched (known gap)', !app.isBookingName('Guest -ORB123'))
+check('guard: Guest-ORB12345 booking (idAtEnd)', app.isBookingName('Guest-ORB12345'))
+check('guard: Guest -ORB12345 booking (OwnerRez fork idAtEnd)', app.isBookingName('Guest -ORB12345'))
+check('guard: Orbit not booking', !app.isBookingName('Orbit'))
+check('guard: Re-Orbit not booking', !app.isBookingName('Re-Orbit'))
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: Café']]
 check('non-ASCII name refused', app.apiSetCode().status == 400)
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: a\nb']]
@@ -204,7 +206,11 @@ lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"SBA: Forbes"', '"na
 check('ORB123-Guest refused', app.apiDeleteCode().status == 403)
 lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"ORB123-Guest"', '"name":"GT: ORB123-Guest"')
 check('GT: ORB123-Guest refused', app.apiDeleteCode().status == 403)
-lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"GT: ORB123-Guest"', '"name":"Old"')
+lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"GT: ORB123-Guest"', '"name":"Guest-ORB12345"')
+check('Guest-ORB12345 refused', app.apiDeleteCode().status == 403)
+lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"Guest-ORB12345"', '"name":"Guest -ORB12345"')
+check('Guest -ORB12345 refused', app.apiDeleteCode().status == 403)
+lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"Guest -ORB12345"', '"name":"Old"')
 app.state.revealTimes = []
 
 app.params = [lockId: '7', slot: '12']
