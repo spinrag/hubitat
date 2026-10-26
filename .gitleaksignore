@@ -1,0 +1,4 @@
+# Findings reviewed and accepted. One fingerprint per line (from gitleaks output).
+# OAUTH_CLIENT_SECRET in an early SignalBricks Telemetry commit: shipped in public
+# source as an app identifier; the app now uses a public PKCE client with no secret.
+0c80a7d85847a0ca1d57c0041556dfb62f826f79:signalbricksTelemetry/app.groovy:generic-api-key:29
