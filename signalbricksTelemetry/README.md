@@ -57,21 +57,27 @@ Already-connected hubs need only an app update:
 1. Update **SignalBricks Telemetry** to 1.1.0 or later (HPM **Update**, or paste the new `app.groovy` in **Apps Code** and **Save**).
 2. Open the app. Under **Lock code management (optional)**, turn on **Enable lock code management**.
 3. Select the locks SignalBricks may manage codes on. This list is separate from the telemetry locks.
-4. Click **Done**. The app registers with SignalBricks (see below). Reopen the app and check **Registration: registered …**.
-5. Nothing can be written yet: SignalBricks first sends the slot rules (admin range, managed range, adopted slots) during lock onboarding in the portal.
+4. Check **Highest slot SignalBricks may manage** (default 25). Keep it below the booking apps' **Minimum code position**.
+5. Click **Done**. The app registers with SignalBricks (see below). Reopen the app and check **Registration: registered …**.
+6. Nothing can be written yet: SignalBricks first sends the slot rules (admin range, managed range, adopted slots) during lock onboarding in the portal. If it asks to manage existing codes above the ceiling, they are listed in the app under **Approve these slots**. Approve only codes you recognise as admin or managed codes.
 
-New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 4.
+New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 5.
 
-To turn it off, switch off **Enable lock code management** and click **Done**. The app rotates its access token (so the token SignalBricks held stops working) and tells SignalBricks lock management is off. **Disconnect** does the same.
+To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**. The app rotates its access token (so the token SignalBricks held stops working), clears the slot rules and approvals, and tells SignalBricks lock management is off. **Disconnect** does the same.
+
+While lock code management is on, **Reconnect to SignalBricks** is hidden, because the connect link would carry the access token SignalBricks uses for lock control. To reconnect, turn lock code management off, reconnect, then turn it back on.
 
 ### What the hub enforces
 
-The hub, not SignalBricks, decides which slots may be touched, so a compromised platform still can't change booking codes:
+The hub decides which slots may be touched. Anyone holding the app's access token (SignalBricks, or someone who stole it) can only reach what the operator allowed in the app UI:
 
-- **Allowed slots** = admin range ∪ managed range ∪ the lock's adopted slots. SignalBricks sets these with `POST /lockConfig`. Until it does, every write and reveal is refused. Any other slot gets `403`.
-- **Names:** a code set in the admin range must be named `SBA: …`, in the managed range `SBM: …`. Adopted slots (existing codes recorded in place at onboarding) keep their current names.
+- **Ceiling (local only):** *Highest slot SignalBricks may manage*, default 25, is set only in the app UI. `POST /lockConfig` is refused (`400`) if the admin or managed range goes above it. Lowering the ceiling later immediately refuses slots above it.
+- **Allowed slots** = admin range ∪ managed range (both ≤ ceiling) ∪ the lock's adopted slots. Adopted slots at or below the ceiling are allowed. Adopted slots **above** it stay refused until the operator approves them in the app UI. The API can never approve them. Before a config exists, every write and reveal is refused. Any other slot gets `403`.
+- **Booking codes:** any slot whose current name matches `ORB<digits>` (case-insensitive) is always refused for write, delete and reveal, even if adopted and approved.
+- **Names:** a code set in the admin range must be named `SBA: …`, in the managed range `SBM: …`. Adopted slots (existing codes recorded in place at onboarding) keep their current names. Every name must be 1–64 printable ASCII characters and must not contain `ORB` (any case), so the booking apps' name matching can never claim it.
+- **Existing codes:** in the admin and managed ranges, a slot holding a code without that range's `SBA:`/`SBM:` marker can't be overwritten, deleted or revealed until it is adopted. Empty slots may be written.
 - Codes must be 4 to 10 digits. Slots above the lock's `maxCodes` are refused.
-- **Reveal** returns one slot's code, only for allowed slots, at most 10 times a minute across the app (`429` beyond that).
+- **Reveal** returns one slot's code, only for `SBA:`/`SBM:` codes in their ranges or allowed adopted slots, at most 10 times a minute across the app (`429` beyond that).
 - Codes are never logged, never stored by the app and never sent as telemetry. Logs record the lock and slot only.
 
 Recommended layout (signalbricks/platform#472): admin slots 1–10, managed 11–25, and the booking apps' **Minimum code position** set to 26 so booking codes fill upward from there.
@@ -87,10 +93,10 @@ All are served from the hub's cloud endpoint (`https://cloud.hubitat.com/api/<hu
 | `POST` | `/locks/:id/codes` | `{slot, code, name}` → `202 {lockId, slot, status: "pending"}`. The lock confirms asynchronously: re-read `/slots`. |
 | `DELETE` | `/locks/:id/codes/:slot` | → `202 {lockId, slot, status: "pending"}` |
 | `GET` | `/locks/:id/codes/:slot/reveal` | `{lockId, slot, name, code}`; `429` when rate-limited |
-| `GET` | `/lockConfig` | `{config}` (`null` until set) |
-| `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]}}}` replaces the rules. Ranges must be within 1–1000 and must not overlap; lock ids must be selected for lock code management. `400` with a message otherwise. |
+| `GET` | `/lockConfig` | `{config, ceiling, pendingApproval}`. `config` is `null` until set. `pendingApproval` lists `"<lockId>:<slot>"` adopted slots above the ceiling that the operator hasn't approved. |
+| `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]}}}` replaces the rules and returns the same shape as `GET`. Ranges must not overlap and must stay within 1..ceiling. Lock ids must be selected for lock code management. Otherwise `400` with a message. |
 
-Errors: `400` invalid input, `403` slot or name not allowed, `404` not enabled / unknown lock / empty slot, `409` lock codes unreadable (see below), `429` reveal rate limit.
+Errors: `400` invalid input, `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot, `409` lock codes unreadable (see below), `429` reveal rate limit.
 
 ### Registration
 
@@ -100,7 +106,7 @@ After every Connect (once the access token has been rotated), on every **Done**,
 {"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.1.0", "lockManagement": true}
 ```
 
-SignalBricks stores the endpoint and token encrypted against the hub the ingestion token belongs to, and never logs or returns them.
+SignalBricks accepts it only with the ingestion token the Connect flow issued for this hub and app. It stores the endpoint and token encrypted against that hub, and never logs or returns them. The app sends tokens only to an `https://` ingest URL.
 
 ### Encrypted lock codes
 
@@ -117,7 +123,7 @@ Some newer lock drivers can store `lockCodes` encrypted (a driver preference suc
 ## Troubleshooting
 
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
-- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks**.
+- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** (turn lock code management off first if it's on).
 - **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
 - **Slots answer `409 lock_codes_unreadable`**: see [Encrypted lock codes](#encrypted-lock-codes).
 - Turn on **debug logging** to see each event as it is sent. Debug logging turns itself off after 30 minutes.
