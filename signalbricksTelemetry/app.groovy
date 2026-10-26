@@ -875,7 +875,7 @@ Map apiGetLockConfig() {
 Map parseFingerprintKey(def body) {
     def raw = body instanceof Map ? body.fingerprintKey : null
     if (raw == null) return [key: null]
-    String s = raw instanceof String ? raw.trim() : null
+    String s = raw instanceof String ? raw : null
     if (!(s ==~ /[A-Za-z0-9+\/]{43}=/)) return [error: "fingerprintKey must be base64 of exactly ${FINGERPRINT_KEY_BYTES} bytes"]
     byte[] bytes = s.decodeBase64()
     if (bytes.length != FINGERPRINT_KEY_BYTES) return [error: "fingerprintKey must be base64 of exactly ${FINGERPRINT_KEY_BYTES} bytes"]
@@ -960,9 +960,10 @@ Map apiListFingerprints() {
         if (!code) return
         Integer slot = k.toString().toInteger()
         if (isBookingName(v.name?.toString())) return
-        if (survey ? slot > ceiling : !slotClass(lockId, slot)) return
+        if (slot < 1 || (survey ? slot > ceiling : !slotClass(lockId, slot))) return
         slots << [slot: slot, fp: codeFingerprint(key, code)]
     }
+    log.info "SignalBricks Telemetry: fingerprints listed for ${lock.displayName} (${slots.size()} slots)"
     return jsonResponse([lockId: lockId, slots: slots.sort { it.slot }])
 }
 

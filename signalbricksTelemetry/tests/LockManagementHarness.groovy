@@ -812,7 +812,7 @@ def missing = fcall('apiListFingerprints')
 check('fp: no key -> 409 fingerprint_key_missing', missing.status == 409 && body(missing).error == 'fingerprint_key_missing')
 check('fp: GET lockConfig says no key', body(fcall('apiGetLockConfig')).fingerprintKeySet == false)
 [['bad', 'not base64'], [(new byte[16]).encodeBase64().toString(), '16 bytes'], [(new byte[33]).encodeBase64().toString(), '33 bytes'],
- [KEY.replace('=', ''), 'unpadded'], [KEY.substring(0, 42) + '_=', 'base64url char'], [12345, 'number']].each { k, why ->
+ [KEY.replace('=', ''), 'unpadded'], [' ' + KEY, 'leading space'], [KEY + '\n', 'trailing newline'], [KEY.substring(0, 42) + '_=', 'base64url char'], [12345, 'number']].each { k, why ->
     app.request = [JSON: fpCfg + [fingerprintKey: k]]
     def r = fcall('apiSetLockConfig')
     check("fp: invalid key (${why}) -> 400, nothing stored", r.status == 400 && body(r).error == 'invalid_config' && app.state.fingerprintKey == null && !r.data.contains(k.toString()))
@@ -881,6 +881,7 @@ app.state.fingerprintTimes = []
 def lockD = new FakeLock(id: '13', displayName: 'FpD', name: 'FpD', label: 'FpD')
 lockD.attrs.maxCodes = 250
 lockD.attrs.lockCodes = groovy.json.JsonOutput.toJson([
+    '0': [name: 'Zero', code: '55550000'],
     '1': [name: 'Old', code: '12340001'],
     '2': [name: 'Someone', code: '55550002'],
     '5': [name: 'ORB9-Guest', code: '55550005'],
@@ -889,7 +890,7 @@ lockD.attrs.lockCodes = groovy.json.JsonOutput.toJson([
     '30': [name: 'Above', code: '55550030'],
 ])
 app.codeLocks = [lockA, lockB, lockC, lockD]
-fpCodes += ['55550005', '91930003', '91930004']
+fpCodes += ['55550000', '55550005', '91930003', '91930004']
 app.state.fingerprintTimes = []; app.state.writeTimes = []; app.state.revealTimes = []; app.state.retryTimes = []
 [[surveyOnly: true, adopted: [1]], [surveyOnly: true, admin: [from: 1, to: 10]], [surveyOnly: 'yes'], [surveyOnly: 1]].each { e ->
     app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': e]]]
@@ -916,6 +917,7 @@ check('survey: other locks report surveyOnly false', body(fcall('apiListSlots'))
 app.params = [lockId: '13']
 def svFp = fcall('apiListFingerprints')
 check('survey: fingerprints for occupied in-ceiling slots, no booking/empty/above', svFp.status == 200 && body(svFp).slots*.slot == [1, 2, 12])
+check('survey: info log names lock and count, no fp or code', app.logged.any { it.toString() == 'SignalBricks Telemetry: fingerprints listed for FpD (3 slots)' } && !app.logged.any { it.toString().contains(body(svFp).slots[0].fp) || it.toString().contains('12340001') })
 check('survey: fp comparable with onboarded locks', body(svFp).slots.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001'))
 app.request = [JSON: [slot: 2, code: '91930004', name: 'SBA: Take']]
 def svSet = fcall('apiSetCode')
