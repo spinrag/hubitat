@@ -43,6 +43,15 @@ abstract class HubitatStub extends Script {
     String decrypt(String s) { throw new RuntimeException('no decrypt') }
 }
 
+// Hubitat AsyncResponse: getData() on success, getErrorData() on error.
+class FakeResp {
+    int status; String body
+    Boolean hasError() { status >= 400 }
+    int getStatus() { status }
+    String getData() { if (hasError()) throw new IllegalStateException('no data on error'); body }
+    String getErrorData() { body }
+}
+
 class FakeApp {
     def owner
     def id = 42
@@ -274,6 +283,7 @@ check('token rotated on enable', app.state.accessToken != 'tok-abandoned-reconne
 // Disable without Done (submitOnChange): rotate, clear rules, notify
 app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegistered = true
 String oldToken = 'tok-old'
 app.state.accessToken = oldToken
 app.lockManagementEnabled = false
@@ -301,6 +311,81 @@ app.state.ingestUrl = 'http://ingest.test/v1/webhooks/hubitat'
 before = app.posts.size()
 app.registerWithPlatform()
 check('no token over http', app.posts.size() == before)
+
+// --- Register only when needed; reconnect instead of a raw 403 (#522) ---
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+def registers = { app.posts.findAll { it.cb == 'registerCallback' } }
+def regBody = { new JsonSlurper().parseText(registers()[-1].params.body) }
+app.posts.clear(); app.logged.clear()
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.state.remove('lockMgmtRegistered'); app.state.remove('lockMgmtRegisteredAt')
+app.updated()
+check('off and never registered: Done sends no register', registers().isEmpty())
+app.registerWithPlatform(false)
+check('off and never registered: disconnect-style disable not sent', registers().isEmpty())
+app.state.lockMgmtRegisteredAt = '2026-10-20 10:00'
+app.updated()
+check('off, registered on 1.2.0 (registeredAt only): disable sent', registers().size() == 1 && regBody().lockManagement == false && regBody().appAccessToken == null)
+app.posts.clear()
+app.state.lockMgmtRegistered = true
+app.state.remove('lockMgmtRegisteredAt')
+app.updated()
+check('off, previously registered: disable sent', registers().size() == 1 && regBody().lockManagement == false)
+app.posts.clear()
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegistered = false
+app.updated()
+check('on: register sent even if never registered', registers().size() == 1 && regBody().lockManagement == true && regBody().appAccessToken)
+
+// 403 TOKEN_NOT_BOUND_TO_APP on enable: reconnect message, no raw 403, no retry
+app.posts.clear(); app.logged.clear(); app.scheduled.clear()
+app.state.remove('lockMgmtRegisterError')
+app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden","code":"TOKEN_NOT_BOUND_TO_APP"}'), [enabled: true])
+check('403 unbound: reconnect required', app.state.lockMgmtReconnectRequired == true)
+check('403 unbound: no raw error shown', app.state.lockMgmtRegisterError == null)
+check('403 unbound: logs the reconnect message', app.logged.any { it.toString().contains('Reconnect to SignalBricks to enable lock management') } && !app.logged.any { it.toString().contains('403') })
+check('403 unbound: no retry (no post, nothing scheduled)', app.posts.isEmpty() && app.scheduled.isEmpty())
+check('403 unbound: not marked registered', app.state.lockMgmtRegistered == false)
+app.logged.clear()
+app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden","code":"TOKEN_NOT_BOUND_TO_APP"}'), [enabled: true])
+check('403 unbound again: not logged again', app.logged.isEmpty())
+
+// 200 reconnect_required on a disable: same message, registration state kept
+app.state.remove('lockMgmtReconnectRequired')
+app.state.lockMgmtRegistered = true
+app.state.remove('lockMgmtRegisteredAt')
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":false,"connected":false,"reconnect_required":true}'), [enabled: false])
+check('200 reconnect_required: reconnect required', app.state.lockMgmtReconnectRequired == true && app.state.lockMgmtRegisterError == null)
+check('200 reconnect_required: not counted as registered or cleared', app.state.lockMgmtRegistered == true && app.state.lockMgmtRegisteredAt == null)
+check('200 reconnect_required: no retry', app.posts.isEmpty() && app.scheduled.isEmpty())
+
+// Other errors still show the status
+app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden"}'), [enabled: true])
+check('other 403: error shown', app.state.lockMgmtRegisterError?.endsWith('HTTP 403'))
+app.registerCallback(new FakeResp(status: 500, body: 'not json'), [enabled: true])
+check('unparseable error body: error shown', app.state.lockMgmtRegisterError?.endsWith('HTTP 500'))
+
+// Bound token: enable then disable clear the message and track registration
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"registered_at":"2026-10-26T12:00:00.000Z"}'), [enabled: true])
+check('bound enable: registered, message cleared', app.state.lockMgmtRegistered == true && app.state.lockMgmtReconnectRequired == null && app.state.lockMgmtRegisterError == null && app.state.lockMgmtRegisteredAt)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":false,"connected":false,"registered_at":"2026-10-26T12:00:00.000Z"}'), [enabled: false])
+check('bound disable: no longer registered', app.state.lockMgmtRegistered == false)
+app.posts.clear()
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.updated()
+check('after a registered disable: Done sends nothing', registers().isEmpty())
+
+// Disconnect clears the flags
+app.state.lockMgmtReconnectRequired = true
+app.state.lockMgmtRegistered = true
+app.appButtonHandler('btnDisconnect')
+check('disconnect sends the disable when registered', registers().size() == 1 && regBody().lockManagement == false)
+check('disconnect clears registration flags', app.state.lockMgmtRegistered == null && app.state.lockMgmtReconnectRequired == null)
+app.state.sbToken = 'ingest-fake'
+app.posts.clear(); app.logged.clear(); app.scheduled.clear()
 
 // --- Set/delete verification, retry and result events (#520) ---
 app.lockManagementEnabled = true

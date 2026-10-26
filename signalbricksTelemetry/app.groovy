@@ -40,7 +40,7 @@
 import groovy.json.JsonOutput
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '1.2.0'
+@Field static final String APP_VERSION = '1.2.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -66,6 +66,9 @@ import groovy.transform.Field
 @Field static final int REVEAL_LIMIT_PER_MIN = 10
 @Field static final String ADMIN_NAME_PREFIX = 'SBA:'
 @Field static final String MANAGED_NAME_PREFIX = 'SBM:'
+// Hubs connected before signalbricks/platform#505 hold an ingestion token that
+// can't register lock management; only a reconnect issues one that can (#522).
+@Field static final String RECONNECT_MESSAGE = 'Reconnect to SignalBricks to enable lock management'
 
 // Set/delete verification (#520). Each attempt is checked 30s after it is
 // sent and again at its final check; the final check backs off per attempt
@@ -155,6 +158,9 @@ Map mainPage() {
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${state.lastError}"
                 }
+                if (state.lockMgmtReconnectRequired) {
+                    paragraph "<b>Lock code management:</b> ${RECONNECT_MESSAGE}."
+                }
                 if (lockManagementEnabled) {
                     // The connect URL carries this app's access token in the
                     // OAuth state, and while lock management is on that token
@@ -190,7 +196,11 @@ Map mainPage() {
                 if (!state.sbToken) {
                     paragraph '<b>Connect to SignalBricks first.</b> Lock code management registers with SignalBricks after Connect.'
                 } else {
-                    paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                    if (state.lockMgmtReconnectRequired) {
+                        paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (turn lock code management off, reconnect above, then turn it back on)."
+                    } else {
+                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                    }
                     if (state.lockMgmtRegisterError) {
                         paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
                     }
@@ -223,7 +233,8 @@ void updated() {
     initialize()
     if (!syncLockManagementEnabled()) {
         // Re-register on every save, so enabling and app upgrades reach the
-        // platform. Cheap: one request, only when connected.
+        // platform. Cheap: one request, only when connected and lock
+        // management is on or was registered.
         registerWithPlatform()
     }
 }
@@ -308,6 +319,8 @@ void appButtonHandler(String btn) {
         state.remove('lastError')
         state.remove('lockMgmtRegisteredAt')
         state.remove('lockMgmtRegisterError')
+        state.remove('lockMgmtRegistered')
+        state.remove('lockMgmtReconnectRequired')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         createAccessToken()
@@ -500,6 +513,8 @@ Map handleOauthCallback() {
                 state.ingestUrl = body.ingest_url
                 state.connectedAt = new Date().format('yyyy-MM-dd HH:mm')
                 state.remove('lastError')
+                // A fresh Connect issues a token bound to this hub and app.
+                state.remove('lockMgmtReconnectRequired')
             } else {
                 state.lastError = "Token exchange returned HTTP ${resp.status}"
             }
@@ -537,13 +552,23 @@ Boolean lockManagementActive() {
     return lockManagementEnabled == true && state.sbToken
 }
 
+// True while SignalBricks may hold this app's endpoint: an enable was
+// registered and no disable since. Hubs upgraded from 1.2.0 only have
+// lockMgmtRegisteredAt.
+Boolean lockMgmtPreviouslyRegistered() {
+    if (state.lockMgmtRegistered != null) return state.lockMgmtRegistered == true
+    return state.lockMgmtRegisteredAt != null
+}
+
 // Registers this app's cloud endpoint and access token with SignalBricks,
 // authenticated with the ingestion token. The access token is sent only while
-// lock management is on; with it off, the platform drops what it stored.
+// lock management is on; with it off, the platform drops what it stored. A
+// disable is sent only if an earlier registration may still be stored (#522).
 // SECURITY: the body carries the app access token; never log it.
 void registerWithPlatform(Boolean enabledOverride = null) {
     if (!state.sbToken || !isHttps(state.ingestUrl)) return
     Boolean enabled = enabledOverride != null ? enabledOverride : lockManagementEnabled == true
+    if (!enabled && !lockMgmtPreviouslyRegistered()) return
     if (enabled && !state.accessToken) ensureAccessToken()
     Map body = [
         cloudEndpointBase: getFullApiServerUrl(),
@@ -565,14 +590,33 @@ void registerWithPlatform(Boolean enabledOverride = null) {
 }
 
 void registerCallback(resp, Map data) {
-    if (resp.hasError()) {
-        int status = resp.getStatus()
+    Boolean failed = resp.hasError()
+    int status = resp.getStatus()
+    Map reply = [:]
+    try {
+        def parsed = parseJson((failed ? resp.getErrorData() : resp.getData()) ?: '{}')
+        if (parsed instanceof Map) reply = parsed
+    } catch (Exception e) {
+        // Unparseable body: handled by status alone.
+    }
+    // The token can't register lock management (connected before
+    // signalbricks/platform#505). Only a reconnect fixes that, so say so and
+    // don't retry; a disable answered this way changed nothing on the platform.
+    if ((failed && status == 403 && reply.code == 'TOKEN_NOT_BOUND_TO_APP') || (!failed && reply.reconnect_required == true)) {
+        if (!state.lockMgmtReconnectRequired) log.warn "SignalBricks Telemetry: ${RECONNECT_MESSAGE}"
+        state.lockMgmtReconnectRequired = true
+        state.remove('lockMgmtRegisterError')
+        return
+    }
+    if (failed) {
         String msg = status == 401 ? 'SignalBricks rejected the token. Reconnect to SignalBricks.' : "HTTP ${status}"
         log.warn "SignalBricks Telemetry: lock management registration failed: ${msg}"
         state.lockMgmtRegisterError = "${new Date().format('yyyy-MM-dd HH:mm')} ${msg}"
         return
     }
     state.remove('lockMgmtRegisterError')
+    state.remove('lockMgmtReconnectRequired')
+    state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
     log.info "SignalBricks Telemetry: registered with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
 }
