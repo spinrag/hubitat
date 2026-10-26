@@ -18,6 +18,12 @@
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
  *
+ * Each set/delete is verified on the hub (signalbricks/platform#520): the app
+ * keeps one pending change per lock and slot, re-reads the slot from
+ * lockCodes, re-sends the command up to 3 times and reports the outcome as a
+ * `lock_code_result` event (never the code). A pending set keeps its code in
+ * app state only, until it is confirmed, superseded, cleared or 24h old.
+ *
  * Setup uses Hubitat's documented OAuth "stateredirect" pattern with
  * SignalBricks as the OAuth provider: "Connect to SignalBricks" opens the
  * SignalBricks portal, the user picks the organization/property/hub, and
@@ -34,7 +40,7 @@
 import groovy.json.JsonOutput
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '1.1.1'
+@Field static final String APP_VERSION = '1.2.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -60,6 +66,16 @@ import groovy.transform.Field
 @Field static final int REVEAL_LIMIT_PER_MIN = 10
 @Field static final String ADMIN_NAME_PREFIX = 'SBA:'
 @Field static final String MANAGED_NAME_PREFIX = 'SBM:'
+
+// Set/delete verification (#520). Each attempt is checked 30s after it is
+// sent and again at its final check; the final check backs off per attempt
+// (120s, 150s, 180s), so a change is settled within 7.5 minutes.
+@Field static final int CODE_MAX_ATTEMPTS = 3
+@Field static final int CODE_FIRST_CHECK_SECONDS = 30
+@Field static final List<Integer> CODE_FINAL_CHECK_SECONDS = [120, 150, 180]
+@Field static final long PENDING_CODE_TTL_MS = 24L * 60 * 60 * 1000
+@Field static final int RETRY_LIMIT_PER_MIN = 10
+@Field static final java.util.regex.Pattern REQUEST_ID = ~/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
 
 definition(
     name: 'SignalBricks Telemetry',
@@ -105,6 +121,9 @@ mappings {
     }
     path('/locks/:lockId/codes/:slot/reveal') {
         action: [GET: 'apiRevealCode']
+    }
+    path('/locks/:lockId/codes/:slot/retry') {
+        action: [POST: 'apiRetryCode']
     }
 }
 
@@ -173,6 +192,11 @@ Map mainPage() {
                         paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
                     }
                     paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (all code writes are refused until SignalBricks sends them)'}"
+                    Map changes = pendingCodeChanges()
+                    if (changes) {
+                        int failed = changes.values().count { it.status == 'failed' }
+                        paragraph "<b>Code changes awaiting the lock:</b> ${changes.size() - failed} in progress, ${failed} failed (SignalBricks can retry failed changes for 24 hours)"
+                    }
                     input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
                 }
             }
@@ -218,8 +242,10 @@ Boolean syncLockManagementEnabled() {
     if (!wasEnabled || enabled) return false
     log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
     createAccessToken()
+    abandonPendingCodeChanges('lock_management_disabled')
     state.remove('lockConfig')
     state.remove('revealTimes')
+    state.remove('retryTimes')
     app.removeSetting('approvedAdoptedSlots')
     registerWithPlatform(false)
     return true
@@ -237,6 +263,7 @@ void initialize() {
     if (debugLogging) {
         runIn(1800, 'logsOff')
     }
+    resumePendingCodeChanges()
 }
 
 void logsOff() {
@@ -267,6 +294,7 @@ void appButtonHandler(String btn) {
         // invalidate the access token it may hold.
         registerWithPlatform(false)
         createAccessToken()
+        abandonPendingCodeChanges('disconnected')
         state.remove('lockConfig')
         app.removeSetting('approvedAdoptedSlots')
         state.remove('sbToken')
@@ -791,8 +819,15 @@ Map apiListSlots() {
     return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), slots: slots])
 }
 
+// A refusal: [response, error]. `error` doubles as the result event's reason.
+Map refuse(String error, int status, String message = null) {
+    Map body = [error: error]
+    if (message) body.message = message
+    return [response: jsonResponse(body, status), error: error]
+}
+
 // Common checks for write/delete/reveal. Returns [lock, slot, slotClass,
-// codes, currentName] or [response]. Refuses:
+// codes, currentName] or [response, error]. Refuses:
 //   - slots outside admin/managed/approved-adopted (and above the ceiling)
 //   - any slot whose current name is a booking code (isBookingName)
 //   - in the admin/managed ranges, a slot holding a code without that
@@ -800,60 +835,130 @@ Map apiListSlots() {
 //     an empty slot may be written (`allowEmpty`), not deleted or revealed.
 Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
     def lock = findCodeLock(lockIdRaw)
-    if (!lock) return [response: jsonResponse([error: 'lock_not_found'], 404)]
+    if (!lock) return refuse('lock_not_found', 404)
     Integer slot = parseSlot(slotRaw)
-    if (slot == null) return [response: jsonResponse([error: 'invalid_slot'], 400)]
+    if (slot == null) return refuse('invalid_slot', 400)
     Integer maxCodes = maxCodesOf(lock)
-    if (maxCodes != null && slot > maxCodes) return [response: jsonResponse([error: 'invalid_slot', message: 'slot exceeds maxCodes'], 400)]
+    if (maxCodes != null && slot > maxCodes) return refuse('invalid_slot', 400, 'slot exceeds maxCodes')
     String cls = slotClass(lock.id.toString(), slot)
-    if (!cls) return [response: jsonResponse([error: 'slot_not_allowed'], 403)]
+    if (!cls) return refuse('slot_not_allowed', 403)
     Map codes = readLockCodes(lock)
-    if (codes == null) return [response: jsonResponse([error: 'lock_codes_unreadable'], 409)]
+    if (codes == null) return refuse('lock_codes_unreadable', 409)
     def entry = codes[slot.toString()]
     String currentName = entry instanceof Map ? entry.name?.toString() : null
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
-    if (isBookingName(currentName)) return [response: jsonResponse([error: 'booking_code', message: 'slot holds a booking code'], 403)]
+    if (isBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
     String prefix = classPrefix(cls)
     if (prefix && occupied && !(currentName?.startsWith(prefix))) {
-        return [response: jsonResponse([error: 'slot_not_managed', message: "slot holds a code without the ${prefix} marker; adopt it first"], 403)]
+        return refuse('slot_not_managed', 403, "slot holds a code without the ${prefix} marker; adopt it first")
     }
-    if (!occupied && !allowEmpty) return [response: jsonResponse([error: 'slot_empty'], 404)]
+    if (!occupied && !allowEmpty) return refuse('slot_empty', 404)
     return [lock: lock, slot: slot, slotClass: cls, codes: codes, currentName: currentName]
 }
 
-// Body {slot, code, name}. The lock confirms asynchronously; poll /slots.
+// Name and slot rules for a set. Checked on the request and again before
+// every re-send, so a change stops once its slot is no longer allowed.
+Map resolveSet(def lockIdRaw, def slotRaw, String name) {
+    if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
+        return refuse('invalid_name', 400, "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters")
+    }
+    // Never create a name the booking guard would read as a booking code, or
+    // one signalbricksIntegration would claim (ORB followed by a digit anywhere).
+    if (isBookingName(name) || CLAIMABLE_NAME.matcher(name).find()) {
+        return refuse('name_not_allowed', 403, 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space or hyphen')
+    }
+    Map r = resolveAllowedSlot(lockIdRaw, slotRaw, true)
+    if (r.response) return r
+    // Created codes carry their class marker; adopted slots keep their name.
+    String prefix = classPrefix(r.slotClass)
+    if (prefix && !name.startsWith(prefix)) return refuse('name_not_allowed', 403, "${r.slotClass} slots need a ${prefix} name")
+    return r
+}
+
+// Re-send checks: a delete may find the slot already empty (then the check
+// confirms it).
+Map resolvePendingChange(Map p) {
+    return p.action == 'set' ? resolveSet(p.lockId, p.slot, p.name) : resolveAllowedSlot(p.lockId, p.slot, true)
+}
+
+// Optional request id from the platform (a UUID), echoed in the response and
+// the result events; the hub makes one when it is absent.
+Map requestIdFrom(def raw) {
+    if (raw == null || raw.toString() == '') return [id: UUID.randomUUID().toString()]
+    String s = raw.toString()
+    if (!(s ==~ REQUEST_ID)) return refuse('invalid_request_id', 400, 'requestId must be a UUID')
+    return [id: s.toLowerCase()]
+}
+
+// At most `limit` calls a minute across the app, counted in state[key].
+Boolean rateLimited(String key, int limit) {
+    long nowMs = now()
+    List recent = (state[key] ?: []).findAll { (nowMs - (it as long)) < 60000L }
+    Boolean limited = recent.size() >= limit
+    if (!limited) recent << nowMs
+    state[key] = recent
+    return limited
+}
+
+// Body {slot, code, name, requestId?}. The hub verifies the change and
+// reports a lock_code_result event; /slots shows the lock's current state.
 Map apiSetCode() {
     if (!lockManagementActive()) return notEnabled()
     def body = request.JSON
     if (!(body instanceof Map)) return jsonResponse([error: 'invalid_body'], 400)
     String code = body.code?.toString()
     if (!(code ==~ /\d{4,10}/)) return jsonResponse([error: 'invalid_code', message: 'code must be 4-10 digits'], 400)
+    Map rid = requestIdFrom(body.requestId)
+    if (rid.response) return rid.response
     String name = body.name?.toString()?.trim()
-    if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
-        return jsonResponse([error: 'invalid_name', message: "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters"], 400)
-    }
-    // Never create a name the booking guard would read as a booking code, or
-    // one signalbricksIntegration would claim (ORB followed by a digit anywhere).
-    if (isBookingName(name) || CLAIMABLE_NAME.matcher(name).find()) {
-        return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space or hyphen'], 403)
-    }
-    Map r = resolveAllowedSlot(params.lockId, body.slot, true)
+    Map r = resolveSet(params.lockId, body.slot, name)
     if (r.response) return r.response
-    // Created codes carry their class marker; adopted slots keep their name.
-    String prefix = classPrefix(r.slotClass)
-    if (prefix && !name.startsWith(prefix)) return jsonResponse([error: 'name_not_allowed', message: "${r.slotClass} slots need a ${prefix} name"], 403)
-    r.lock.setCode(r.slot, code, name)
+    startCodeChange(r.lock, r.slot, 'set', name, code, rid.id)
     log.info "SignalBricks Telemetry: setCode requested on ${r.lock.displayName} slot ${r.slot}"
-    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending'], 202)
+    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
 
+// requestId may come as a query parameter (or in a JSON body, if any).
 Map apiDeleteCode() {
     if (!lockManagementActive()) return notEnabled()
+    def raw = params.requestId
+    if (raw == null) {
+        try {
+            def b = request?.JSON
+            if (b instanceof Map) raw = b.requestId
+        } catch (Exception e) {
+            raw = null
+        }
+    }
+    Map rid = requestIdFrom(raw)
+    if (rid.response) return rid.response
     Map r = resolveAllowedSlot(params.lockId, params.slot, false)
     if (r.response) return r.response
-    r.lock.deleteCode(r.slot)
+    startCodeChange(r.lock, r.slot, 'delete', r.currentName, null, rid.id)
     log.info "SignalBricks Telemetry: deleteCode requested on ${r.lock.displayName} slot ${r.slot}"
-    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending'], 202)
+    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
+}
+
+// Re-sends the hub's own pending (or failed) change for this slot, with the
+// same rules as a new request. No code in the request. Resets the attempts.
+Map apiRetryCode() {
+    if (!lockManagementActive()) return notEnabled()
+    if (rateLimited('retryTimes', RETRY_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    expirePendingCodeChanges()
+    def lock = findCodeLock(params.lockId)
+    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
+    Integer slot = parseSlot(params.slot)
+    if (slot == null) return jsonResponse([error: 'invalid_slot'], 400)
+    Map p = pendingCodeChanges()[pendingKey(lock.id.toString(), slot)]
+    if (!p) return jsonResponse([error: 'no_pending_change', message: 'nothing pending for this slot (confirmed, superseded or expired)'], 404)
+    Map r = resolvePendingChange(p)
+    if (r.response) return r.response
+    p.attempts = 0
+    p.status = 'pending'
+    p.remove('reason')
+    sendCodeChange(p, lock)
+    log.info "SignalBricks Telemetry: ${p.action} retry requested on ${lock.displayName} slot ${slot}"
+    return jsonResponse([lockId: p.lockId, slot: slot, action: p.action, status: 'pending', requestId: p.requestId], 202)
 }
 
 // One slot, allowed slots only (SBA:/SBM: names in their ranges, or approved
@@ -861,19 +966,192 @@ Map apiDeleteCode() {
 // The code is returned to the caller and never logged.
 Map apiRevealCode() {
     if (!lockManagementActive()) return notEnabled()
-    long nowMs = now()
-    List recent = (state.revealTimes ?: []).findAll { (nowMs - (it as long)) < 60000L }
-    if (recent.size() >= REVEAL_LIMIT_PER_MIN) {
-        state.revealTimes = recent
-        return jsonResponse([error: 'rate_limited'], 429)
-    }
-    recent << nowMs
-    state.revealTimes = recent
+    if (rateLimited('revealTimes', REVEAL_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
     Map r = resolveAllowedSlot(params.lockId, params.slot, false)
     if (r.response) return r.response
     String code = r.codes[r.slot.toString()].code.toString()
     log.info "SignalBricks Telemetry: code revealed for ${r.lock.displayName} slot ${r.slot}"
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, name: r.currentName, code: code])
+}
+
+// --- Set/delete verification (#520) ---
+//
+// state.pendingCodeChanges: "<lockId>:<slot>" -> {lockId, slot, action, name,
+// code (set only), requestId, attempts, createdAt, status, seq}. One per lock
+// and slot. `status` is pending (being verified) or failed (kept for the retry
+// endpoint). Entries go on confirm, supersede, disable/disconnect or 24h after
+// createdAt. The code lives only here: never log it, return it or report it.
+// `seq` changes on every send, so checks scheduled for an older send (or a
+// superseded change) find a different seq and do nothing.
+
+String pendingKey(String lockId, Integer slot) {
+    return "${lockId}:${slot}".toString()
+}
+
+Map pendingCodeChanges() {
+    return (state.pendingCodeChanges ?: [:]) as Map
+}
+
+// Reassigned on every change so Hubitat persists the nested map.
+void savePendingCodeChanges(Map all) {
+    if (all) {
+        state.pendingCodeChanges = all
+        long next = all.values().collect { it.createdAt as long }.min() + PENDING_CODE_TTL_MS
+        runIn(Math.max(1L, (long) ((next - now()) / 1000) + 1), 'expirePendingCodeChanges')
+    } else {
+        state.remove('pendingCodeChanges')
+        unschedule('expirePendingCodeChanges')
+    }
+}
+
+void startCodeChange(lock, Integer slot, String action, String name, String code, String requestId) {
+    expirePendingCodeChanges()
+    String lockId = lock.id.toString()
+    Map old = pendingCodeChanges()[pendingKey(lockId, slot)]
+    if (old?.status == 'pending' && old.requestId != requestId) reportCodeResult(old, 'superseded', null)
+    Map p = [lockId: lockId, slot: slot, action: action, name: name, requestId: requestId, attempts: 0, createdAt: now(), status: 'pending']
+    if (code) p.code = code
+    sendCodeChange(p, lock)
+}
+
+// Sends the command, stores the change and schedules its first check.
+void sendCodeChange(Map p, lock) {
+    p.attempts = (p.attempts as Integer) + 1
+    p.seq = ((state.codeChangeSeq ?: 0) as long) + 1
+    state.codeChangeSeq = p.seq
+    if (p.action == 'set') lock.setCode(p.slot as Integer, p.code, p.name)
+    else lock.deleteCode(p.slot as Integer)
+    Map all = pendingCodeChanges()
+    all[pendingKey(p.lockId, p.slot as Integer)] = p
+    savePendingCodeChanges(all)
+    scheduleCodeCheck(p, 1, CODE_FIRST_CHECK_SECONDS)
+}
+
+void scheduleCodeCheck(Map p, int check, int seconds) {
+    runIn(seconds, 'verifyCodeChange', [data: [key: pendingKey(p.lockId, p.slot as Integer), seq: p.seq, check: check], overwrite: false])
+}
+
+// Set: the slot holds the expected name and code. Delete: the slot is empty.
+Boolean codeChangeApplied(Map p, Map codes) {
+    def entry = codes[p.slot.toString()]
+    Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
+    if (p.action == 'delete') return !occupied
+    return occupied && entry.name?.toString() == p.name && entry.code.toString() == p.code
+}
+
+// Scheduled check. check 1 (30s after a send) confirms early; check 2 (the
+// final one for that attempt) re-sends, or fails after CODE_MAX_ATTEMPTS.
+void verifyCodeChange(Map data) {
+    expirePendingCodeChanges()
+    Map p = pendingCodeChanges()[data?.key]
+    if (!p || p.status != 'pending' || (p.seq as long) != (data.seq as long)) return
+    def lock = findCodeLock(p.lockId)
+    if (!lockManagementActive() || !lock) {
+        finishCodeChange(p, 'failed', lock ? 'lock_management_disabled' : 'lock_not_found')
+        return
+    }
+    Map codes = readLockCodes(lock)
+    if (codes != null && codeChangeApplied(p, codes)) {
+        finishCodeChange(p, 'confirmed', null)
+        return
+    }
+    int attempts = p.attempts as Integer
+    if ((data.check as Integer) == 1) {
+        int finalAt = CODE_FINAL_CHECK_SECONDS[Math.min(attempts, CODE_FINAL_CHECK_SECONDS.size()) - 1]
+        scheduleCodeCheck(p, 2, finalAt - CODE_FIRST_CHECK_SECONDS)
+        return
+    }
+    if (attempts >= CODE_MAX_ATTEMPTS) {
+        finishCodeChange(p, 'failed', codes == null ? 'lock_codes_unreadable' : 'not_applied')
+        return
+    }
+    // Re-send only while the slot is still allowed.
+    Map r = resolvePendingChange(p)
+    if (r.response) {
+        finishCodeChange(p, 'failed', r.error)
+        return
+    }
+    log.info "SignalBricks Telemetry: ${p.action} not applied yet on ${lock.displayName} slot ${p.slot}; re-sending (attempt ${attempts + 1})"
+    sendCodeChange(p, lock)
+}
+
+// Confirmed changes are dropped; failed ones stay (with any code) so the
+// retry endpoint can re-send them until they expire.
+void finishCodeChange(Map p, String result, String reason) {
+    reportCodeResult(p, result, reason)
+    Map all = pendingCodeChanges()
+    String key = pendingKey(p.lockId, p.slot as Integer)
+    if (result == 'failed') {
+        p.status = 'failed'
+        p.reason = reason
+        all[key] = p
+    } else {
+        all.remove(key)
+    }
+    savePendingCodeChanges(all)
+}
+
+// Drops changes older than 24h; one still being verified is reported failed.
+void expirePendingCodeChanges() {
+    Map all = pendingCodeChanges()
+    if (!all) return
+    long cutoff = now() - PENDING_CODE_TTL_MS
+    Map expired = all.findAll { k, p -> (p.createdAt as long) <= cutoff }
+    if (!expired) return
+    expired.each { k, p ->
+        if (p.status == 'pending') reportCodeResult(p, 'failed', 'expired')
+        all.remove(k)
+    }
+    savePendingCodeChanges(all)
+}
+
+// After initialize() (which unschedules everything): check in-flight changes again.
+void resumePendingCodeChanges() {
+    expirePendingCodeChanges()
+    Map all = pendingCodeChanges()
+    all.values().findAll { it.status == 'pending' }.each { scheduleCodeCheck(it, 1, CODE_FIRST_CHECK_SECONDS) }
+    savePendingCodeChanges(all)
+}
+
+// Lock management turned off or the hub disconnected: drop every change (and
+// its code); in-flight ones are reported failed.
+void abandonPendingCodeChanges(String reason) {
+    pendingCodeChanges().values().findAll { it.status == 'pending' }.each { reportCodeResult(it, 'failed', reason) }
+    savePendingCodeChanges([:])
+    unschedule('verifyCodeChange')
+}
+
+// Sent like a telemetry event (same ingest URL and token), so it arrives as
+// event type hubitat.lock_code_result. Never carries the code; the name only
+// when it is an SBA:/SBM: name.
+void reportCodeResult(Map p, String result, String reason) {
+    log.info "SignalBricks Telemetry: code ${p.action} ${result} on lock ${p.lockId} slot ${p.slot} after ${p.attempts} attempt(s)${reason ? " (${reason})" : ''}"
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    Map data = [lockId: p.lockId, slot: p.slot as Integer, action: p.action, result: result, attempts: p.attempts as Integer, requestId: p.requestId]
+    if (reason) data.reason = reason
+    String name = p.name?.toString()
+    if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isBookingName(name) && !CLAIMABLE_NAME.matcher(name).find()) {
+        data.name = name
+    }
+    Map payload = [
+        id: "lock_code_result:${p.requestId}:${p.seq}:${result}".toString(),
+        deviceId: p.lockId,
+        name: 'lock_code_result',
+        displayName: findCodeLock(p.lockId)?.displayName,
+        value: result,
+        data: JsonOutput.toJson(data),
+        date: new Date(now()).format("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", TimeZone.getTimeZone('UTC')),
+        version: APP_VERSION,
+    ]
+    Map params = [
+        uri: state.ingestUrl,
+        requestContentType: 'application/json',
+        contentType: 'application/json',
+        headers: [Authorization: "Bearer ${state.sbToken}"],
+        body: JsonOutput.toJson(payload),
+        timeout: 15,
+    ]
+    asynchttpPost('postCallback', params, [name: 'lock_code_result', deviceId: p.lockId])
 }
 
 String escapeHtml(String s) {
