@@ -12,8 +12,9 @@
  * reveal one code at a time. The hub enforces which slots may be touched:
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
  * but only up to a ceiling set in this app's UI; adopted slots above it need
- * the operator's approval in the UI. Slots whose name contains ORB (booking codes) are
- * always refused, and created names must carry SBA:/SBM: and never "ORB".
+ * the operator's approval in the UI. Slots whose name has an upper-case "ORB"
+ * at the start or after a space (booking codes) are always refused, and
+ * created names must carry SBA:/SBM: and never such an "ORB".
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
  *
@@ -33,7 +34,7 @@
 import groovy.json.JsonOutput
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '1.1.0'
+@Field static final String APP_VERSION = '1.1.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -593,11 +594,16 @@ Boolean rangesOverlap(Map a, Map b) {
     return a.from <= b.to && b.from <= a.to
 }
 
-// Booking codes from the SignalBricks Integration / OwnerRez apps. Any name
-// containing "ORB" (any case), matching the write rule and stock OwnerRez's
-// prefix claim.
+// Booking codes from the SignalBricks Integration / OwnerRez apps: an
+// upper-case "ORB" at the start of the name or right after whitespace,
+// case-sensitive. Covers "ORB<id>-Guest" (signalbricksIntegration's default
+// with an empty prefix) and "<prefix> ORB<id>…"; ordinary words such as
+// "Forbes" or "Orbit" don't match. Known gap: the idAtEnd forms
+// "Guest-ORB<id>" and "Guest -ORB<id>" don't match either.
+@Field static final java.util.regex.Pattern BOOKING_NAME = ~/(^|\s)ORB/
+
 Boolean isBookingName(String name) {
-    return name != null && name.toUpperCase().contains('ORB')
+    return name != null && BOOKING_NAME.matcher(name).find()
 }
 
 // Validates a /lockConfig body. Returns [config: Map] or [error: String].
@@ -781,7 +787,7 @@ Map apiListSlots() {
 // Common checks for write/delete/reveal. Returns [lock, slot, slotClass,
 // codes, currentName] or [response]. Refuses:
 //   - slots outside admin/managed/approved-adopted (and above the ceiling)
-//   - any slot whose current name contains ORB (booking codes)
+//   - any slot whose current name is a booking code (isBookingName)
 //   - in the admin/managed ranges, a slot holding a code without that
 //     range's SBA:/SBM: marker (existing codes must be adopted first);
 //     an empty slot may be written (`allowEmpty`), not deleted or revealed.
@@ -819,8 +825,8 @@ Map apiSetCode() {
     if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
         return jsonResponse([error: 'invalid_name', message: "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters"], 400)
     }
-    // Never create anything the booking apps' ORB matching could claim.
-    if (name.toUpperCase().contains('ORB')) return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB'], 403)
+    // Never create a name the booking guard (and the booking apps) would read as a booking code.
+    if (isBookingName(name)) return jsonResponse([error: 'name_not_allowed', message: 'names must not have an upper-case ORB at the start or after a space'], 403)
     Map r = resolveAllowedSlot(params.lockId, body.slot, true)
     if (r.response) return r.response
     // Created codes carry their class marker; adopted slots keep their name.
