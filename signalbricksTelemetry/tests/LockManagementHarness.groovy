@@ -56,7 +56,11 @@ app.run()
 def lock = new FakeLock(id: '7', displayName: 'Front', name: 'Front', label: 'Front')
 lock.attrs.maxCodes = '250.0'
 lock.attrs.lockCodes = '{"1":{"name":"SBA: Owner","code":"11111111"},"5":{"name":"Old","code":"55555555"},"12":{"name":"SBM: Cleaner","code":"22222222"},"30":{"name":"ORB123","code":"33333333"},"40":{"name":"Legacy","code":"44444444"}}'
-app.codeLocks = [lock]
+// A second selected lock that the slot rules never list (not onboarded).
+def lock2 = new FakeLock(id: '8', displayName: 'Back', name: 'Back', label: 'Back')
+lock2.attrs.maxCodes = 250
+lock2.attrs.lockCodes = '{"1":{"name":"SBA: Owner","code":"66666666"},"12":{"name":"SBM: Cleaner","code":"77777777"}}'
+app.codeLocks = [lock, lock2]
 app.state.sbToken = 'ingest-fake'
 app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 
@@ -164,6 +168,32 @@ check('approvals removed when none listed', app.approvedAdoptedSlots == null)
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['7': [adopted: [40]]]]]
 app.apiSetLockConfig()
 app.approvedAdoptedSlots = ['7:40']
+
+// Un-listed lock: nothing allowed, no fallback to the default ranges
+app.state.revealTimes = []
+app.params = [lockId: '8']
+app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: New']]
+check('un-listed lock: set refused', app.apiSetCode().status == 403)
+app.params = [lockId: '8', slot: '1']
+check('un-listed lock: delete refused', app.apiDeleteCode().status == 403)
+check('un-listed lock: reveal refused', app.apiRevealCode().status == 403)
+app.params = [lockId: '8']
+def slots8 = body(app.apiListSlots()).slots
+check('un-listed lock: slots allowedAs none', slots8.size() == 2 && slots8.every { it.allowedAs == null })
+app.params = [lockId: '7']
+check('listed lock unchanged', body(app.apiListSlots()).slots.find { it.slot == 1 }.allowedAs == 'admin')
+app.params = [lockId: '7', slot: '1']
+check('listed lock: reveal still ok', app.apiRevealCode().status == 200)
+// Listing it with {} gives it the default ranges
+app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['7': [adopted: [40]], '8': [:]]]]
+check('config listing lock 8 accepted', app.apiSetLockConfig().status == 200)
+app.params = [lockId: '8']
+app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: New']]
+check('listed-with-defaults lock: set ok', app.apiSetCode().status == 202)
+app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['7': [adopted: [40]]]]]
+app.apiSetLockConfig()
+app.approvedAdoptedSlots = ['7:40']
+app.state.revealTimes = []
 
 // Booking guard on current names: Forbes passes, "ORB123-Guest" / "GT: ORB123-Guest" refused
 app.state.revealTimes = []

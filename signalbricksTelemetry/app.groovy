@@ -691,14 +691,16 @@ Map pendingAdoptedOptions() {
 }
 
 // Which class a slot belongs to on this lock: 'adopted', 'admin', 'managed',
-// or null when the hub must refuse it. No config yet = nothing allowed.
-// Nothing above the ceiling is allowed unless it is an adopted slot the
-// operator approved in the app UI.
+// or null when the hub must refuse it. No config yet = nothing allowed. A
+// lock not listed in config.locks (not onboarded) allows nothing: the global
+// ranges are only defaults for listed locks. Nothing above the ceiling is
+// allowed unless it is an adopted slot the operator approved in the app UI.
 String slotClass(String lockId, Integer slot) {
     Map cfg = state.lockConfig
     if (!cfg || slot == null) return null
+    Map lockCfg = cfg.locks?.get(lockId)
+    if (!(lockCfg instanceof Map)) return null
     Integer ceiling = managedCeiling()
-    Map lockCfg = cfg.locks?.get(lockId) ?: [:]
     if ((lockCfg.adopted ?: []).collect { it as Integer }.contains(slot)) {
         if (slot <= ceiling || approvedAdoptedKeys().contains("${lockId}:${slot}".toString())) return 'adopted'
     }
