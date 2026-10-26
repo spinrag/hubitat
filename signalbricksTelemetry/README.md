@@ -40,9 +40,10 @@ Version 1.1.0 adds optional **lock code management** (off by default): SignalBri
 Use Hubitat Package Manager (HPM) to keep the app up to date. Set this up once on each hub:
 
 1. Open **Hubitat Package Manager** → **Package Manager Settings**.
-2. Turn on automatic updates and set the auto-update mode to **Only those I list**, then select **SignalBricks Telemetry**. Other packages on the hub keep updating the way you choose.
-3. Turn on notifications for failed updates, with the **hub name** included, so you can tell which hub needs attention when you run several.
+2. Set **Install updates automatically when** to **Only those I list**, then add **SignalBricks Telemetry** under **Which packages should be automatically updated?** Other packages on the hub keep updating the way you choose.
+3. Turn on **Notify me if automatic updates are unsuccessful**, pick a notification device, and turn on **Include hub name in notifications**, so you can tell which hub needs attention when you run several.
 4. If **Hub Login Security** is on (Settings → Hub Login Security), enter the hub's username and password under **Hub Security** in HPM settings. HPM needs them to install the new code; without them updates fail.
+   If the hub has HTTPS turned on, also turn on **SSL (HTTPS) Enabled** in HPM settings.
 5. Set the update check time away from 3am: the hub runs its nightly maintenance and backups then. Any time outside 2–4am works.
 
 **From 1.3.1 on, you don't need to open the app and click Done after an update.** HPM replaces the code without running Done; the app notices the new version and [re-registers](#registration) with SignalBricks by itself. Open the app and click **Done** only when a release adds a new setting or permission you want to use (the release notes say so).

@@ -5,6 +5,8 @@ import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
     Map state = [:]
+    // Same store as state here; the hub writes atomicState through immediately.
+    Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
     def codeLocks = []

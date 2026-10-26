@@ -358,7 +358,7 @@ void appButtonHandler(String btn) {
         state.remove('registeredVersion')
         state.remove('reregisterAttemptAt')
         unschedule('dailyCheckIn')
-        state.remove('checkInSecond')
+        atomicState.remove('checkInSecond')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         createAccessToken()
@@ -369,7 +369,7 @@ void appButtonHandler(String btn) {
 void eventHandler(evt) {
     if (!state.sbToken || !isHttps(state.ingestUrl)) return
     // Hubs updated by HPM from before 1.3.2 never ran initialize(); schedule once.
-    if (state.checkInSecond == null) scheduleDailyCheckIn()
+    if (atomicState.checkInSecond == null) scheduleDailyCheckIn()
 
     Map payload = [
         id: evt.id,
@@ -669,16 +669,17 @@ void scheduleDailyCheckIn() {
         unschedule('dailyCheckIn')
         return
     }
-    if (state.checkInSecond == null) {
-        state.checkInSecond = (CHECK_IN_WINDOW_START_SEC + new Random().nextInt(CHECK_IN_WINDOW_SEC)) % 86400
+    // atomicState: two first events running at once must not pick two times.
+    if (atomicState.checkInSecond == null) {
+        atomicState.checkInSecond = (CHECK_IN_WINDOW_START_SEC + new Random().nextInt(CHECK_IN_WINDOW_SEC)) % 86400
     }
-    int t = state.checkInSecond as int
+    int t = atomicState.checkInSecond as int
     schedule("${t % 60} ${(t.intdiv(60)) % 60} ${t.intdiv(3600)} * * ?".toString(), 'dailyCheckIn')
 }
 
 String checkInTime() {
-    if (state.checkInSecond == null) return null
-    int t = state.checkInSecond as int
+    if (atomicState.checkInSecond == null) return null
+    int t = atomicState.checkInSecond as int
     return String.format('%02d:%02d', t.intdiv(3600), (t.intdiv(60)) % 60)
 }
 
