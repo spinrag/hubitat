@@ -18,6 +18,12 @@
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
  *
+ * Fingerprints (signalbricks/platform#532): SignalBricks may push a per-org
+ * fingerprint key in /lockConfig; /locks/:id/fingerprints then returns a
+ * truncated HMAC-SHA256 of each allowed slot's code (never the code), so
+ * SignalBricks can see which slots share a code across locks and hubs. The key
+ * is write-only: never returned, never logged, cleared on disable/disconnect.
+ *
  * Each set/delete is verified on the hub (signalbricks/platform#520): the app
  * keeps one pending change per lock and slot, re-reads the slot from
  * lockCodes, re-sends the command up to 3 times and reports the outcome as a
@@ -39,8 +45,10 @@
 
 import groovy.json.JsonOutput
 import groovy.transform.Field
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.2.1'
+@Field static final String APP_VERSION = '1.3.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -64,6 +72,10 @@ import groovy.transform.Field
 // managed 11-25, bookings from 26). Only the app UI can change it.
 @Field static final int DEFAULT_MAX_MANAGED_SLOT = 25
 @Field static final int REVEAL_LIMIT_PER_MIN = 10
+// Fingerprints (#532): HMAC-SHA256(fingerprintKey, code), first 16 hex chars.
+@Field static final int FINGERPRINT_LIMIT_PER_MIN = 10
+@Field static final int FINGERPRINT_HEX_LENGTH = 16
+@Field static final int FINGERPRINT_KEY_BYTES = 32
 @Field static final String ADMIN_NAME_PREFIX = 'SBA:'
 @Field static final String MANAGED_NAME_PREFIX = 'SBM:'
 // Hubs connected before signalbricks/platform#505 hold an ingestion token that
@@ -118,6 +130,9 @@ mappings {
     }
     path('/locks/:lockId/slots') {
         action: [GET: 'apiListSlots']
+    }
+    path('/locks/:lockId/fingerprints') {
+        action: [GET: 'apiListFingerprints']
     }
     path('/locks/:lockId/codes') {
         action: [POST: 'apiSetCode']
@@ -205,6 +220,7 @@ Map mainPage() {
                         paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
                     }
                     paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (all code writes are refused until SignalBricks sends them)'}"
+                    if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set (code fingerprints for onboarding are unavailable)'}"
                     Map changes = pendingCodeChanges()
                     if (changes) {
                         int failed = changes.values().count { it.status == 'failed' }
@@ -258,9 +274,11 @@ Boolean syncLockManagementEnabled() {
     createAccessToken()
     abandonPendingCodeChanges('lock_management_disabled')
     state.remove('lockConfig')
+    state.remove('fingerprintKey')
     state.remove('revealTimes')
     state.remove('retryTimes')
     state.remove('writeTimes')
+    state.remove('fingerprintTimes')
     app.removeSetting('approvedAdoptedSlots')
     registerWithPlatform(false)
     return true
@@ -312,6 +330,7 @@ void appButtonHandler(String btn) {
         createAccessToken()
         abandonPendingCodeChanges('disconnected')
         state.remove('lockConfig')
+        state.remove('fingerprintKey')
         app.removeSetting('approvedAdoptedSlots')
         state.remove('sbToken')
         state.remove('ingestUrl')
@@ -822,16 +841,38 @@ Integer maxCodesOf(lock) {
     return parseIntLoose(lock.currentValue('maxCodes'))
 }
 
+// GET and POST /lockConfig reply. Says whether a fingerprint key is held,
+// never the key itself.
+Map lockConfigReply() {
+    return [config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys(), fingerprintKeySet: state.fingerprintKey != null]
+}
+
 Map apiGetLockConfig() {
     if (!lockManagementActive()) return notEnabled()
-    return jsonResponse([config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
+    return jsonResponse(lockConfigReply())
+}
+
+// Optional fingerprintKey: standard base64 (with padding) of exactly 32 bytes.
+// Returns [key: String] (null when absent, so the stored key is kept) or
+// [error: String]. The key is a secret: never echo it in errors or logs.
+Map parseFingerprintKey(def body) {
+    def raw = body instanceof Map ? body.fingerprintKey : null
+    if (raw == null) return [key: null]
+    String s = raw instanceof String ? raw.trim() : null
+    if (!(s ==~ /[A-Za-z0-9+\/]{43}=/)) return [error: "fingerprintKey must be base64 of exactly ${FINGERPRINT_KEY_BYTES} bytes"]
+    byte[] bytes = s.decodeBase64()
+    if (bytes.length != FINGERPRINT_KEY_BYTES) return [error: "fingerprintKey must be base64 of exactly ${FINGERPRINT_KEY_BYTES} bytes"]
+    return [key: s]
 }
 
 Map apiSetLockConfig() {
     if (!lockManagementActive()) return notEnabled()
+    Map fpKey = parseFingerprintKey(request.JSON)
+    if (fpKey.error) return jsonResponse([error: 'invalid_config', message: fpKey.error], 400)
     Map result = validateLockConfig(request.JSON)
     if (result.error) return jsonResponse([error: 'invalid_config', message: result.error], 400)
     state.lockConfig = result.config
+    if (fpKey.key) state.fingerprintKey = fpKey.key
     // Approvals only cover adopted slots the current config still lists.
     List stillAdopted = adoptedAboveCeiling()
     List kept = approvedAdoptedKeys().findAll { stillAdopted.contains(it) }
@@ -840,8 +881,8 @@ Map apiSetLockConfig() {
         else app.removeSetting('approvedAdoptedSlots')
     }
     dropDisallowedCodeChanges()
-    log.info 'SignalBricks Telemetry: lock slot rules updated'
-    return jsonResponse([config: result.config, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
+    log.info "SignalBricks Telemetry: lock slot rules updated${fpKey.key ? ' (fingerprint key updated)' : ''}"
+    return jsonResponse(lockConfigReply())
 }
 
 Map apiListLocks() {
@@ -867,6 +908,41 @@ Map apiListSlots() {
         [slot: slot, name: name, set: set, allowedAs: cls]
     }.sort { it.slot }
     return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), slots: slots])
+}
+
+// HMAC-SHA256(fingerprintKey, code) as lower-case hex, first 16 characters.
+// The same code gives the same fingerprint on every lock and every hub holding
+// the same key. Takes and returns no code: never log its input.
+String codeFingerprint(byte[] key, String code) {
+    Mac mac = Mac.getInstance('HmacSHA256')
+    mac.init(new SecretKeySpec(key, 'HmacSHA256'))
+    return mac.doFinal(code.getBytes('UTF-8')).encodeHex().toString().substring(0, FINGERPRINT_HEX_LENGTH)
+}
+
+// Fingerprints of the occupied slots SignalBricks may manage (slotClass
+// non-null: a listed lock's ranges within the ceiling, or allowed adopted
+// slots), never booking-code names. Unmarked codes in the ranges are included,
+// so onboarding can group them before adopting. Never returns or logs codes.
+Map apiListFingerprints() {
+    if (!lockManagementActive()) return notEnabled()
+    if (rateLimited('fingerprintTimes', FINGERPRINT_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    def lock = findCodeLock(params.lockId)
+    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
+    if (!state.fingerprintKey) return jsonResponse([error: 'fingerprint_key_missing', message: 'SignalBricks has not sent a fingerprint key'], 409)
+    Map codes = readLockCodes(lock)
+    if (codes == null) return jsonResponse([error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'], 409)
+    byte[] key = state.fingerprintKey.toString().decodeBase64()
+    String lockId = lock.id.toString()
+    List slots = []
+    codes.each { k, v ->
+        if (!(k.toString() ==~ /\d{1,4}/) || !(v instanceof Map)) return
+        String code = v.code?.toString()
+        if (!code) return
+        Integer slot = k.toString().toInteger()
+        if (isBookingName(v.name?.toString()) || !slotClass(lockId, slot)) return
+        slots << [slot: slot, fp: codeFingerprint(key, code)]
+    }
+    return jsonResponse([lockId: lockId, slots: slots.sort { it.slot }])
 }
 
 // A refusal: [response, error]. `error` doubles as the result event's reason.
