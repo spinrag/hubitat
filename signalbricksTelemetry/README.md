@@ -258,4 +258,4 @@ It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It 
 
 ## License
 
-MIT © Spinrag, LLC
+MIT © 2025–2026 Spinrag, LLC

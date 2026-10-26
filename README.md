@@ -123,4 +123,4 @@ Contributions and feedback are welcome!
 
 ---
 
-© 2025 Spinrag, LLC • Developed by [Chris Ogden](https://github.com/ChrisOgden) / [spinrag](https://github.com/spinrag)
+© 2025–2026 Spinrag, LLC • Developed by [Chris Ogden](https://github.com/ChrisOgden) / [spinrag](https://github.com/spinrag)
