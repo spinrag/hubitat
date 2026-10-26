@@ -3,8 +3,19 @@
  *
  * Read-only telemetry sender for SignalBricks. Forwards lock, contact,
  * temperature, humidity and battery events to the SignalBricks ingestion API.
- * It never sends device commands and never reads or sends lock codes (PINs):
- * the `lockCodes` attribute is deliberately not subscribed to.
+ * Telemetry never sends device commands and never reads or sends lock codes
+ * (PINs): the `lockCodes` attribute is deliberately not subscribed to.
+ *
+ * Optional "Lock code management" (off by default, signalbricks/platform#472):
+ * when enabled, separately selected locks get access-token gated endpoints
+ * that let SignalBricks list slots (never codes), set and delete codes and
+ * reveal one code at a time. The hub enforces which slots may be touched:
+ * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
+ * but only up to a ceiling set in this app's UI; adopted slots above it need
+ * the operator's approval in the UI. Slots whose name contains ORB (booking codes) are
+ * always refused, and created names must carry SBA:/SBM: and never "ORB".
+ * So neither the platform nor anyone holding its token can reach booking
+ * codes. Codes are never logged or put in events.
  *
  * Setup uses Hubitat's documented OAuth "stateredirect" pattern with
  * SignalBricks as the OAuth provider: "Connect to SignalBricks" opens the
@@ -22,7 +33,7 @@
 import groovy.json.JsonOutput
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '1.0.0'
+@Field static final String APP_VERSION = '1.1.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -37,6 +48,17 @@ import groovy.transform.Field
 // context: lock events, or a per-slot lock-code map {"3":{"name":"Guest","code":"1234"}}.
 @Field static final Set<String> LOCK_CONTEXT_SECRET_KEYS = ['code', 'usedcode'] as Set
 @Field static final Set<String> LOCK_EVENT_NAMES = ['lock', 'unlock', 'codechanged', 'lastcodename', 'lockcodes'] as Set
+
+// Lock code management (#472)
+@Field static final int MAX_SLOT = 1000
+@Field static final int MAX_ADOPTED_PER_LOCK = 250
+@Field static final int MAX_NAME_LENGTH = 64
+// Default hub-local ceiling for admin + managed ranges (layout: admin 1-10,
+// managed 11-25, bookings from 26). Only the app UI can change it.
+@Field static final int DEFAULT_MAX_MANAGED_SLOT = 25
+@Field static final int REVEAL_LIMIT_PER_MIN = 10
+@Field static final String ADMIN_NAME_PREFIX = 'SBA:'
+@Field static final String MANAGED_NAME_PREFIX = 'SBM:'
 
 definition(
     name: 'SignalBricks Telemetry',
@@ -62,12 +84,36 @@ mappings {
     path('/oauthCallback') {
         action: [GET: 'oauthCallback']
     }
+
+    // Lock code management (#472). Every handler returns 404 unless the
+    // section is enabled and the hub is connected.
+    path('/lockConfig') {
+        action: [GET: 'apiGetLockConfig', POST: 'apiSetLockConfig']
+    }
+    path('/locks') {
+        action: [GET: 'apiListLocks']
+    }
+    path('/locks/:lockId/slots') {
+        action: [GET: 'apiListSlots']
+    }
+    path('/locks/:lockId/codes') {
+        action: [POST: 'apiSetCode']
+    }
+    path('/locks/:lockId/codes/:slot') {
+        action: [DELETE: 'apiDeleteCode']
+    }
+    path('/locks/:lockId/codes/:slot/reveal') {
+        action: [GET: 'apiRevealCode']
+    }
 }
 
 Map mainPage() {
+    // Turning lock management off takes effect at once (submitOnChange), not
+    // only on Done.
+    syncLockManagementEnabled()
     dynamicPage(name: 'mainPage', title: 'SignalBricks Telemetry', install: true, uninstall: true) {
         section() {
-            paragraph 'Sends device events to SignalBricks. Read-only: this app never controls devices and never sends lock codes (PINs).'
+            paragraph 'Sends device events to SignalBricks. Telemetry is read-only: it never controls devices and never sends lock codes (PINs).'
         }
 
         section('<b>Devices</b>') {
@@ -86,7 +132,14 @@ Map mainPage() {
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${state.lastError}"
                 }
-                href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', description: 'Issue a new token (replaces the current one)', style: 'external', url: connectUrl())
+                if (lockManagementEnabled) {
+                    // The connect URL carries this app's access token in the
+                    // OAuth state, and while lock management is on that token
+                    // is the one SignalBricks holds for lock control.
+                    paragraph '<small>To reconnect, first turn off lock code management below (this rotates the access token), reconnect, then turn it back on.</small>'
+                } else {
+                    href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', description: 'Issue a new token (replaces the current one)', style: 'external', url: connectUrl())
+                }
                 input(name: 'btnDisconnect', type: 'button', title: 'Disconnect')
                 paragraph '<small>Disconnect stops sending immediately. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
             } else {
@@ -94,7 +147,33 @@ Map mainPage() {
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${state.lastError}"
                 }
+                // Not connected: SignalBricks holds no valid token for this app
+                // (Disconnect rotated it), so the token in this URL controls nothing.
                 href(name: 'hrefConnect', title: 'Connect to SignalBricks', description: 'Sign in and choose the property this hub belongs to', style: 'external', url: connectUrl())
+            }
+        }
+
+        section('<b>Lock code management (optional)</b>') {
+            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks selected here. Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (<code>ORB…</code>) are always refused. Codes are never logged or sent as telemetry.'
+            input(name: 'lockManagementEnabled', type: 'bool', title: 'Enable lock code management', defaultValue: false, submitOnChange: true)
+            if (lockManagementEnabled) {
+                input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Locks SignalBricks may manage codes on', multiple: true, required: false, submitOnChange: true)
+                input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may manage (admin + managed codes; keep it below the booking apps' minimum code position)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
+                Map pending = pendingAdoptedOptions()
+                if (pending) {
+                    paragraph '<b>Existing codes above the ceiling that SignalBricks asks to manage.</b> Approve only codes you recognise as admin or managed codes; never booking codes.'
+                    input(name: 'approvedAdoptedSlots', type: 'enum', title: 'Approve these slots', options: pending, multiple: true, required: false, submitOnChange: true)
+                }
+                if (!state.sbToken) {
+                    paragraph '<b>Connect to SignalBricks first.</b> Lock code management registers with SignalBricks after Connect.'
+                } else {
+                    paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                    if (state.lockMgmtRegisterError) {
+                        paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
+                    }
+                    paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (all code writes are refused until SignalBricks sends them)'}"
+                    input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
+                }
             }
         }
 
@@ -114,6 +193,35 @@ void installed() {
 void updated() {
     logDebug 'updated'
     initialize()
+    if (!syncLockManagementEnabled()) {
+        // Re-register on every save, so enabling and app upgrades reach the
+        // platform. Cheap: one request, only when connected.
+        registerWithPlatform()
+    }
+}
+
+// On an off -> on flip: rotate the access token before it is registered, so
+// an older token (e.g. from an abandoned Reconnect link) never becomes the
+// live lock token. On an on -> off flip: rotate it (the one SignalBricks holds
+// stops working), drop the slot rules and tell the platform. Returns true when
+// it just handled a disable (and so already registered).
+Boolean syncLockManagementEnabled() {
+    Boolean enabled = lockManagementEnabled == true
+    Boolean wasEnabled = state.lockMgmtLastEnabled == true
+    state.lockMgmtLastEnabled = enabled
+    if (!wasEnabled && enabled) {
+        log.info 'SignalBricks Telemetry: lock code management turned on; access token rotated'
+        createAccessToken()
+        return false
+    }
+    if (!wasEnabled || enabled) return false
+    log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
+    createAccessToken()
+    state.remove('lockConfig')
+    state.remove('revealTimes')
+    app.removeSetting('approvedAdoptedSlots')
+    registerWithPlatform(false)
+    return true
 }
 
 void uninstalled() {
@@ -154,15 +262,27 @@ void subscribeToEvents() {
 void appButtonHandler(String btn) {
     if (btn == 'btnDisconnect') {
         log.info 'Disconnected from SignalBricks'
+        // Tell the platform lock management is off (best effort), then
+        // invalidate the access token it may hold.
+        registerWithPlatform(false)
+        createAccessToken()
+        state.remove('lockConfig')
+        app.removeSetting('approvedAdoptedSlots')
         state.remove('sbToken')
         state.remove('ingestUrl')
         state.remove('connectedAt')
         state.remove('lastError')
+        state.remove('lockMgmtRegisteredAt')
+        state.remove('lockMgmtRegisterError')
+    } else if (btn == 'btnRotateLockToken') {
+        log.info 'SignalBricks Telemetry: access token rotated'
+        createAccessToken()
+        registerWithPlatform()
     }
 }
 
 void eventHandler(evt) {
-    if (!state.sbToken || !state.ingestUrl) return
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return
 
     Map payload = [
         id: evt.id,
@@ -296,12 +416,15 @@ String connectUrl() {
 def oauthCallback() {
     Map page = handleOauthCallback()
     // The access token travelled in the authorize URL's `state`, so copies can
-    // sit in proxy/CDN access logs. /oauthCallback is the only inbound call
-    // this app needs, so replace the token once the callback has run (success
-    // or failure). createAccessToken() invalidates the previous token, the same
-    // behaviour signalbricksIntegration's "Refresh Access Token" button relies
-    // on. The next Connect builds a fresh `state` from the new token.
+    // sit in proxy/CDN access logs. Replace it once the callback has run
+    // (success or failure): createAccessToken() invalidates the previous token,
+    // the same behaviour signalbricksIntegration's "Refresh Access Token"
+    // button relies on. The only other inbound calls are the lock-management
+    // endpoints, which use the new token: it is registered with SignalBricks
+    // below and never appears in a URL (Reconnect is hidden while lock
+    // management is on, and Connect only shows when no token is registered).
     createAccessToken()
+    registerWithPlatform()
     return page
 }
 
@@ -338,7 +461,7 @@ Map handleOauthCallback() {
         // One-off exchange; synchronous so the result can be shown to the user.
         httpPost(tokenParams) { resp ->
             Map body = resp.data instanceof Map ? resp.data : [:]
-            if (resp.status == 200 && body.access_token && body.ingest_url?.toString()?.startsWith('http')) {
+            if (resp.status == 200 && body.access_token && isHttps(body.ingest_url)) {
                 state.sbToken = body.access_token
                 state.ingestUrl = body.ingest_url
                 state.connectedAt = new Date().format('yyyy-MM-dd HH:mm')
@@ -367,6 +490,374 @@ Map renderPage(String title, String message) {
 <body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
 <h2>SignalBricks Telemetry: ${title}</h2><p>${message}</p></body></html>"""
     return render(contentType: 'text/html', data: html, status: 200)
+}
+
+// --- Lock code management (#472) ---
+
+// Tokens (ingestion and app access token) only ever go to an https URL.
+Boolean isHttps(def url) {
+    return url?.toString()?.startsWith('https://')
+}
+
+Boolean lockManagementActive() {
+    return lockManagementEnabled == true && state.sbToken
+}
+
+// Registers this app's cloud endpoint and access token with SignalBricks,
+// authenticated with the ingestion token. The access token is sent only while
+// lock management is on; with it off, the platform drops what it stored.
+// SECURITY: the body carries the app access token; never log it.
+void registerWithPlatform(Boolean enabledOverride = null) {
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    Boolean enabled = enabledOverride != null ? enabledOverride : lockManagementEnabled == true
+    if (enabled && !state.accessToken) ensureAccessToken()
+    Map body = [
+        cloudEndpointBase: getFullApiServerUrl(),
+        appAccessToken: enabled ? state.accessToken : null,
+        hubUid: getHubUID(),
+        appId: app.id.toString(),
+        version: APP_VERSION,
+        lockManagement: enabled,
+    ]
+    Map params = [
+        uri: "${state.ingestUrl}/register",
+        requestContentType: 'application/json',
+        contentType: 'application/json',
+        headers: [Authorization: "Bearer ${state.sbToken}"],
+        body: JsonOutput.toJson(body),
+        timeout: 15,
+    ]
+    asynchttpPost('registerCallback', params, [enabled: enabled])
+}
+
+void registerCallback(resp, Map data) {
+    if (resp.hasError()) {
+        int status = resp.getStatus()
+        String msg = status == 401 ? 'SignalBricks rejected the token. Reconnect to SignalBricks.' : "HTTP ${status}"
+        log.warn "SignalBricks Telemetry: lock management registration failed: ${msg}"
+        state.lockMgmtRegisterError = "${new Date().format('yyyy-MM-dd HH:mm')} ${msg}"
+        return
+    }
+    state.remove('lockMgmtRegisterError')
+    state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
+    log.info "SignalBricks Telemetry: registered with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
+}
+
+Map jsonResponse(def data, int status = 200) {
+    return render(contentType: 'application/json', data: JsonOutput.toJson(data), status: status)
+}
+
+Map notEnabled() {
+    return jsonResponse([error: 'not_found'], 404)
+}
+
+def findCodeLock(lockId) {
+    return (codeLocks ?: []).find { it.id.toString() == lockId?.toString() }
+}
+
+Integer parseSlot(def raw) {
+    String s = raw?.toString()
+    if (!(s ==~ /\d{1,4}/)) return null
+    Integer n = s.toInteger()
+    return (n >= 1 && n <= MAX_SLOT) ? n : null
+}
+
+// 250, "250" or "250.0" -> 250; anything else (fractions, text) -> null.
+Integer parseIntLoose(def v) {
+    if (v == null) return null
+    try {
+        BigDecimal d = new BigDecimal(v.toString().trim())
+        return d.stripTrailingZeros().scale() <= 0 ? d.intValueExact() : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+// Hub-local ceiling for admin + managed slots. Set only in the app UI, never
+// via the API, so a token holder can't widen the ranges into booking slots.
+Integer managedCeiling() {
+    Integer n = parseIntLoose(maxManagedSlot)
+    return (n != null && n >= 1 && n <= MAX_SLOT) ? n : DEFAULT_MAX_MANAGED_SLOT
+}
+
+// Range {from, to} with 1 <= from <= to <= MAX_SLOT, or null if invalid.
+Map parseRange(def raw) {
+    if (!(raw instanceof Map)) return null
+    Integer from = parseSlot(raw.from)
+    Integer to = parseSlot(raw.to)
+    if (from == null || to == null || from > to) return null
+    return [from: from, to: to]
+}
+
+Boolean rangesOverlap(Map a, Map b) {
+    return a.from <= b.to && b.from <= a.to
+}
+
+// Booking codes from the SignalBricks Integration / OwnerRez apps. Any name
+// containing "ORB" (any case), matching the write rule and stock OwnerRez's
+// prefix claim.
+Boolean isBookingName(String name) {
+    return name != null && name.toUpperCase().contains('ORB')
+}
+
+// Validates a /lockConfig body. Returns [config: Map] or [error: String].
+//   { admin: {from, to}, managed: {from, to},
+//     locks: { "<lockId>": { admin?: {from, to}, managed?: {from, to}, adopted?: [slot, ...] } } }
+// Ranges must stay within the hub-local ceiling. Adopted slots above it are
+// stored but stay refused until the operator approves them in the app UI.
+Map validateLockConfig(def body) {
+    if (!(body instanceof Map)) return [error: 'body must be a JSON object']
+    Integer ceiling = managedCeiling()
+    Map admin = parseRange(body.admin)
+    Map managed = parseRange(body.managed)
+    if (!admin || !managed) return [error: 'admin and managed must be {from, to} slot ranges']
+    if (rangesOverlap(admin, managed)) return [error: 'admin and managed ranges overlap']
+    if (admin.to > ceiling || managed.to > ceiling) return [error: "admin and managed ranges must stay within slots 1-${ceiling} (the hub's ceiling, set in the app)"]
+    Map locksOut = [:]
+    def locksIn = body.locks ?: [:]
+    if (!(locksIn instanceof Map)) return [error: 'locks must be an object keyed by lock id']
+    for (entry in locksIn) {
+        String lockId = entry.key.toString()
+        if (!findCodeLock(lockId)) return [error: "lock ${lockId} is not selected for lock code management"]
+        def v = entry.value
+        if (!(v instanceof Map)) return [error: "lock ${lockId}: must be an object"]
+        Map lockAdmin = v.admin != null ? parseRange(v.admin) : admin
+        Map lockManaged = v.managed != null ? parseRange(v.managed) : managed
+        if (!lockAdmin || !lockManaged) return [error: "lock ${lockId}: invalid admin or managed range"]
+        if (rangesOverlap(lockAdmin, lockManaged)) return [error: "lock ${lockId}: admin and managed ranges overlap"]
+        if (lockAdmin.to > ceiling || lockManaged.to > ceiling) return [error: "lock ${lockId}: ranges must stay within slots 1-${ceiling}"]
+        def adoptedIn = v.adopted ?: []
+        if (!(adoptedIn instanceof List) || adoptedIn.size() > MAX_ADOPTED_PER_LOCK) {
+            return [error: "lock ${lockId}: adopted must be a list of at most ${MAX_ADOPTED_PER_LOCK} slots"]
+        }
+        List adopted = adoptedIn.collect { parseSlot(it) }
+        if (adopted.any { it == null }) return [error: "lock ${lockId}: adopted slots must be integers 1-${MAX_SLOT}"]
+        Map out = [adopted: adopted.unique().sort()]
+        if (v.admin != null) out.admin = lockAdmin
+        if (v.managed != null) out.managed = lockManaged
+        locksOut[lockId] = out
+    }
+    return [config: [admin: admin, managed: managed, locks: locksOut]]
+}
+
+List approvedAdoptedKeys() {
+    def v = approvedAdoptedSlots
+    if (!v) return []
+    return (v instanceof Collection ? v : [v]).collect { it.toString() }
+}
+
+// Adopted slots above the ceiling, as "<lockId>:<slot>" keys.
+List adoptedAboveCeiling() {
+    Map cfg = state.lockConfig
+    if (!cfg) return []
+    Integer ceiling = managedCeiling()
+    List out = []
+    (cfg.locks ?: [:]).each { lockId, l ->
+        (l.adopted ?: []).collect { it as Integer }.findAll { it > ceiling }.each { out << "${lockId}:${it}".toString() }
+    }
+    return out
+}
+
+List pendingAdoptedKeys() {
+    List approved = approvedAdoptedKeys()
+    return adoptedAboveCeiling().findAll { !approved.contains(it) }
+}
+
+// Options for the approval input: slot number and current name only.
+Map pendingAdoptedOptions() {
+    Map options = [:]
+    adoptedAboveCeiling().each { String key ->
+        List parts = key.split(':')
+        def lock = findCodeLock(parts[0])
+        if (!lock) return
+        Map codes = readLockCodes(lock)
+        def entry = codes?.get(parts[1])
+        String name = entry instanceof Map ? entry.name?.toString() : null
+        String label = "${lock.displayName}: slot ${parts[1]}${name ? " (${escapeHtml(name)})" : ' (empty)'}"
+        if (isBookingName(name)) label += ' - booking code, always refused'
+        options[key] = label
+    }
+    return options
+}
+
+// Which class a slot belongs to on this lock: 'adopted', 'admin', 'managed',
+// or null when the hub must refuse it. No config yet = nothing allowed.
+// Nothing above the ceiling is allowed unless it is an adopted slot the
+// operator approved in the app UI.
+String slotClass(String lockId, Integer slot) {
+    Map cfg = state.lockConfig
+    if (!cfg || slot == null) return null
+    Integer ceiling = managedCeiling()
+    Map lockCfg = cfg.locks?.get(lockId) ?: [:]
+    if ((lockCfg.adopted ?: []).collect { it as Integer }.contains(slot)) {
+        if (slot <= ceiling || approvedAdoptedKeys().contains("${lockId}:${slot}".toString())) return 'adopted'
+    }
+    if (slot > ceiling) return null
+    Map admin = lockCfg.admin ?: cfg.admin
+    Map managed = lockCfg.managed ?: cfg.managed
+    if (slot >= (admin.from as Integer) && slot <= (admin.to as Integer)) return 'admin'
+    if (slot >= (managed.from as Integer) && slot <= (managed.to as Integer)) return 'managed'
+    return null
+}
+
+String classPrefix(String cls) {
+    return cls == 'admin' ? ADMIN_NAME_PREFIX : (cls == 'managed' ? MANAGED_NAME_PREFIX : null)
+}
+
+// The lock's lockCodes as a Map keyed by slot string, or null if it can't be
+// read. Newer drivers can store lockCodes encrypted (driver preference
+// "Encrypt lock codes"); those values are decrypted with the hub's decrypt()
+// when the platform provides it to apps. The result holds codes: never log it.
+Map readLockCodes(lock) {
+    def raw = lock.currentValue('lockCodes', true)
+    if (!raw) return [:]
+    String s = raw.toString().trim()
+    if (!s.startsWith('{')) {
+        try {
+            s = decrypt(s)?.toString()?.trim()
+        } catch (Exception e) {
+            return null
+        }
+        if (!s?.startsWith('{')) return null
+    }
+    try {
+        def parsed = parseJson(s)
+        return parsed instanceof Map ? parsed : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+Integer maxCodesOf(lock) {
+    return parseIntLoose(lock.currentValue('maxCodes'))
+}
+
+Map apiGetLockConfig() {
+    if (!lockManagementActive()) return notEnabled()
+    return jsonResponse([config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
+}
+
+Map apiSetLockConfig() {
+    if (!lockManagementActive()) return notEnabled()
+    Map result = validateLockConfig(request.JSON)
+    if (result.error) return jsonResponse([error: 'invalid_config', message: result.error], 400)
+    state.lockConfig = result.config
+    // Approvals only cover adopted slots the current config still lists.
+    List stillAdopted = adoptedAboveCeiling()
+    List kept = approvedAdoptedKeys().findAll { stillAdopted.contains(it) }
+    if (kept.size() != approvedAdoptedKeys().size()) {
+        if (kept) app.updateSetting('approvedAdoptedSlots', [type: 'enum', value: kept])
+        else app.removeSetting('approvedAdoptedSlots')
+    }
+    log.info 'SignalBricks Telemetry: lock slot rules updated'
+    return jsonResponse([config: result.config, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys()])
+}
+
+Map apiListLocks() {
+    if (!lockManagementActive()) return notEnabled()
+    List out = (codeLocks ?: []).collect { lock ->
+        [id: lock.id.toString(), name: lock.name, label: lock.label ?: lock.displayName, maxCodes: maxCodesOf(lock)]
+    }
+    return jsonResponse([locks: out])
+}
+
+// Slot metadata only: slot number, name, set. Never code values.
+Map apiListSlots() {
+    if (!lockManagementActive()) return notEnabled()
+    def lock = findCodeLock(params.lockId)
+    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
+    Map codes = readLockCodes(lock)
+    if (codes == null) return jsonResponse([error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'], 409)
+    List slots = codes.findAll { k, v -> k.toString() ==~ /\d+/ }.collect { k, v ->
+        Integer slot = k.toString().toInteger()
+        String name = v instanceof Map ? v.name?.toString() : null
+        Boolean set = v instanceof Map ? (v.code != null && v.code.toString() != '') : false
+        String cls = isBookingName(name) ? null : slotClass(lock.id.toString(), slot)
+        [slot: slot, name: name, set: set, allowedAs: cls]
+    }.sort { it.slot }
+    return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), slots: slots])
+}
+
+// Common checks for write/delete/reveal. Returns [lock, slot, slotClass,
+// codes, currentName] or [response]. Refuses:
+//   - slots outside admin/managed/approved-adopted (and above the ceiling)
+//   - any slot whose current name contains ORB (booking codes)
+//   - in the admin/managed ranges, a slot holding a code without that
+//     range's SBA:/SBM: marker (existing codes must be adopted first);
+//     an empty slot may be written (`allowEmpty`), not deleted or revealed.
+Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
+    def lock = findCodeLock(lockIdRaw)
+    if (!lock) return [response: jsonResponse([error: 'lock_not_found'], 404)]
+    Integer slot = parseSlot(slotRaw)
+    if (slot == null) return [response: jsonResponse([error: 'invalid_slot'], 400)]
+    Integer maxCodes = maxCodesOf(lock)
+    if (maxCodes != null && slot > maxCodes) return [response: jsonResponse([error: 'invalid_slot', message: 'slot exceeds maxCodes'], 400)]
+    String cls = slotClass(lock.id.toString(), slot)
+    if (!cls) return [response: jsonResponse([error: 'slot_not_allowed'], 403)]
+    Map codes = readLockCodes(lock)
+    if (codes == null) return [response: jsonResponse([error: 'lock_codes_unreadable'], 409)]
+    def entry = codes[slot.toString()]
+    String currentName = entry instanceof Map ? entry.name?.toString() : null
+    Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
+    if (isBookingName(currentName)) return [response: jsonResponse([error: 'booking_code', message: 'slot holds a booking code'], 403)]
+    String prefix = classPrefix(cls)
+    if (prefix && occupied && !(currentName?.startsWith(prefix))) {
+        return [response: jsonResponse([error: 'slot_not_managed', message: "slot holds a code without the ${prefix} marker; adopt it first"], 403)]
+    }
+    if (!occupied && !allowEmpty) return [response: jsonResponse([error: 'slot_empty'], 404)]
+    return [lock: lock, slot: slot, slotClass: cls, codes: codes, currentName: currentName]
+}
+
+// Body {slot, code, name}. The lock confirms asynchronously; poll /slots.
+Map apiSetCode() {
+    if (!lockManagementActive()) return notEnabled()
+    def body = request.JSON
+    if (!(body instanceof Map)) return jsonResponse([error: 'invalid_body'], 400)
+    String code = body.code?.toString()
+    if (!(code ==~ /\d{4,10}/)) return jsonResponse([error: 'invalid_code', message: 'code must be 4-10 digits'], 400)
+    String name = body.name?.toString()?.trim()
+    if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
+        return jsonResponse([error: 'invalid_name', message: "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters"], 400)
+    }
+    // Never create anything the booking apps' ORB matching could claim.
+    if (name.toUpperCase().contains('ORB')) return jsonResponse([error: 'name_not_allowed', message: 'names must not contain ORB'], 403)
+    Map r = resolveAllowedSlot(params.lockId, body.slot, true)
+    if (r.response) return r.response
+    // Created codes carry their class marker; adopted slots keep their name.
+    String prefix = classPrefix(r.slotClass)
+    if (prefix && !name.startsWith(prefix)) return jsonResponse([error: 'name_not_allowed', message: "${r.slotClass} slots need a ${prefix} name"], 403)
+    r.lock.setCode(r.slot, code, name)
+    log.info "SignalBricks Telemetry: setCode requested on ${r.lock.displayName} slot ${r.slot}"
+    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending'], 202)
+}
+
+Map apiDeleteCode() {
+    if (!lockManagementActive()) return notEnabled()
+    Map r = resolveAllowedSlot(params.lockId, params.slot, false)
+    if (r.response) return r.response
+    r.lock.deleteCode(r.slot)
+    log.info "SignalBricks Telemetry: deleteCode requested on ${r.lock.displayName} slot ${r.slot}"
+    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending'], 202)
+}
+
+// One slot, allowed slots only (SBA:/SBM: names in their ranges, or approved
+// adopted slots), at most REVEAL_LIMIT_PER_MIN per minute across the app.
+// The code is returned to the caller and never logged.
+Map apiRevealCode() {
+    if (!lockManagementActive()) return notEnabled()
+    long nowMs = now()
+    List recent = (state.revealTimes ?: []).findAll { (nowMs - (it as long)) < 60000L }
+    if (recent.size() >= REVEAL_LIMIT_PER_MIN) {
+        state.revealTimes = recent
+        return jsonResponse([error: 'rate_limited'], 429)
+    }
+    recent << nowMs
+    state.revealTimes = recent
+    Map r = resolveAllowedSlot(params.lockId, params.slot, false)
+    if (r.response) return r.response
+    String code = r.codes[r.slot.toString()].code.toString()
+    log.info "SignalBricks Telemetry: code revealed for ${r.lock.displayName} slot ${r.slot}"
+    return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, name: r.currentName, code: code])
 }
 
 String escapeHtml(String s) {
