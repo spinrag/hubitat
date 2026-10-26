@@ -267,6 +267,7 @@ void initialize() {
     if (debugLogging) {
         runIn(1800, 'logsOff')
     }
+    dropCodeChangesForMissingLocks()
     resumePendingCodeChanges()
 }
 
@@ -887,8 +888,10 @@ Map resolvePendingChange(Map p) {
     Map r = p.action == 'set' ? resolveSet(p.lockId, p.slot, p.name) : resolveAllowedSlot(p.lockId, p.slot, true)
     if (r.response || !r.occupied) return r
     // Delete: the slot must still hold the name it had at request time.
-    // Set: it may hold our name or the name it had before the request.
-    Boolean ours = r.currentName == p.name || (p.action == 'set' && r.currentName == p.prevName)
+    // Set: it may hold our name or the name it had before the request. An
+    // unnamed code never counts as ours (it could be anyone's).
+    String current = r.currentName
+    Boolean ours = current != null && (current == p.name || (p.action == 'set' && current == p.prevName))
     if (!ours) return refuse('slot_changed', 409, 'the slot now holds a different code; send a new request')
     return r
 }
@@ -1092,12 +1095,27 @@ Boolean codeChangeApplied(Map p, Map codes) {
     return occupied && entry.name?.toString() == p.name?.toString() && sameCode(entry.code, p.code?.toString())
 }
 
-// Scheduled: runs every check that is due, then schedules the next one.
+// Scheduled: runs every check that is due, then schedules the next one. A
+// check that throws (e.g. the driver's setCode) fails only its own change.
 void verifyCodeChanges() {
-    expirePendingCodeChanges()
-    long due = now() + 1000L
-    pendingCodeChanges().findAll { k, p -> p.status == 'pending' && (p.checkAt as long) <= due }.keySet().each { verifyCodeChange(it) }
-    savePendingCodeChanges(pendingCodeChanges())
+    try {
+        expirePendingCodeChanges()
+        long due = now() + 1000L
+        List keys = pendingCodeChanges().findAll { k, p -> p.status == 'pending' && (p.checkAt as long) <= due }.keySet() as List
+        keys.each { String key ->
+            try {
+                verifyCodeChange(key)
+            } catch (Exception e) {
+                // Only the class name: exception messages can carry the
+                // command's arguments, i.e. the code.
+                log.warn "SignalBricks Telemetry: code change check failed for ${key} (${e.class.simpleName})"
+                Map p = pendingCodeChanges()[key]
+                if (p) finishCodeChange(p, 'failed', 'send_error', p.status == 'pending')
+            }
+        }
+    } finally {
+        savePendingCodeChanges(pendingCodeChanges())
+    }
 }
 
 // Check 1 (30s after a send) confirms early; check 2 (the attempt's final
@@ -1182,6 +1200,19 @@ void expirePendingCodeChanges() {
     if (!expired) return
     expired.each { k, p ->
         if (p.status == 'pending') reportCodeResult(p, 'failed', 'expired')
+        all.remove(k)
+    }
+    savePendingCodeChanges(all)
+}
+
+// On Done/update: drop changes (failed ones too) for locks no longer selected
+// for lock code management; an in-flight one is reported failed.
+void dropCodeChangesForMissingLocks() {
+    Map all = pendingCodeChanges()
+    Map gone = all.findAll { k, p -> !findCodeLock(p.lockId) }
+    if (!gone) return
+    gone.each { k, p ->
+        if (p.status == 'pending') reportCodeResult(p, 'failed', 'lock_not_found')
         all.remove(k)
     }
     savePendingCodeChanges(all)

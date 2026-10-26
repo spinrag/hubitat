@@ -55,8 +55,13 @@ class FakeLock {
     // next `dropCommands` ones (a lock that silently drops a change).
     Boolean applyCommands = false
     int dropCommands = 0
+    Boolean throwOnSet = false
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
-    void setCode(Integer slot, String code, String name) { calls << ['setCode', slot, name]; apply { it[slot.toString()] = [name: name, code: code] } }
+    void setCode(Integer slot, String code, String name) {
+        calls << ['setCode', slot, name]
+        if (throwOnSet) throw new IllegalStateException("setCode(${slot}, ${code}, ${name}) failed")
+        apply { it[slot.toString()] = [name: name, code: code] }
+    }
     void deleteCode(Integer slot) { calls << ['deleteCode', slot]; apply { it.remove(slot.toString()) } }
     void apply(Closure c) {
         if (!applyCommands) return
@@ -571,6 +576,52 @@ app.state.remove('pendingCodeChanges')
 app.scheduled.clear()
 lock3.applyCommands = true
 
+// An unnamed code appearing in a slot that was empty is not ours (adopted
+// slot 20, where no SBA:/SBM: marker rule applies)
+lock3.dropCommands = 99
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 20, code: '91922222', name: 'Fresh Legacy']]
+call('apiSetCode')
+check('empty slot: prevName is null', pendingFor(20).prevName == null)
+tick()
+lock3.attrs.lockCodes = groovy.json.JsonOutput.toJson((new JsonSlurper().parseText(lock3.attrs.lockCodes) as Map) + ['20': [code: '91922229']])
+tick()
+check('unnamed foreign code -> slot_changed, not re-sent', results()[-1].d.reason == 'slot_changed' && results()[-1].d.slot == 20 && lock3.calls.count { it[0] == 'setCode' && it[1] == 20 } == 1)
+putSlot(20, null, null)
+
+// A driver that throws on re-send fails only that change, never logging the message
+app.request = [JSON: [slot: 19, code: '91919191', name: 'SBM: Throw']]
+call('apiSetCode')
+app.request = [JSON: [slot: 21, code: '91912121', name: 'SBM: Bystander']]
+call('apiSetCode')
+tick()
+lock3.throwOnSet = true
+app.logged.clear()
+tick()
+lock3.throwOnSet = false
+def thrown = results().find { it.d.slot == 19 && it.d.reason == 'send_error' }
+check('driver exception -> failed send_error, dropped', thrown != null && thrown.value == 'failed' && pendingFor(19) == null)
+check('exception logged by class name only', app.logged.any { it.toString().contains('IllegalStateException') } && !app.logged.any { it.toString().contains('91919191') || it.toString().contains('failed)') && it.toString().contains('setCode(') })
+check('other due change also handled and job rescheduled', results().any { it.d.slot == 21 && it.d.reason == 'send_error' } || (pendingFor(21) != null && verifyJobs().size() == 1))
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+
+// Done/update drops changes for locks no longer selected
+lock3.dropCommands = 99
+app.request = [JSON: [slot: 23, code: '91923232', name: 'SBM: Kept']]
+call('apiSetCode')
+while (tick()) {}
+check('slot 23 failed and kept', pendingFor(23)?.status == 'failed')
+app.request = [JSON: [slot: 24, code: '91924242', name: 'SBM: Flight']]
+call('apiSetCode')
+int beforeSweep = results().size()
+app.codeLocks = [lock, lock2]
+app.initialize()
+def swept = results().drop(beforeSweep)
+check('sweep: both changes dropped', app.state.pendingCodeChanges == null && !verifyJobs())
+check('sweep: only the in-flight one reported (lock_not_found)', swept.size() == 1 && swept[0].d.slot == 24 && swept[0].d.reason == 'lock_not_found')
+app.codeLocks = [lock, lock2, lock3]
+lock3.dropCommands = 0
+
 // Code comparison: strings, numbers only as the driver reported them
 check('sameCode: string match', app.sameCode('01234', '01234'))
 check('sameCode: string leading zero differs', !app.sameCode('1234', '01234'))
@@ -592,7 +643,7 @@ app.appButtonHandler('btnDisconnect')
 check('disconnect reports and clears', results()[-1].d.reason == 'disconnected' && app.state.pendingCodeChanges == null)
 
 // No code anywhere outside app state
-List codes = ['91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
+List codes = ['91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
 String everything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })
