@@ -48,7 +48,7 @@ import groovy.transform.Field
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.3.0'
+@Field static final String APP_VERSION = '1.3.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -81,6 +81,9 @@ import javax.crypto.spec.SecretKeySpec
 // Hubs connected before signalbricks/platform#505 hold an ingestion token that
 // can't register lock management; only a reconnect issues one that can (#522).
 @Field static final String RECONNECT_MESSAGE = 'Reconnect to SignalBricks to enable lock management'
+// An HPM update replaces the code without calling updated(), so the app
+// re-registers itself once the version changes, at most this often (#539).
+@Field static final long REREGISTER_INTERVAL_MS = 30L * 60 * 1000
 
 // Set/delete verification (#520). Each attempt is checked 30s after it is
 // sent and again at its final check; the final check backs off per attempt
@@ -340,6 +343,8 @@ void appButtonHandler(String btn) {
         state.remove('lockMgmtRegisterError')
         state.remove('lockMgmtRegistered')
         state.remove('lockMgmtReconnectRequired')
+        state.remove('registeredVersion')
+        state.remove('reregisterAttemptAt')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         createAccessToken()
@@ -376,6 +381,7 @@ void eventHandler(evt) {
         timeout: 15,
     ]
     asynchttpPost('postCallback', params, [name: evt.name, deviceId: evt.deviceId])
+    reregisterIfVersionChanged()
 }
 
 // Door codes (PINs) must never leave the hub. `evt.data` is a JSON string;
@@ -595,6 +601,7 @@ void registerWithPlatform(Boolean enabledOverride = null) {
         hubUid: getHubUID(),
         appId: app.id.toString(),
         version: APP_VERSION,
+        hubFirmwareVersion: hubFirmwareVersion(),
         lockManagement: enabled,
     ]
     Map params = [
@@ -606,6 +613,33 @@ void registerWithPlatform(Boolean enabledOverride = null) {
         timeout: 15,
     ]
     asynchttpPost('registerCallback', params, [enabled: enabled])
+}
+
+// Hubitat platform version, shown on the SignalBricks hub page. Null if unavailable.
+String hubFirmwareVersion() {
+    try {
+        return location?.hub?.firmwareVersionString?.toString()
+    } catch (Exception e) {
+        return null
+    }
+}
+
+// After an update that didn't run updated() (HPM), re-register so SignalBricks
+// sees the new version: on the next event or scheduled check, only when
+// registering is otherwise allowed, and at most every REREGISTER_INTERVAL_MS.
+void reregisterIfVersionChanged() {
+    if (state.registeredVersion == APP_VERSION) return
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    if (lockManagementEnabled != true && !lockMgmtPreviouslyRegistered()) return
+    if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
+    state.reregisterAttemptAt = now()
+    log.info "SignalBricks Telemetry: re-registering after update to ${APP_VERSION}"
+    try {
+        registerWithPlatform()
+    } catch (Exception e) {
+        // Only the class name: the request body carries the access token.
+        log.warn "SignalBricks Telemetry: re-registration failed (${e.class.simpleName})"
+    }
 }
 
 void registerCallback(resp, Map data) {
@@ -625,6 +659,7 @@ void registerCallback(resp, Map data) {
         if (!state.lockMgmtReconnectRequired) log.warn "SignalBricks Telemetry: ${RECONNECT_MESSAGE}"
         state.lockMgmtReconnectRequired = true
         state.remove('lockMgmtRegisterError')
+        state.registeredVersion = APP_VERSION
         return
     }
     if (failed) {
@@ -635,6 +670,7 @@ void registerCallback(resp, Map data) {
     }
     state.remove('lockMgmtRegisterError')
     state.remove('lockMgmtReconnectRequired')
+    state.registeredVersion = APP_VERSION
     state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
     log.info "SignalBricks Telemetry: registered with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
@@ -1243,6 +1279,7 @@ Boolean codeChangeApplied(Map p, Map codes) {
 // Scheduled: runs every check that is due, then schedules the next one. A
 // check that throws (e.g. the driver's setCode) fails only its own change.
 void verifyCodeChanges() {
+    reregisterIfVersionChanged()
     try {
         expirePendingCodeChanges()
         long due = now() + 1000L
