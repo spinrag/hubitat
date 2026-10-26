@@ -5,7 +5,7 @@
 - every app/driver location in a manifest points at a file in this repo
 - each app's version in its source matches its packageManifest version
   (drivers are checked too when their source declares a version)
-- repository.json entries point at existing manifests
+- repository.json entries point at existing manifests, and every manifest is listed
 """
 import json
 import re
@@ -90,7 +90,7 @@ if repo is not None:
 
 for path in manifests:
     if path not in listed:
-        warnings.append(f"{path} is not listed in repository.json")
+        errors.append(f"{path} is not listed in repository.json")
 
 for w in warnings:
     print(f"WARN {w}")
