@@ -369,6 +369,7 @@ void eventHandler(evt) {
         date: evt.date ? evt.date.format("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", TimeZone.getTimeZone('UTC')) : null,
         unit: evt.unit,
         version: APP_VERSION,
+        hubFirmwareVersion: hubFirmwareVersion(),
     ]
     logDebug "sending ${evt.displayName} ${evt.name}=${evt.value}"
 
@@ -615,7 +616,8 @@ void registerWithPlatform(Boolean enabledOverride = null) {
     asynchttpPost('registerCallback', params, [enabled: enabled])
 }
 
-// Hubitat platform version, shown on the SignalBricks hub page. Null if unavailable.
+// Hubitat platform version, sent with events and registration for the
+// SignalBricks hub page. Null if unavailable.
 String hubFirmwareVersion() {
     try {
         return location?.hub?.firmwareVersionString?.toString()

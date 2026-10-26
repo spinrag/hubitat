@@ -44,7 +44,7 @@ Version 1.1.0 adds optional **lock code management** (off by default): SignalBri
 | Temperature sensors | `temperature`, `battery` |
 | Humidity sensors | `humidity`, `battery` |
 
-Each event is sent with `asynchttpPost` to the SignalBricks ingestion API (`https://ingest.signalbricks.co/v1/webhooks/hubitat`) using `Authorization: Bearer <token>`. Each event includes the device id and name, the attribute name and value, the unit, the description text, the event time, and the app version.
+Each event is sent with `asynchttpPost` to the SignalBricks ingestion API (`https://ingest.signalbricks.co/v1/webhooks/hubitat`) using `Authorization: Bearer <token>`. Each event includes the device id and name, the attribute name and value, the unit, the description text, the event time, the app version, and (since 1.3.1) the hub firmware version.
 
 ## Lock code management (optional)
 
@@ -164,7 +164,7 @@ After every Connect (once the access token has been rotated), on every **Done**,
 
 Since 1.2.1 it does this only while lock code management is on, or to send a disable (`lockManagement: false`) when an earlier enable may still be stored. A hub that has never used lock code management doesn't register at all.
 
-Since 1.3.1 the app remembers the version it last registered. Updating through Hubitat Package Manager replaces the code without running **Done**, so when the version differs the app re-registers on its own on the next event it sends (or the next code-change check), under the same conditions, at most every 30 minutes until SignalBricks accepts it. It also sends the hub's firmware version (`hubFirmwareVersion`, shown on the SignalBricks hub page). Every event also carries `version`, so SignalBricks shows the version of hubs that don't use lock code management too.
+Since 1.3.1 the app remembers the version it last registered. Updating through Hubitat Package Manager replaces the code without running **Done**, so when the version differs the app re-registers on its own on the next event it sends (or the next code-change check), under the same conditions, at most every 30 minutes until SignalBricks accepts it. Registration and every event carry the app `version` and the hub's firmware version (`hubFirmwareVersion`, null when Hubitat doesn't report it), so SignalBricks shows both on its hub page for every connected hub, including hubs that don't use lock code management, and picks up a firmware update with the next event.
 
 SignalBricks accepts it only with the ingestion token the Connect flow issued for this hub and app. It stores the endpoint and token encrypted against that hub, and never logs or returns them. The app sends tokens only to an `https://` ingest URL.
 

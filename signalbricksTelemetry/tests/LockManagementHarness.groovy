@@ -993,7 +993,7 @@ app.state.remove('reregisterAttemptAt')
 app.fakeNow = 1_800_000_000_000L
 event()
 def evBody = new JsonSlurper().parseText(app.posts.find { it.cb == 'postCallback' }.params.body)
-check('version: event carries the app version', evBody.version == VERSION)
+check('version: event carries the app and firmware versions', evBody.version == VERSION && evBody.hubFirmwareVersion == '2.4.1.177')
 check('version: changed version re-registers on the next event', registers().size() == 1 && regBody().version == VERSION && regBody().lockManagement == true)
 check('version: registration carries the hub firmware version', regBody().hubFirmwareVersion == '2.4.1.177')
 event()
