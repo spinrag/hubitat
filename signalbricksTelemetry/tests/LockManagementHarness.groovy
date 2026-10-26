@@ -30,6 +30,10 @@ abstract class HubitatStub extends Script {
         if (opts?.overwrite != false) scheduled.removeAll { it.handler == handler }
         scheduled << [secs: secs, handler: handler, data: opts?.data]
     }
+    void schedule(String cron, String handler) {
+        scheduled.removeAll { it.handler == handler }
+        scheduled << [cron: cron, handler: handler]
+    }
     void unschedule(String handler = null) { if (handler) scheduled.removeAll { it.handler == handler } else scheduled.clear() }
     void unsubscribe() {}
     String getHubUID() { '00000000-0000-4000-8000-00000000abcd' }
@@ -979,7 +983,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.3.1'
+String VERSION = '1.3.2'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1062,6 +1066,93 @@ check('version: no location -> hubFirmwareVersion null', registers().size() == 1
 app.appButtonHandler('btnDisconnect')
 check('version: disconnect clears the registered version', app.state.registeredVersion == null && app.state.reregisterAttemptAt == null)
 check('version: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
+
+// --- Daily check-in (#13) ---
+def checkInJobs = { app.scheduled.findAll { it.handler == 'dailyCheckIn' } }
+def cronSecond = { String cron -> def f = cron.split(' '); (f[2] as int) * 3600 + (f[1] as int) * 60 + (f[0] as int) }
+app.location = [name: 'Test', hub: [firmwareVersionString: '2.4.1.177']]
+app.scheduled.clear(); app.posts.clear(); app.logged.clear()
+check('check-in: disconnected, nothing scheduled', checkInJobs().isEmpty() && app.state.checkInSecond == null)
+app.initialize()
+check('check-in: initialize while disconnected schedules nothing', checkInJobs().isEmpty())
+
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegistered = true
+app.initialize()
+def job = checkInJobs()
+check('check-in: initialize schedules one daily job', job.size() == 1 && job[0].cron ==~ /\d{1,2} \d{1,2} \d{1,2} \* \* \?/)
+int sec = cronSecond(job[0].cron)
+check('check-in: cron matches the stored time', sec == (app.state.checkInSecond as int))
+check('check-in: time shown on the app page', app.checkInTime() == String.format('%02d:%02d', sec.intdiv(3600), (sec.intdiv(60)) % 60))
+app.initialize()
+app.updated()
+check('check-in: Done keeps the same time and a single job', checkInJobs().size() == 1 && checkInJobs()[0].cron == job[0].cron)
+
+// Random per hub, never 02:00-03:59
+Set seen = []
+boolean outsideWindow = true
+500.times {
+    app.state.remove('checkInSecond')
+    app.scheduleDailyCheckIn()
+    int t = cronSecond(checkInJobs()[0].cron)
+    seen << t
+    if (t >= 2 * 3600 && t < 4 * 3600) outsideWindow = false
+    if (t < 0 || t >= 86400) outsideWindow = false
+}
+check('check-in: times are spread out', seen.size() > 400)
+check('check-in: never between 02:00 and 03:59', outsideWindow)
+check('check-in: still a single job', checkInJobs().size() == 1)
+
+// The job runs the version check, with its guards and backoff
+app.posts.clear()
+app.state.registeredVersion = VERSION
+app.state.remove('reregisterAttemptAt')
+app.dailyCheckIn()
+check('check-in: same version sends nothing', app.posts.isEmpty())
+app.state.registeredVersion = '1.3.1'
+app.fakeNow += 24L * 3600 * 1000
+app.dailyCheckIn()
+check('check-in: changed version re-registers', registers().size() == 1 && regBody().version == VERSION)
+app.dailyCheckIn()
+check('check-in: backoff respected', registers().size() == 1)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true])
+app.fakeNow += 24L * 3600 * 1000
+app.dailyCheckIn()
+check('check-in: registered version, nothing on the next day', registers().size() == 1)
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.state.lockMgmtRegistered = false
+app.state.registeredVersion = '1.3.1'
+app.posts.clear()
+app.dailyCheckIn()
+check('check-in: telemetry-only hub never registers', app.posts.isEmpty())
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegistered = true
+
+// Hub updated by HPM from 1.3.1 (initialize never ran): the next event schedules it
+app.scheduled.clear()
+app.state.remove('checkInSecond')
+app.posts.clear()
+app.eventHandler(evt)
+check('check-in: first event after an HPM update schedules the job', checkInJobs().size() == 1 && app.state.checkInSecond != null)
+def cronBefore = checkInJobs()[0].cron
+app.eventHandler(evt)
+check('check-in: later events leave it alone', checkInJobs().size() == 1 && checkInJobs()[0].cron == cronBefore)
+
+// Disconnect removes the job; reconnect schedules a new one
+app.appButtonHandler('btnDisconnect')
+check('check-in: disconnect unschedules', checkInJobs().isEmpty() && app.state.checkInSecond == null)
+app.posts.clear()
+app.state.registeredVersion = '1.3.1'
+app.dailyCheckIn()
+app.eventHandler(evt)
+check('check-in: disconnected job run or event sends nothing', app.posts.isEmpty())
+check('check-in: nothing rescheduled while disconnected', checkInJobs().isEmpty())
+check('check-in: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
