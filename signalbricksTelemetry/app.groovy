@@ -30,6 +30,9 @@
  * `lock_code_result` event (never the code). A pending set keeps its code in
  * app state only, until it is confirmed, superseded, cleared or 24h old.
  *
+ * Updates (#13): a daily check-in at a random per-hub time re-registers when
+ * the version changed, since an HPM update doesn't run updated().
+ *
  * Setup uses Hubitat's documented OAuth "stateredirect" pattern with
  * SignalBricks as the OAuth provider: "Connect to SignalBricks" opens the
  * SignalBricks portal, the user picks the organization/property/hub, and
@@ -48,7 +51,7 @@ import groovy.transform.Field
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.3.1'
+@Field static final String APP_VERSION = '1.3.2'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -84,6 +87,11 @@ import javax.crypto.spec.SecretKeySpec
 // An HPM update replaces the code without calling updated(), so the app
 // re-registers itself once the version changes, at most this often (#539).
 @Field static final long REREGISTER_INTERVAL_MS = 30L * 60 * 1000
+// Daily check-in (#13): runs that check once a day, so a quiet hub reports a
+// new version without waiting for an event. Each hub picks its own random
+// time, outside 02:00-03:59 (hub maintenance and backups).
+@Field static final int CHECK_IN_WINDOW_START_SEC = 4 * 3600
+@Field static final int CHECK_IN_WINDOW_SEC = 22 * 3600
 
 // Set/delete verification (#520). Each attempt is checked 30s after it is
 // sent and again at its final check; the final check backs off per attempt
@@ -173,6 +181,9 @@ Map mainPage() {
             } else if (state.sbToken) {
                 paragraph "<b>Status:</b> Connected${state.connectedAt ? " since ${state.connectedAt}" : ''}"
                 paragraph "<b>Sending to:</b> ${state.ingestUrl}"
+                if (checkInTime()) {
+                    paragraph "<small>Daily update check-in at ${checkInTime()} (hub time).</small>"
+                }
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${state.lastError}"
                 }
@@ -296,6 +307,7 @@ void initialize() {
     unsubscribe()
     unschedule()
     subscribeToEvents()
+    scheduleDailyCheckIn()
     if (debugLogging) {
         runIn(1800, 'logsOff')
     }
@@ -345,6 +357,8 @@ void appButtonHandler(String btn) {
         state.remove('lockMgmtReconnectRequired')
         state.remove('registeredVersion')
         state.remove('reregisterAttemptAt')
+        unschedule('dailyCheckIn')
+        atomicState.remove('checkInSecond')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         createAccessToken()
@@ -354,6 +368,8 @@ void appButtonHandler(String btn) {
 
 void eventHandler(evt) {
     if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    // Hubs updated by HPM from before 1.3.2 never ran initialize(); schedule once.
+    if (atomicState.checkInSecond == null) scheduleDailyCheckIn()
 
     Map payload = [
         id: evt.id,
@@ -554,6 +570,7 @@ Map handleOauthCallback() {
     if (state.sbToken && !state.lastError) {
         log.info 'Connected to SignalBricks'
         subscribeToEvents()
+        scheduleDailyCheckIn()
         return renderPage('Connected', 'This hub is now connected to SignalBricks. You can close this window and return to the app.')
     }
     return renderPage('Not connected', "Could not complete the connection (${escapeHtml(state.lastError ?: 'unknown error')}). Close this window and try again from the app.")
@@ -642,6 +659,35 @@ void reregisterIfVersionChanged() {
         // Only the class name: the request body carries the access token.
         log.warn "SignalBricks Telemetry: re-registration failed (${e.class.simpleName})"
     }
+}
+
+// Schedules dailyCheckIn at this hub's time of day, picked at random once and
+// kept, so hubs don't all call SignalBricks at the same moment. Only while
+// connected. Schedules survive later code updates.
+void scheduleDailyCheckIn() {
+    if (!state.sbToken || !isHttps(state.ingestUrl)) {
+        unschedule('dailyCheckIn')
+        return
+    }
+    // atomicState: two first events running at once must not pick two times.
+    if (atomicState.checkInSecond == null) {
+        atomicState.checkInSecond = (CHECK_IN_WINDOW_START_SEC + new Random().nextInt(CHECK_IN_WINDOW_SEC)) % 86400
+    }
+    int t = atomicState.checkInSecond as int
+    schedule("${t % 60} ${(t.intdiv(60)) % 60} ${t.intdiv(3600)} * * ?".toString(), 'dailyCheckIn')
+}
+
+String checkInTime() {
+    if (atomicState.checkInSecond == null) return null
+    int t = atomicState.checkInSecond as int
+    return String.format('%02d:%02d', t.intdiv(3600), (t.intdiv(60)) % 60)
+}
+
+// Scheduled daily. Sends nothing unless the version changed since the last
+// registration (same guards and backoff as after an event).
+void dailyCheckIn() {
+    logDebug 'daily check-in'
+    reregisterIfVersionChanged()
 }
 
 void registerCallback(resp, Map data) {

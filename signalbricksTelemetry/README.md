@@ -4,7 +4,7 @@ A Hubitat Elevation app that sends read-only device telemetry to [SignalBricks](
 
 It runs alongside the **SignalBricks Integration** (lock-code) app. The two apps are independent. Telemetry never controls devices.
 
-Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app.
+Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day.
 
 ## Requirements
 
@@ -34,6 +34,21 @@ Version 1.1.0 adds optional **lock code management** (off by default): SignalBri
 4. After you approve, Hubitat sends you back to the app. A confirmation page appears, and the app shows **Status: Connected**.
 
 **Reconnect** issues a new token and revokes the previous one. **Disconnect** stops sending right away. To revoke the token on the SignalBricks side as well, remove it under **Tokens** in the portal.
+
+## Updating
+
+Use Hubitat Package Manager (HPM) to keep the app up to date. Set this up once on each hub:
+
+1. Open **Hubitat Package Manager** → **Package Manager Settings**.
+2. Set **Install updates automatically when** to **Only those I list**, then add **SignalBricks Telemetry** under **Which packages should be automatically updated?** Other packages on the hub keep updating the way you choose.
+3. Turn on **Notify me if automatic updates are unsuccessful**, pick a notification device, and turn on **Include hub name in notifications**, so you can tell which hub needs attention when you run several.
+4. If **Hub Login Security** is on (Settings → Hub Login Security), enter the hub's username and password under **Hub Security** in HPM settings. HPM needs them to install the new code; without them updates fail.
+   If the hub has HTTPS turned on, also turn on **SSL (HTTPS) Enabled** in HPM settings.
+5. Set the update check time away from 3am: the hub runs its nightly maintenance and backups then. Any time outside 2–4am works.
+
+**From 1.3.1 on, you don't need to open the app and click Done after an update.** HPM replaces the code without running Done; the app notices the new version and [re-registers](#registration) with SignalBricks by itself. Open the app and click **Done** only when a release adds a new setting or permission you want to use (the release notes say so).
+
+**Daily check-in (1.3.2).** Once a day the app checks whether it was updated and, if so, re-registers, so a hub that sends few events still reports the new version within a day. Each hub picks its own random time once, never between 2 and 4am (hub time), so hubs don't all call SignalBricks at once; the app page shows it under **Status** as *Daily update check-in at HH:MM*. The check sends nothing when the version hasn't changed, and follows the same rules as re-registering after an event. It is set up on **Done** or **Connect** (or, for a hub updated from 1.3.1, with its next event) and removed on **Disconnect**.
 
 ## Events sent
 
@@ -159,12 +174,14 @@ Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots`
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.1", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.2", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
 ```
 
 Since 1.2.1 it does this only while lock code management is on, or to send a disable (`lockManagement: false`) when an earlier enable may still be stored. A hub that has never used lock code management doesn't register at all.
 
 Since 1.3.1 the app remembers the version it last registered. Updating through Hubitat Package Manager replaces the code without running **Done**, so when the version differs the app re-registers on its own on the next event it sends (or the next code-change check), under the same conditions, at most every 30 minutes until SignalBricks accepts it. Registration and every event carry the app `version` and the hub's firmware version (`hubFirmwareVersion`, null when Hubitat doesn't report it), so SignalBricks shows both on its hub page for every connected hub, including hubs that don't use lock code management, and picks up a firmware update with the next event.
+
+Since 1.3.2 the same check also runs once a day (see [Daily check-in](#updating)), so the version reaches SignalBricks within a day even on a hub that sends few events.
 
 SignalBricks accepts it only with the ingestion token the Connect flow issued for this hub and app. It stores the endpoint and token encrypted against that hub, and never logs or returns them. The app sends tokens only to an `https://` ingest URL.
 
