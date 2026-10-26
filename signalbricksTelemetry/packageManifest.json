@@ -12,6 +12,7 @@
 			"name": "SignalBricks Telemetry",
 			"namespace": "spinrag",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksTelemetry/app.groovy",
+			"betaLocation": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksTelemetry/beta/app.groovy",
 			"required": true,
 			"primary": true,
 			"oauth": true

@@ -5,6 +5,9 @@
 - every app/driver location in a manifest points at a file in this repo
 - each app's version in its source matches its packageManifest version
   (drivers are checked too when their source declares a version)
+- beta channel: a betaLocation is a file in this repo whose version is the
+  manifest's betaVersion, or its version when no beta is out; a betaVersion
+  needs betaReleaseNotes and must be one HPM offers over version
 - repository.json entries point at existing manifests, and every manifest is listed
 """
 import json
@@ -37,6 +40,20 @@ def local_path(url):
     return url[len(RAW_PREFIX):] if url and url.startswith(RAW_PREFIX) else None
 
 
+def hpm_compare(old, new):
+    """Hubitat Package Manager's compareVersions (apps/Package_Manager.groovy), as is:
+    1 when any part of new is higher than old's, 0 when equal, else -1."""
+    new = re.sub(r"[^\d.]", "", new)
+    old = re.sub(r"[^\d.]", "", old)
+    if new == old:
+        return 0
+    old_parts, new_parts = old.split("."), new.split(".")
+    for i, part in enumerate(new_parts):
+        if i >= len(old_parts) or int(old_parts[i]) < int(part):
+            return 1
+    return -1
+
+
 def source_version(path):
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -58,6 +75,19 @@ for path in manifests:
     version = m.get("version")
     if not version:
         errors.append(f"{path}: no version")
+    beta_version = m.get("betaVersion")
+    if beta_version and version:
+        # HPM installs the stable code instead when compareVersions(betaVersion, version) != -1.
+        if beta_version == version:
+            errors.append(f"{path}: betaVersion equals version {version}; remove betaVersion and betaReleaseNotes when promoting a beta")
+        elif hpm_compare(beta_version, version) != -1:
+            errors.append(f"{path}: HPM would not offer betaVersion {beta_version} over version {version}; every part of betaVersion must be at least the same part of version")
+        if not m.get("betaReleaseNotes"):
+            errors.append(f"{path}: betaVersion {beta_version} has no betaReleaseNotes")
+    elif m.get("betaReleaseNotes"):
+        errors.append(f"{path}: betaReleaseNotes without betaVersion")
+    if beta_version and not any(e.get("betaLocation") for k in ("apps", "drivers") for e in m.get(k, [])):
+        errors.append(f"{path}: betaVersion {beta_version} but no app or driver has a betaLocation")
     # The top-level location is optional in HPM; when present it must be this file.
     if "location" in m and local_path(m["location"]) != path:
         errors.append(f"{path}: location {m.get('location')!r} does not point at itself")
@@ -76,6 +106,20 @@ for path in manifests:
                 errors.append(f"{src}: version {found} does not match {path} version {version}")
             else:
                 print(f"OK   {src} version {found} matches {path}")
+            if "betaLocation" not in entry:
+                continue
+            beta_src = local_path(entry["betaLocation"])
+            if beta_src not in tracked:
+                errors.append(f"{path}: {kind} betaLocation {entry['betaLocation']!r} is not a file in this repo")
+                continue
+            # Between betas the beta copy is the stable code: HPM installs it on hubs opted in to betas.
+            expected = beta_version or version
+            found = source_version(beta_src)
+            if found != expected:
+                field = "betaVersion" if beta_version else "version (no betaVersion)"
+                errors.append(f"{beta_src}: version {found} does not match {path} {field} {expected}")
+            else:
+                print(f"OK   {beta_src} version {found} matches {path} {'betaVersion' if beta_version else 'version'}")
 
 repo = load("repository.json")
 listed = set()
