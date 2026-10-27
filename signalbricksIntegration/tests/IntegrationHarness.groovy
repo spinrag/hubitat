@@ -33,6 +33,7 @@ abstract class HubitatStub extends Script {
     void runOnce(Date d, String handler, Map opts = [:]) { scheduled << [at: d, handler: handler] }
     void schedule(String cron, String handler) { scheduled << [cron: cron, handler: handler] }
     void unschedule() { scheduled.clear() }
+    void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
     void unsubscribe() {}
     def parseJson(String s) { new JsonSlurper().parseText(s) }
