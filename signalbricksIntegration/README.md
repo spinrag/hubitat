@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.6*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.7*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -13,6 +13,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 - **Which codes it manages.** The app adds, changes and removes codes whose name starts with its code name prefix and contains `ORB` followed by the booking id. It also treats any slot it assigned earlier as its own, by position, even if that slot was later reassigned outside the app (it tracks its assignments because some lock drivers don't keep code names). It writes new codes only into empty slots from its **Minimum Code Position** up. SignalBricks Telemetry never names its admin and managed codes (`SBA:` / `SBM:`) with `ORB` plus a digit, so the app doesn't claim them by name; keep Telemetry's slots below the app's minimum.
 - **Retries.** Each code set is verified and re-sent until the lock confirms it; a reconcile loop catches missed confirmations.
 - **Door code refresh.** Off by default. Reads the codes back from the locks one lock at a time, on a schedule you choose or from the app page (see [Door code refresh](#door-code-refresh)).
+- **Bookings page.** Shows the bookings the app knows against its codes on the locks, with codes masked (see [Bookings page](#bookings-page)).
 - **API.** A small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher. The dispatcher is not part of this repository.
 
 ## Running alongside the OwnerRez app
@@ -45,6 +46,16 @@ The **Door code refresh** section of the app page has:
 Locks are always read one at a time. The next lock starts when the current one has reported its codes (counted only after 2.6 seconds per slot, at least 60 seconds, because large locks report codes while still reading; then 30 seconds to settle), or when its time budget runs out (3 seconds per slot, at least 2 and at most 20 minutes), whichever comes first. A refresh of 13 large locks can take a few hours. Starting a refresh while one is running does nothing. Booking syncs and reconciles carry on during a refresh.
 
 Clicking **Done** never starts a refresh. Up to 1.3.4 the app refreshed every lock at midnight each night, starting a new lock every 90 seconds; on hubs with large locks the reads overlapped and Z-Wave timed out for hours. After updating to 1.3.5 that midnight schedule is removed when you open the app and click **Done**, or else the next time it fires (it then reads no lock).
+
+## Bookings page
+
+Added in 1.3.7. Open the app and click **Bookings** under **Diagnostics**. The page shows what the app knows and what is on the locks, from the hub's own state and each lock's last reported codes (it sends nothing and reads nothing from the locks; reload the page to update it, or run a [door code refresh](#door-code-refresh) first if a lock's codes may be out of date):
+
+- **Summary:** `N bookings known · M codes on locks · K not on lock · J orphans`, and when the last booking sync arrived and whether it was a full sync (PUT) or a partial one (PATCH). The sync time is recorded from 1.3.7 on.
+- **Known bookings:** one row per booking: booking id, guest, check-in and checkout in hub time, and whether it is current, upcoming or past. For each lock assigned to the booking, the slot that holds its code, matched the same way reconcile matches (its prefix + `ORB<booking id>`, or a slot the app assigned earlier), or **not on lock**. An upcoming booking is normally not on the lock yet; its code is added at check-in. A current booking that is not on a lock is the case to look at (try **Debug** → **Reconcile Door Codes**).
+- **Orphans:** codes on the selected locks that carry the app's prefix and an `ORB` booking id (or sit in a slot it assigned) but match no known booking for that lock. The next reconcile removes them. Many orphans and few known bookings usually means the dispatcher's last full sync left bookings out.
+
+Codes are shown masked, with only their last 2 digits (e.g. `••••12`), and are never logged. A lock whose codes the hub can't read (e.g. encrypted lock codes) is noted and not counted.
 
 ## Conflicts
 
@@ -109,10 +120,10 @@ You don't need to open the app and click **Done** after an update; the existing 
 
 ## Development
 
-`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. `tests/RefreshHarness.groovy` checks the door code refresh: Off by default and after an upgrade, the old midnight job removed, Done not refreshing, the Weekly/Daily times, the one-lock-at-a-time queue, the manual button and progress, re-arming after a booking sync, and that no code is logged. Neither is loaded by Hubitat or HPM. Run them from the repository root with Docker:
+`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. `tests/RefreshHarness.groovy` checks the door code refresh: Off by default and after an upgrade, the old midnight job removed, Done not refreshing, the Weekly/Daily times, the one-lock-at-a-time queue, the manual button and progress, re-arming after a booking sync, and that no code is logged. `tests/BookingsHarness.groovy` checks the Bookings page: it renders with no state (as when the hub saves the code), the on lock, not on lock and orphan statuses, the summary and last sync, and that codes are masked and never rendered in full or logged. None is loaded by Hubitat or HPM. Run them from the repository root with Docker:
 
 ```bash
-for h in IntegrationHarness RefreshHarness; do
+for h in IntegrationHarness RefreshHarness BookingsHarness; do
   docker run --rm --network none -v "$PWD/signalbricksIntegration:/w:ro" groovy:4.0-jdk17 \
     groovy /w/tests/$h.groovy /w/app.groovy
 done
