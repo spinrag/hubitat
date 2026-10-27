@@ -32,11 +32,13 @@ preferences {
             paragraph '<b>' + sbAppNameAndVersion + '</b>'
             paragraph 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to the locks selected below. ' +
                 'Each code is named <code>&lt;prefix&gt;ORB&lt;booking id&gt;-&lt;guest&gt;</code> and is on the lock from before check-in to after checkout. ' +
-                'This app only adds, changes and removes codes whose name contains <code>ORB</code> followed by the booking id; ' +
-                'it never touches other codes, including slots managed by SignalBricks Telemetry (<code>SBA:</code>/<code>SBM:</code>).'
+                'It manages codes named with its prefix + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
+                '(it can treat such a slot as its own by position even if the slot was reassigned outside the app). ' +
+                'It writes new codes only into empty slots from the minimum code position up. ' +
+                'Do not run Hubitat Lock Code Manager on the same locks.'
             paragraph 'Runs alongside the OwnerRez app. Give the two apps <b>different, non-empty</b> code name prefixes, neither the start of the other ' +
                 '(e.g. OwnerRez <code>G:</code>, SignalBricks Integration <code>GT:</code>) and minimum code positions above the Telemetry slots ' +
-                "(e.g. OwnerRez 30, this app 50). <a href='https://github.com/spinrag/hubitat/blob/main/signalbricksIntegration/README.md' target='_blank'>Documentation</a>"
+                "(e.g. OwnerRez 30, this app 50; a minimum is a lower bound, not a separate range). <a href='https://github.com/spinrag/hubitat/blob/main/signalbricksIntegration/README.md' target='_blank'>Documentation</a>"
         }
 
         // We can only access the locks the user has selected
@@ -75,6 +77,8 @@ preferences {
                         input(name: 'btnDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                     } else {
                         paragraph '<b>Status:</b> Not registered (use CLI add-hub to configure)'
+                        paragraph '<small>Expected and harmless: the SignalBricks dispatcher drives this app through its endpoints (<code>/sync</code> etc.) with the access token above. ' +
+                            'Registration only enables an outbound webhook to a SignalBricks backend that was never wired up; lock events reach SignalBricks through the SignalBricks Telemetry app.</small>'
                     }
                 }
             } else {
@@ -633,7 +637,7 @@ void webhook(e) {
     log.debug "webhook: ${e.name}"
 
     if (!state.sbId) {
-        log.debug "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
+        log.trace "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
         return
     }
 

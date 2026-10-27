@@ -5,7 +5,7 @@
 	"minimumHEVersion": "2.5.0",
 	"dateReleased": "2026-10-27",
 	"documentationLink": "https://github.com/spinrag/hubitat/blob/main/signalbricksIntegration/README.md",
-	"releaseNotes": "1.3.4 - First release through Hubitat Package Manager. Hubs that installed the app by hand: use HPM Match Up (see the README), don't Install it again. The app page and log lines now show the app name with the version (\"SignalBricks Integration 1.3.4\"), the app has a description of what it does, and the page warns when the code name prefix is empty. Door code writing, reconcile and code naming are unchanged; API responses still carry the bare version.",
+	"releaseNotes": "1.3.4 - First release through Hubitat Package Manager. Hubs that installed the app by hand: use HPM Match Up (see the README), don't Install it again. The app page and log lines now show the app name with the version (\"SignalBricks Integration 1.3.4\"), the app has a description of what it does, the page warns when the code name prefix is empty, and explains that \"Status: Not registered\" is expected (the dispatcher drives the app through its endpoints; lock events reach SignalBricks through SignalBricks Telemetry). The \"webhook: No SignalBricks ID\" log line is now at trace level instead of debug. Door code writing, reconcile and code naming are unchanged; API responses still carry the bare version.",
 	"apps": [
 		{
 			"id": "4ca34cbe-29d9-41ff-85e8-ddace84041dc",

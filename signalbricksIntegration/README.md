@@ -10,7 +10,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 
 - **Code names.** Each booking code is named `<prefix>ORB<booking id>-<guest>`, e.g. `GT:ORB123456-Ann` (or `<prefix><guest>-ORB<booking id>` with **Booking ID at End?** on).
 - **Timing.** A code is on the lock from before check-in to after checkout: the dispatcher sends the booking window and the app reconciles the lock codes at its start and end.
-- **Only its own codes.** The app only adds, changes and removes codes whose name has `ORB` followed by the booking id and starts with its own code name prefix. It never touches any other code, including the admin and managed slots of SignalBricks Telemetry (`SBA:` / `SBM:`, which Telemetry never names with `ORB` plus a digit). It only writes new codes into empty slots.
+- **Which codes it manages.** The app adds, changes and removes codes whose name starts with its code name prefix and contains `ORB` followed by the booking id. It also treats any slot it assigned earlier as its own, by position, even if that slot was later reassigned outside the app (it tracks its assignments because some lock drivers don't keep code names). It writes new codes only into empty slots from its **Minimum Code Position** up. SignalBricks Telemetry never names its admin and managed codes (`SBA:` / `SBM:`) with `ORB` plus a digit, so the app doesn't claim them by name; keep Telemetry's slots below the app's minimum.
 - **Retries.** Each code set is verified and re-sent until the lock confirms it; a reconcile loop catches missed confirmations.
 - **API.** A small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher. The dispatcher is not part of this repository.
 
@@ -19,7 +19,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 Both apps write `ORB<booking id>` codes. Each one recognises its own codes by its **code name prefix**, so:
 
 - **Both prefixes must be set (non-empty) and different, and neither may be the start of the other.** With an empty prefix the app treats every `ORB` code on its locks as its own and can change or delete the other app's codes; the app page warns when the prefix is empty. `G:` and `GT:` are fine (`GT:` does not start with `G:`); `G` and `GT` are not.
-- **Give each app its own slot range** with **Minimum Code Position**, above the slots SignalBricks Telemetry manages.
+- **Set each app's Minimum Code Position** above the slots SignalBricks Telemetry manages. A minimum is only a lower bound, not a separate range: each app uses the first empty slot from its minimum up to the lock's `maxCodes`, so once OwnerRez's slots 30–49 are full it also uses slots from 50 up, alongside this app. Where possible, size it so OwnerRez stays below this app's minimum (enough slots between the two minimums for OwnerRez's overlapping bookings).
 
 Known-good setup:
 
@@ -30,6 +30,14 @@ Known-good setup:
 | SignalBricks Telemetry | `SBA:` / `SBM:` | admin and managed slots 1–25 |
 
 The app only uses slots from its **Minimum Code Position** up to the lock's reported `maxCodes`. A lock with fewer slots than the minimum, or a lock that doesn't report `maxCodes`, gets **no codes**, and the log shows `no free code position (>= <minimum>) on lock <id>`. Check the lock's `maxCodes` on its device page (run **Get Codes** on the lock if it is empty) and choose the minimum accordingly.
+
+## Conflicts
+
+- **Don't run Hubitat's Lock Code Manager on the same locks.** It manages codes as its own users and can rename or delete codes this app and the OwnerRez app wrote (observed on a production hub).
+
+## Registration status and the outbound webhook
+
+The app page shows **Status: Not registered**, and with debug or trace logging the log shows `webhook: No SignalBricks ID — skipping outbound POST`. Both are expected and harmless. The app is driven inbound: the SignalBricks dispatcher calls its endpoints (`/sync`, `/devices`, `/info`, …) with the app's access token. Registration would only enable an outbound webhook of lock events to a SignalBricks backend, which was never wired up. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead. Since 1.3.4 that log line is at trace level.
 
 ## Requirements
 
@@ -80,7 +88,8 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **No codes are generated for a booking.** Check the log for `no free code position`: the lock has no empty slot between **Minimum Code Position** and its `maxCodes`, or doesn't report `maxCodes`. Check `maxCodes` on the lock's device page and lower the minimum or free slots. Also check that the lock is selected in the app.
 - **Codes vanished.** Don't use **Reset State** on the Debug page: it clears the app's bookings and code assignments, so the next reconcile removes this app's codes until the dispatcher syncs the bookings again.
 - **A current (in-house) booking's code is missing.** Open **Debug** → **Reconcile Door Codes**. It re-adds codes for every booking the app holds that is active now, about a minute apart per code.
-- **The OwnerRez app's codes are changed or removed.** Check that both apps have a non-empty code name prefix, that the prefixes differ, and that neither is the start of the other.
+- **The OwnerRez app's codes are changed or removed.** Check that both apps have a non-empty code name prefix, that the prefixes differ, and that neither is the start of the other, and that Lock Code Manager isn't running on the lock (see [Conflicts](#conflicts)).
+- **Status: Not registered** / `skipping outbound POST` in the log: expected, see [Registration status](#registration-status-and-the-outbound-webhook).
 
 ## Development
 

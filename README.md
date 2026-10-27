@@ -46,7 +46,8 @@ Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Z
 
 - Codes are named `<prefix>ORB<booking id>-<guest>` and are on the lock from before check-in to after checkout
 - Both apps need different, non-empty code name prefixes (e.g. OwnerRez `G:`, SignalBricks Integration `GT:`)
-- Never touches codes without `ORB<booking id>` in the name, or SignalBricks Telemetry's `SBA:` / `SBM:` slots
+- Manages codes named with its prefix + `ORB<booking id>`, plus slots it assigned earlier; writes new codes only into empty slots from its minimum code position up
+- Don't run Hubitat's Lock Code Manager on the same locks
 - Per-code retry-until-confirmed, with a reconcile loop for missed confirmations
 - Small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher (not included in this repo)
 
