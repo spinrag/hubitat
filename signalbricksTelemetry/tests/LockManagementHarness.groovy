@@ -956,20 +956,102 @@ app.request = [JSON: fpCfg]
 fcall('apiSetLockConfig')
 app.state.fingerprintTimes = []
 
+// --- Batch fingerprints (#17): GET /fingerprints[?ids=] ---
+// Same rules as the per-lock endpoint: compare against it lock by lock,
+// including a survey-only lock and an un-listed one.
+app.codeLocks = [lockA, lockB, lockC, lockD]
+app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': [surveyOnly: true]]]]
+fcall('apiSetLockConfig')
+app.state.fingerprintTimes = []; app.state.fingerprintBatchTimes = []
+def batch = { Map p = [:] -> app.params = p; app.state.fingerprintBatchTimes = []; fcall('apiListFingerprintsBatch') }
+def perLock = { String id -> app.params = [lockId: id]; app.state.fingerprintTimes = []; body(fcall('apiListFingerprints')).slots }
+def all = batch()
+List allLocks = body(all).locks
+check('batch: 200 {locks} in selection order', all.status == 200 && body(all).keySet() == ['locks'] as Set && allLocks*.id == ['10', '11', '12', '13'])
+check('batch: each entry is {id, slots}', allLocks.every { it.keySet() == ['id', 'slots'] as Set })
+check('batch: rules parity with per-lock endpoint (ranges, adopted+approved, un-listed, survey-only)',
+    ['10', '11', '12', '13'].every { id -> allLocks.find { it.id == id }.slots == perLock(id) })
+check('batch: expected slots per lock', allLocks*.slots.collect { it*.slot } == [[1, 2, 12, 41], [1, 12, 13], [], [1, 2, 12]])
+check('batch: same code across locks -> same fp', allLocks[0].slots.find { it.slot == 1 }.fp == allLocks[3].slots.find { it.slot == 1 }.fp && allLocks[0].slots[0].fp == hmac16(key2Bytes, '12340001'))
+app.approvedAdoptedSlots = null
+check('batch: approval withdrawn -> adopted slot above ceiling dropped', body(batch()).locks[0].slots*.slot == [1, 2, 12])
+app.approvedAdoptedSlots = ['10:30', '10:41']
+check('batch: info log names counts only', app.logged.any { it.toString() == 'SignalBricks Telemetry: fingerprints listed for 4 locks (10 slots)' })
+
+// ids filter
+check('batch: ids filter keeps the requested order', body(batch(ids: '11,10')).locks*.id == ['11', '10'])
+check('batch: ids with spaces and duplicates', body(batch(ids: ' 13 , 13,10')).locks*.id == ['13', '10'])
+check('batch: ids as a list', body(batch(ids: ['12', '11'])).locks*.id == ['12', '11'])
+def unknown = batch(ids: '10,999')
+check('batch: unselected id -> per-lock lock_not_found, call still 200', unknown.status == 200 && body(unknown).locks == [[id: '10', slots: allLocks[0].slots], [id: '999', error: 'lock_not_found']])
+['', 'abc', '10,,11', '10;11', '-1', '1234567890123', (1..101).join(',')].each { ids ->
+    def r = batch(ids: ids)
+    check("batch: invalid ids '${ids.size() > 20 ? ids.take(20) + '...' : ids}' -> 400 invalid_ids", r.status == 400 && body(r).error == 'invalid_ids')
+}
+check('batch: 100 ids accepted', batch(ids: (1..100).join(',')).status == 200)
+
+// A lock whose codes can't be read fails on its own, not the whole call
+String savedB = lockB.attrs.lockCodes
+lockB.attrs.lockCodes = 'ENCRYPTEDBLOB'
+def partial = batch()
+List partialLocks = body(partial).locks
+check('batch: unreadable lock -> its entry has lock_codes_unreadable, call 200', partial.status == 200 &&
+    partialLocks.find { it.id == '11' } == [id: '11', error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'])
+check('batch: other locks still listed', partialLocks*.id == ['10', '11', '12', '13'] && partialLocks.find { it.id == '10' }.slots == allLocks[0].slots && partialLocks.find { it.id == '13' }.slots == allLocks[3].slots)
+app.params = [lockId: '11']; app.state.fingerprintTimes = []
+check('batch: per-lock endpoint still 409 for that lock', fcall('apiListFingerprints').status == 409)
+lockB.attrs.lockCodes = savedB
+
+// Rate limit: own bucket of 4/min; one batch = one read; per-lock bucket separate
+app.params = [:]
+app.state.fingerprintBatchTimes = []; app.state.fingerprintTimes = []
+List okBatch = (1..4).collect { fcall('apiListFingerprintsBatch').status }
+def limitedBatch = fcall('apiListFingerprintsBatch')
+check('batch: 4 calls a minute ok, 5th -> 429 rate_limited', okBatch == [200] * 4 && limitedBatch.status == 429 && body(limitedBatch).error == 'rate_limited')
+check('batch: calls leave the per-lock bucket alone', (app.state.fingerprintTimes ?: []).isEmpty())
+app.params = [lockId: '10']
+check('batch: per-lock endpoint still works while batch is limited', fcall('apiListFingerprints').status == 200)
+app.state.fingerprintBatchTimes = []
+app.state.fingerprintTimes = (1..10).collect { app.now() }
+app.params = [:]
+check('batch: per-lock limit reached -> batch still works', fcall('apiListFingerprintsBatch').status == 200 && fcall('apiListFingerprints').status == 429)
+app.state.fingerprintTimes = []
+
+// Edge cases
+app.codeLocks = []
+check('batch: no selected locks -> {locks: []}', body(batch()).locks == [])
+app.codeLocks = [lockA, lockB, lockC]
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+String heldKey = app.state.fingerprintKey
+app.state.remove('fingerprintKey')
+def noKey = batch()
+check('batch: no key -> 409 fingerprint_key_missing', noKey.status == 409 && body(noKey).error == 'fingerprint_key_missing')
+app.state.fingerprintKey = heldKey
+check('batch: no code or key in any batch response', !fpResponses.findAll { it.data }.any { r -> fpCodes.any { r.data.contains(it) } || r.data.contains(KEY2) })
+app.state.fingerprintBatchTimes = []
+
 // Off -> 404
 app.lockManagementEnabled = false
 app.params = [lockId: '10']
 check('fp: lock management off -> 404', fcall('apiListFingerprints').status == 404)
+app.params = [:]
+check('batch: lock management off -> 404', fcall('apiListFingerprintsBatch').status == 404)
+app.state.fingerprintBatchTimes = [app.now()]
+app.params = [lockId: '10']
 
 // Disable clears the key; re-enabling needs a new one
 app.state.lockMgmtLastEnabled = true
 app.syncLockManagementEnabled()
-check('fp: key cleared on disable', app.state.fingerprintKey == null && app.state.fingerprintTimes == null)
+check('fp: key cleared on disable', app.state.fingerprintKey == null && app.state.fingerprintTimes == null && app.state.fingerprintBatchTimes == null)
 app.lockManagementEnabled = true
 app.syncLockManagementEnabled()
 app.request = [JSON: fpCfg]
 fcall('apiSetLockConfig')
 check('fp: after re-enable -> 409 fingerprint_key_missing', body(fcall('apiListFingerprints')).error == 'fingerprint_key_missing')
+app.params = [:]
+check('batch: after re-enable -> 409 fingerprint_key_missing', body(fcall('apiListFingerprintsBatch')).error == 'fingerprint_key_missing')
+app.params = [lockId: '10']
 
 // Disconnect clears the key
 app.request = [JSON: fpCfg + [fingerprintKey: KEY]]
@@ -985,7 +1067,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.3.2'
+String VERSION = '1.3.3'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
