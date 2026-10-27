@@ -4,7 +4,7 @@ A Hubitat Elevation app that sends read-only device telemetry to [SignalBricks](
 
 It runs alongside the [**SignalBricks Integration**](../signalbricksIntegration/README.md) app (booking door codes). The two apps are independent and versioned separately; each shows its own name next to its version. Telemetry never controls devices.
 
-Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day. Version 1.3.3 adds a [batch fingerprints](#batch-fingerprints) endpoint that reads every lock in one call. Version 1.3.4 shows the app name with the version (*SignalBricks Telemetry 1.3.4*) on the app page and in log lines, so it can't be mistaken for the separately versioned SignalBricks Integration app, and recognises booking codes by `ORB` followed by a digit anywhere in the name, so prefixed names such as `GT:ORB123-x` are [always refused](#what-the-hub-enforces).
+Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day. Version 1.3.3 adds a [batch fingerprints](#batch-fingerprints) endpoint that reads every lock in one call. Version 1.3.4 shows the app name with the version (*SignalBricks Telemetry 1.3.4*) on the app page and in log lines, so it can't be mistaken for the separately versioned SignalBricks Integration app, and recognises booking codes by `ORB` followed by a digit anywhere in the name, so prefixed names such as `GT:ORB123-x` are [always refused](#what-the-hub-enforces). Version 1.3.5 adds the optional, off-by-default [Include door codes (hashed by SignalBricks)](#door-codes-in-telemetry-optional) setting.
 
 ## Requirements
 
@@ -96,6 +96,23 @@ Opting in while no beta is out changes nothing: the beta copy is then identical 
 | Humidity sensors | `humidity`, `battery` |
 
 Each event is sent with `asynchttpPost` to the SignalBricks ingestion API (`https://ingest.signalbricks.co/v1/webhooks/hubitat`) using `Authorization: Bearer <token>`. Each event includes the device id and name, the attribute name and value, the unit, the description text, the event time, the app version, and (since 1.3.1) the hub firmware version.
+
+### Door codes in telemetry (optional)
+
+Added in 1.3.5 (signalbricks/platform#388). **Include door codes (hashed by SignalBricks)** is off by default. It is one of two keys; both must be on before SignalBricks keeps anything about a code:
+
+1. **Hub:** this setting, in the app's *Door codes in telemetry (optional)* section.
+2. **SignalBricks:** an organization admin turns on *Hash door codes from Hubitat telemetry* (Security → Door codes → Settings). Each change there is recorded with who made it and when.
+
+| This setting | SignalBricks policy | What SignalBricks keeps |
+|---|---|---|
+| off (default) | either | no code: the app removes it before sending (as in every earlier version) |
+| on | off | no code: SignalBricks removes it on arrival |
+| on | on | a keyed hash of the code, never the code |
+
+With the setting on, the app keeps only the `code` field (a string or number) in the `data` of `lock` events (lock/unlock). Everything else is unchanged: other secret fields (`pin`, `passcode`, `usedCode`, `lockCodes`, ...) are still removed from every event; `codeChanged`, `lastCodeName` and all other events never carry a code; the app still never subscribes to `lockCodes`; codes are never logged (debug logging shows the event name and value only, and a failed send logs only the error class). The code travels only to the ingestion URL SignalBricks returned during Connect, over HTTPS with the hub's ingestion token, the same channel as every other event.
+
+SignalBricks replaces the code with an HMAC-SHA256 hash under a secret key of your organization as soon as the event arrives, before it is stored, streamed or logged. The same code gives the same hash within your organization. Door codes are short, so the hash is only as safe as that key: SignalBricks keeps it on its server and never sends it to the hub.
 
 ## Lock code management (optional)
 
@@ -261,7 +278,8 @@ It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It 
 
 ## Privacy
 
-- **Door codes (PINs) are never sent; only the code slot/name used.** The app never subscribes to `lockCodes`. Lock drivers include the code used in an unlock event's `data`. Before sending any event, the app removes every code/PIN field from `data` (keeping slot numbers and code names) and drops `data` entirely if it can't be parsed. `lastCodeName` is the *name* of the code that was used (for example, a guest or booking label), not the code.
+- **By default, door codes (PINs) are never sent; only the code slot/name used.** The app never subscribes to `lockCodes`. Lock drivers include the code used in an unlock event's `data`. Before sending any event, the app removes every code/PIN field from `data` (keeping slot numbers and code names) and drops `data` entirely if it can't be parsed. `lastCodeName` is the *name* of the code that was used (for example, a guest or booking label), not the code.
+- **Include door codes (optional, off by default, 1.3.5+).** When you turn it on, the `code` of lock events is sent to SignalBricks, which keeps only a keyed hash, and only if your organization's admin has also turned on hashing; otherwise SignalBricks removes it. Nothing else changes, and codes are never logged. See [Door codes in telemetry](#door-codes-in-telemetry-optional).
 - **Telemetry is read-only.** With lock code management off (the default), the app sends no device commands and its only working endpoint is the one-time `/oauthCallback` used during Connect. With it on, the lock endpoints above work only for the separately selected locks and the slots the hub allows.
 - **No shared secret.** Connect uses OAuth with PKCE (S256), so the app doesn't need to store a client secret. The hub's own app access token in the OAuth `state` is used only by Hubitat cloud to route the callback, and is never logged.
 - The hub access token used during Connect is rotated immediately after the callback; the new token is then registered with SignalBricks (sent only while lock code management is on).

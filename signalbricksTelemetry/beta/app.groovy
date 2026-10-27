@@ -6,6 +6,14 @@
  * Telemetry never sends device commands and never reads or sends lock codes
  * (PINs): the `lockCodes` attribute is deliberately not subscribed to.
  *
+ * "Include door codes (hashed by SignalBricks)" (off by default,
+ * signalbricks/platform#388): the hub half of a two-key opt-in. When on, the
+ * code used for a `lock` event (the `code` in its data) is sent over the same
+ * authenticated ingestion channel; every other secret is still stripped.
+ * SignalBricks keeps it only if the organization's admin-only "Hash door
+ * codes from Hubitat telemetry" policy is also on, and then only as a keyed
+ * hash; otherwise it redacts it. Codes are still never logged.
+ *
  * Optional "Lock code management" (off by default, signalbricks/platform#472):
  * when enabled, separately selected locks get access-token gated endpoints
  * that let SignalBricks list slots (never codes), set and delete codes and
@@ -53,7 +61,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.3.4'
+@Field static final String APP_VERSION = '1.3.5'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -68,6 +76,9 @@ import javax.crypto.spec.SecretKeySpec
 // context: lock events, or a per-slot lock-code map {"3":{"name":"Guest","code":"1234"}}.
 @Field static final Set<String> LOCK_CONTEXT_SECRET_KEYS = ['code', 'usedcode'] as Set
 @Field static final Set<String> LOCK_EVENT_NAMES = ['lock', 'unlock', 'codechanged', 'lastcodename', 'lockcodes'] as Set
+// "Include door codes" (#388): the only event whose `code` may be sent, and only that key.
+@Field static final String CODE_PASSTHROUGH_EVENT = 'lock'
+@Field static final String CODE_PASSTHROUGH_KEY = 'code'
 
 // Lock code management (#472)
 @Field static final int MAX_SLOT = 1000
@@ -181,6 +192,11 @@ Map mainPage() {
             input(name: 'contactSensors', type: 'capability.contactSensor', title: 'Contact sensors', multiple: true, required: false, submitOnChange: true)
             input(name: 'temperatureSensors', type: 'capability.temperatureMeasurement', title: 'Temperature sensors', multiple: true, required: false, submitOnChange: true)
             input(name: 'humiditySensors', type: 'capability.relativeHumidityMeasurement', title: 'Humidity sensors', multiple: true, required: false, submitOnChange: true)
+        }
+
+        section('<b>Door codes in telemetry (optional)</b>') {
+            paragraph 'Off by default: the code used to unlock a lock is removed before anything is sent; only its slot and name are. When on, the code of lock events is sent to SignalBricks, which keeps only a keyed hash of it, and only if an admin of your SignalBricks organization has also turned on <i>Hash door codes from Hubitat telemetry</i>. Otherwise SignalBricks removes it. Codes are never logged here, and lock code lists (<code>lockCodes</code>) are never read for telemetry.'
+            input(name: 'includeDoorCodes', type: 'bool', title: 'Include door codes (hashed by SignalBricks)', defaultValue: false, submitOnChange: true)
         }
 
         section('<b>Connection</b>') {
@@ -403,6 +419,7 @@ void eventHandler(evt) {
         version: APP_VERSION,
         hubFirmwareVersion: hubFirmwareVersion(),
     ]
+    // Never the data: it may carry a door code when "Include door codes" is on.
     logDebug "sending ${evt.displayName} ${evt.name}=${evt.value}"
 
     Map params = [
@@ -413,32 +430,45 @@ void eventHandler(evt) {
         body: JsonOutput.toJson(payload),
         timeout: 15,
     ]
-    asynchttpPost('postCallback', params, [name: evt.name, deviceId: evt.deviceId])
+    try {
+        asynchttpPost('postCallback', params, [name: evt.name, deviceId: evt.deviceId])
+    } catch (Exception e) {
+        // Only the class name: the request body may carry a door code (#388).
+        log.warn "SignalBricks Telemetry: failed to send ${evt.name} for device ${evt.deviceId} (${e.class.simpleName})"
+    }
     reregisterIfVersionChanged()
 }
 
-// Door codes (PINs) must never leave the hub. `evt.data` is a JSON string;
-// parse it and drop secret keys at any depth (slot numbers, code names, error
-// and status fields stay). Anything that isn't parseable JSON is dropped
-// entirely rather than sent raw. Applied to every event, not just locks.
+// Door codes (PINs) must never leave the hub, unless "Include door codes" is
+// on (#388). `evt.data` is a JSON string; parse it and drop secret keys at any
+// depth (slot numbers, code names, error and status fields stay). Anything
+// that isn't parseable JSON is dropped entirely rather than sent raw. Applied
+// to every event, not just locks. With "Include door codes" on, only the
+// `code` (a string or number) of `lock` events is kept; every other secret key
+// is still dropped, on every event.
 String sanitizeData(String raw, String eventName) {
     if (!raw) return null
     try {
         Boolean lockContext = LOCK_EVENT_NAMES.contains(eventName?.toLowerCase())
-        return JsonOutput.toJson(stripSecrets(parseJson(raw), lockContext))
+        Boolean keepCode = includeDoorCodes == true && eventName == CODE_PASSTHROUGH_EVENT
+        return JsonOutput.toJson(stripSecrets(parseJson(raw), lockContext, keepCode))
     } catch (Exception e) {
         return null
     }
 }
 
-def stripSecrets(obj, Boolean lockContext) {
+def stripSecrets(obj, Boolean lockContext, Boolean keepCode = false) {
     if (obj instanceof Map) {
         Boolean lockHere = lockContext || isLockCodeMap(obj)
-        return obj.findAll { k, v -> !isSecretKey(k, lockHere) }
-            .collectEntries { k, v -> [(k): stripSecrets(v, lockHere)] }
+        return obj.findAll { k, v -> !isSecretKey(k, lockHere) || (keepCode && isPassthroughCode(k, v)) }
+            .collectEntries { k, v -> [(k): stripSecrets(v, lockHere, keepCode)] }
     }
-    if (obj instanceof List) return obj.collect { stripSecrets(it, lockContext) }
+    if (obj instanceof List) return obj.collect { stripSecrets(it, lockContext, keepCode) }
     return obj
+}
+
+Boolean isPassthroughCode(key, value) {
+    return key.toString().toLowerCase() == CODE_PASSTHROUGH_KEY && (value instanceof String || value instanceof Number)
 }
 
 Boolean isSecretKey(key, Boolean lockContext) {
