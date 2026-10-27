@@ -4,7 +4,7 @@ A Hubitat Elevation app that sends read-only device telemetry to [SignalBricks](
 
 It runs alongside the **SignalBricks Integration** (lock-code) app. The two apps are independent. Telemetry never controls devices.
 
-Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day.
+Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day. Version 1.3.3 adds a [batch fingerprints](#batch-fingerprints) endpoint that reads every lock in one call.
 
 ## Requirements
 
@@ -73,7 +73,7 @@ Opting in while no beta is out changes nothing: the beta copy is then identical 
 
 1. Make the change in `beta/app.groovy` and set its `APP_VERSION` to the beta version.
 2. In `packageManifest.json` set `betaVersion` to that version and `betaReleaseNotes` to its notes. Leave `version`, `releaseNotes` and `app.groovy` alone.
-3. Pick a `betaVersion` HPM will offer: HPM compares versions part by part and only offers a beta when **every** part is at least the same part of `version`. After 1.3.2, `1.3.3` and `1.4.2` work; `1.4.0` does not (HPM would quietly install the stable code instead). CI rejects a `betaVersion` HPM would skip.
+3. Pick a `betaVersion` HPM will offer: HPM compares versions part by part and only offers a beta when **every** part is at least the same part of `version`. After 1.3.3, `1.3.4` and `1.4.3` work; `1.4.0` does not (HPM would quietly install the stable code instead). CI rejects a `betaVersion` HPM would skip.
 4. To ship a fix to a beta that is already out, change `beta/app.groovy` again and raise `betaVersion`, so opted-in hubs see an update.
 
 **Promote a beta** (one PR):
@@ -151,10 +151,11 @@ All are served from the hub's cloud endpoint (`https://cloud.hubitat.com/api/<hu
 | `POST` | `/locks/:id/codes/:slot/retry` | No body needed. Re-sends the hub's own pending or failed change for that slot → `202 {lockId, slot, action, status: "pending", requestId}`. `404 no_pending_change` if nothing is pending (confirmed, superseded, expired or no longer allowed). `409 slot_changed` if the slot now holds someone else's code. |
 | `GET` | `/locks/:id/codes/:slot/reveal` | `{lockId, slot, name, code}`; `429` when rate-limited |
 | `GET` | `/locks/:id/fingerprints` | `{lockId, slots: [{slot, fp}]}` for each occupied, allowed slot. Never codes. `409 fingerprint_key_missing` until SignalBricks sends a key; `429` when rate-limited. See [Fingerprints](#fingerprints). |
+| `GET` | `/fingerprints` | Optional `?ids=<id>,<id>`. `{locks: [{id, slots: [{slot, fp}]} \| {id, error, message?}]}` for every lock selected for code management, or the listed ids. Same rules as `/locks/:id/fingerprints`. See [Batch fingerprints](#batch-fingerprints). |
 | `GET` | `/lockConfig` | `{config, ceiling, pendingApproval, fingerprintKeySet}`. `fingerprintKeySet` says whether a fingerprint key is held; the key itself is never returned. `config` is `null` until set. `pendingApproval` lists `"<lockId>:<slot>"` adopted slots above the ceiling that the operator hasn't approved. |
 | `POST` | `/lockConfig` | `{admin: {from, to}, managed: {from, to}, locks: {"<lockId>": {admin?, managed?, adopted?: [slot]} | {surveyOnly: true}}}` replaces the rules and returns the same shape as `GET`. Only locks listed in `locks` (use `{}` to take the default ranges) can be written or revealed. `{surveyOnly: true}` lists a lock for reading only (see [Survey-only locks](#survey-only-locks)); it can't be combined with `admin`, `managed` or `adopted`. Ranges must not overlap and must stay within 1..ceiling. Lock ids must be selected for lock code management. Optional `fingerprintKey` (see [Fingerprints](#fingerprints)); a POST without it (or with `null`) keeps the held key. Otherwise `400` with a message, and nothing is changed. |
 
-Errors: `400` invalid input (including `invalid_request_id`), `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot / `no_pending_change`, `409` lock codes unreadable (see below), `slot_changed` (retry) or `fingerprint_key_missing`, `429` reveal, retry, fingerprint or write rate limit, or `too_many_pending`.
+Errors: `400` invalid input (including `invalid_request_id` and `invalid_ids`), `403` (`slot_not_allowed`, `name_not_allowed`, `booking_code`, `slot_not_managed`), `404` not enabled / unknown lock / empty slot / `no_pending_change`, `409` lock codes unreadable (see below), `slot_changed` (retry) or `fingerprint_key_missing`, `429` reveal, retry, fingerprint or write rate limit, or `too_many_pending`.
 
 ### Verification and results
 
@@ -193,14 +194,34 @@ Added in 1.3.0 (signalbricks/platform#532), for the SignalBricks onboarding wiza
 - **Which slots.** `GET /locks/:id/fingerprints` lists occupied slots that the hub would allow SignalBricks to manage (`allowedAs` non-null in `/slots`): on a lock listed in the config, within the admin or managed range under the ceiling, or an adopted slot (above the ceiling only once approved). Unmarked codes in those ranges are included, so they can be grouped before adoption. Booking-code names (the `ORB` guard), empty slots, slots above the ceiling that aren't approved adopted slots, and every slot of an unlisted lock are left out. Sorted by slot.
 - **Survey-only locks** (below) return every occupied slot at or under the ceiling, except booking-code names.
 - **Errors and limits.** `404` when lock code management is off or the lock isn't selected, `409 fingerprint_key_missing` before a key is set, `409 lock_codes_unreadable` as for `/slots`. Limited to 10 calls a minute across the app (`429 rate_limited`), separate from reveal, retry and write limits.
+- **Batch.** `GET /fingerprints` returns the same for several locks in one call; see [Batch fingerprints](#batch-fingerprints).
 - **Threat model.** Codes are 4 to 10 digits, so anyone holding the key can recover a code from its fingerprint by trying every candidate. SignalBricks holds the key (stored encrypted), and since signalbricks/platform#521 it is already trusted to store managed codes, so this is accepted. Without the key, a fingerprint reveals nothing beyond which slots share a code. Booking codes are never fingerprinted. On a survey-only lock, fingerprints cover every non-booking occupied slot up to the ceiling, so SignalBricks (holding the key) could recover any such code on a lock that hasn't been onboarded yet. SignalBricks uses a separate key per organization, so fingerprints from different organizations can't be compared. `javax.crypto.Mac` is on Hubitat's list of allowed imports.
+
+### Batch fingerprints
+
+Added in 1.3.3 (#17). `GET /locks/:id/fingerprints` is limited to 10 calls a minute, so reading a hub with more than 10 locks one lock at a time hits the limit. `GET /fingerprints` reads them all in one call:
+
+- **Which locks.** Without `ids`, every lock selected for code management, in the order of that selection. With `?ids=7,12,30` (comma-separated lock ids, spaces around ids ignored, duplicates dropped, at most 100), only those, in the order given. An id that isn't selected for code management gets `{id, error: "lock_not_found"}` in the list instead of failing the call.
+- **Which slots.** Each lock's `slots` are exactly what `/locks/:id/fingerprints` would return for it at that moment (same ceiling, ranges, adopted and approved slots, survey-only rule and booking-code guard; a selected lock not listed in the config returns `[]`). Never codes.
+- **Per-lock errors.** A lock whose `lockCodes` can't be read or decrypted gets `{id, error: "lock_codes_unreadable", message}` (no `slots`); the other locks are still returned and the call is `200`.
+- **Response.**
+
+  ```json
+  {"locks": [
+    {"id": "7", "slots": [{"slot": 1, "fp": "3f9a0c1d2e4b5a67"}, {"slot": 12, "fp": "8c41e2a09b7d6f15"}]},
+    {"id": "8", "error": "lock_codes_unreadable", "message": "lockCodes could not be read or decrypted"},
+    {"id": "9", "slots": []}
+  ]}
+  ```
+- **Errors for the whole call.** `404 not_found` when lock code management is off or the hub isn't connected, `400 invalid_ids` (an empty, non-numeric or longer-than-12-digit id, or more than 100 ids), `409 fingerprint_key_missing` before SignalBricks sends a key, `429 rate_limited`.
+- **Limit.** 4 calls a minute across the app, however many locks each reads. This bucket is separate: batch calls don't use up the per-lock endpoint's 10 a minute, and the per-lock limit doesn't block batch calls.
 
 ### Survey-only locks
 
 Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots` and `/fingerprints` for locks that haven't been onboarded yet, but listing a lock normally lets SignalBricks write in its ranges. A `locks` entry of exactly `{"surveyOnly": true}` lists the lock for reading only:
 
 - `GET /locks/:id/slots` works and reports `surveyOnly: true`, with `allowedAs: null` on every slot.
-- `GET /locks/:id/fingerprints` returns every occupied slot at or under the ceiling, whatever its name or marker, except booking-code names. Slots above the ceiling are left out (a survey-only lock has no adopted slots).
+- `GET /locks/:id/fingerprints` (and its entry in `GET /fingerprints`) returns every occupied slot at or under the ceiling, whatever its name or marker, except booking-code names. Slots above the ceiling are left out (a survey-only lock has no adopted slots).
 - Set, delete, reveal and retry are refused with `403 slot_not_allowed`, and the hub never sends a command to it: switching a lock to survey-only drops any change held for it (reporting `failed`, `slot_not_allowed`, if it was in progress), and verification never re-sends to it.
 - `surveyOnly` must be a boolean. `true` can't be combined with `admin`, `managed` or `adopted` (`400`). `false` is the same as leaving it out.
 - Onboarding replaces the entry with a normal one (`{}`, ranges and/or `adopted`), which allows writes as usual.
@@ -210,7 +231,7 @@ Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots`
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.2", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.3", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
 ```
 
 Since 1.2.1 it does this only while lock code management is on, or to send a disable (`lockManagement: false`) when an earlier enable may still be stored. A hub that has never used lock code management doesn't register at all.
@@ -225,7 +246,7 @@ Hubs connected before lock code management existed (signalbricks/platform#505) h
 
 ### Encrypted lock codes
 
-Some newer lock drivers can store `lockCodes` encrypted (a driver preference such as *Encrypt lock codes*). The app decrypts them with the hub's `decrypt()` when the platform provides it to apps. If it can't, `/slots` and `/reveal` answer `409 lock_codes_unreadable`: turn off code encryption in that lock's driver preferences, or leave that lock out of lock code management.
+Some newer lock drivers can store `lockCodes` encrypted (a driver preference such as *Encrypt lock codes*). The app decrypts them with the hub's `decrypt()` when the platform provides it to apps. If it can't, `/slots`, `/reveal` and `/locks/:id/fingerprints` answer `409 lock_codes_unreadable` (`/fingerprints` reports it on that lock's entry): turn off code encryption in that lock's driver preferences, or leave that lock out of lock code management.
 
 ## Development
 

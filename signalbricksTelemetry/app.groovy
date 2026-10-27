@@ -23,6 +23,7 @@
  * truncated HMAC-SHA256 of each allowed slot's code (never the code), so
  * SignalBricks can see which slots share a code across locks and hubs. The key
  * is write-only: never returned, never logged, cleared on disable/disconnect.
+ * /fingerprints (#17) returns the same for several locks in one call.
  *
  * Each set/delete is verified on the hub (signalbricks/platform#520): the app
  * keeps one pending change per lock and slot, re-reads the slot from
@@ -51,7 +52,7 @@ import groovy.transform.Field
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.3.2'
+@Field static final String APP_VERSION = '1.3.3'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -77,6 +78,9 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int REVEAL_LIMIT_PER_MIN = 10
 // Fingerprints (#532): HMAC-SHA256(fingerprintKey, code), first 16 hex chars.
 @Field static final int FINGERPRINT_LIMIT_PER_MIN = 10
+// Batch fingerprints (#17): one call reads many locks, so its own small limit.
+@Field static final int FINGERPRINT_BATCH_LIMIT_PER_MIN = 4
+@Field static final int FINGERPRINT_BATCH_MAX_IDS = 100
 @Field static final int FINGERPRINT_HEX_LENGTH = 16
 @Field static final int FINGERPRINT_KEY_BYTES = 32
 @Field static final String ADMIN_NAME_PREFIX = 'SBA:'
@@ -144,6 +148,9 @@ mappings {
     }
     path('/locks/:lockId/fingerprints') {
         action: [GET: 'apiListFingerprints']
+    }
+    path('/fingerprints') {
+        action: [GET: 'apiListFingerprintsBatch']
     }
     path('/locks/:lockId/codes') {
         action: [POST: 'apiSetCode']
@@ -293,6 +300,7 @@ Boolean syncLockManagementEnabled() {
     state.remove('retryTimes')
     state.remove('writeTimes')
     state.remove('fingerprintTimes')
+    state.remove('fingerprintBatchTimes')
     app.removeSetting('approvedAdoptedSlots')
     registerWithPlatform(false)
     return true
@@ -1024,16 +1032,12 @@ String codeFingerprint(byte[] key, String code) {
 // non-null: a listed lock's ranges within the ceiling, or allowed adopted
 // slots), or on a surveyOnly lock every occupied slot within the ceiling;
 // never booking-code names. Unmarked codes are included, so onboarding can
-// group them before adopting. Never returns or logs codes.
-Map apiListFingerprints() {
-    if (!lockManagementActive()) return notEnabled()
-    if (rateLimited('fingerprintTimes', FINGERPRINT_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
-    def lock = findCodeLock(params.lockId)
-    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
-    if (!state.fingerprintKey) return jsonResponse([error: 'fingerprint_key_missing', message: 'SignalBricks has not sent a fingerprint key'], 409)
+// group them before adopting. Shared by /locks/:id/fingerprints and
+// /fingerprints. Returns [slots: [{slot, fp}]] sorted by slot, or
+// [error: 'lock_codes_unreadable']. Never returns or logs codes.
+Map lockFingerprints(lock, byte[] key) {
     Map codes = readLockCodes(lock)
-    if (codes == null) return jsonResponse([error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'], 409)
-    byte[] key = state.fingerprintKey.toString().decodeBase64()
+    if (codes == null) return [error: 'lock_codes_unreadable']
     String lockId = lock.id.toString()
     Boolean survey = isSurveyOnly(lockId)
     Integer ceiling = managedCeiling()
@@ -1047,8 +1051,55 @@ Map apiListFingerprints() {
         if (slot < 1 || (survey ? slot > ceiling : !slotClass(lockId, slot))) return
         slots << [slot: slot, fp: codeFingerprint(key, code)]
     }
-    log.info "SignalBricks Telemetry: fingerprints listed for ${lock.displayName} (${slots.size()} slots)"
-    return jsonResponse([lockId: lockId, slots: slots.sort { it.slot }])
+    return [slots: slots.sort { it.slot }]
+}
+
+Map apiListFingerprints() {
+    if (!lockManagementActive()) return notEnabled()
+    if (rateLimited('fingerprintTimes', FINGERPRINT_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    def lock = findCodeLock(params.lockId)
+    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
+    if (!state.fingerprintKey) return jsonResponse([error: 'fingerprint_key_missing', message: 'SignalBricks has not sent a fingerprint key'], 409)
+    Map result = lockFingerprints(lock, state.fingerprintKey.toString().decodeBase64())
+    if (result.error) return jsonResponse([error: result.error, message: 'lockCodes could not be read or decrypted'], 409)
+    log.info "SignalBricks Telemetry: fingerprints listed for ${lock.displayName} (${result.slots.size()} slots)"
+    return jsonResponse([lockId: lock.id.toString(), slots: result.slots])
+}
+
+// Optional ?ids=7,8 (comma-separated lock ids, at most FINGERPRINT_BATCH_MAX_IDS).
+// Returns [ids: List] (null when absent: every selected lock) or [error: String].
+Map parseBatchIds(def raw) {
+    if (raw == null) return [ids: null]
+    List parts = (raw instanceof Collection ? raw.join(',') : raw.toString()).split(',', -1).collect { it.trim() }
+    if (parts.any { !(it ==~ /\d{1,12}/) }) return [error: 'ids must be a comma-separated list of lock ids']
+    List ids = parts.unique()
+    if (ids.size() > FINGERPRINT_BATCH_MAX_IDS) return [error: "at most ${FINGERPRINT_BATCH_MAX_IDS} ids"]
+    return [ids: ids]
+}
+
+// Fingerprints for every lock selected for code management, or for ?ids=,
+// with the same rules as /locks/:id/fingerprints. A lock that can't be read
+// (or isn't selected) gets an error entry; the call itself still succeeds.
+// One call counts once against its own limit, not against the per-lock one.
+Map apiListFingerprintsBatch() {
+    if (!lockManagementActive()) return notEnabled()
+    if (rateLimited('fingerprintBatchTimes', FINGERPRINT_BATCH_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    Map parsed = parseBatchIds(params.ids)
+    if (parsed.error) return jsonResponse([error: 'invalid_ids', message: parsed.error], 400)
+    if (!state.fingerprintKey) return jsonResponse([error: 'fingerprint_key_missing', message: 'SignalBricks has not sent a fingerprint key'], 409)
+    byte[] key = state.fingerprintKey.toString().decodeBase64()
+    List ids = parsed.ids != null ? parsed.ids : (codeLocks ?: []).collect { it.id.toString() }
+    int slotCount = 0
+    List out = ids.collect { String id ->
+        def lock = findCodeLock(id)
+        if (!lock) return [id: id, error: 'lock_not_found']
+        Map result = lockFingerprints(lock, key)
+        if (result.error) return [id: id, error: result.error, message: 'lockCodes could not be read or decrypted']
+        slotCount += result.slots.size()
+        return [id: id, slots: result.slots]
+    }
+    log.info "SignalBricks Telemetry: fingerprints listed for ${out.size()} locks (${slotCount} slots)"
+    return jsonResponse([locks: out])
 }
 
 // A refusal: [response, error]. `error` doubles as the result event's reason.
