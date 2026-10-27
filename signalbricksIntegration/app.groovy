@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.6' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.3.7' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -99,11 +99,153 @@ preferences {
         }
 
         section(title: 'Diagnostics') {
+            href(name: 'hrefBookings', title: 'Bookings', description: 'Bookings this app knows vs its codes on the locks (codes masked)', page: 'bookingsPage')
             href(name: 'hrefDebug', title: 'Debug', description: 'API links, manual reconcile, reset state', page: 'debug')
         }
     }
 
     page(name: 'debug', title: 'Debug')
+    page(name: 'bookingsPage', title: 'Bookings')
+}
+
+// Bookings page (#29): the bookings this app knows vs its codes on the selected
+// locks, from hub state only. Codes are masked and never logged.
+def bookingsPage() {
+    Map v = bookingsView()
+    dynamicPage(name: 'bookingsPage', title: 'Bookings') {
+        section {
+            paragraph v.summary
+            v.notes.each { paragraph it }
+            paragraph '<small>From this hub\'s state and the locks\' last reported codes; reload the page to update. ' +
+                'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
+                'Codes show only their last 2 digits.</small>'
+        }
+        section(title: 'Known bookings') {
+            if (v.bookings) {
+                v.bookings.each { paragraph it }
+            } else {
+                paragraph 'No bookings known.'
+            }
+        }
+        section(title: 'Orphans') {
+            if (v.orphans) {
+                paragraph '<small>Codes with this app\'s prefix + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
+                    'The next reconcile removes them.</small>'
+                v.orphans.each { paragraph it }
+            } else {
+                paragraph 'None.'
+            }
+        }
+    }
+}
+
+// Lines for the Bookings page: [summary: String, notes: List, bookings: List, orphans: List]
+Map bookingsView() {
+    Map v = [summary: 'No app state yet. Click Done to finish setup.', notes: [], bookings: [], orphans: []]
+    // The hub may render pages with no state while the app code is saved (#28)
+    if (state == null || atomicState == null) return v
+
+    Map known = atomicState.bookings ?: [:]
+    Date now = new Date()
+
+    // This app's codes on each selected lock, keyed by booking id. codes is null when
+    // the lock reported none (reconcile skips such a lock too) or they can't be read.
+    Map onLock = [:]
+    (locks ?: []).each { lock ->
+        Map l = [name: bookingsEsc(lock.label ?: lock.name), codes: null, problem: 'no codes reported']
+        def raw = lock.currentValue('lockCodes', true)
+        if (raw) {
+            try {
+                l.codes = helperOnlySbCodes(parseJson(raw), lock.id, true)
+            } catch (e) {
+                l.problem = 'codes unreadable'
+            }
+        }
+        onLock[lock.id.toString()] = l
+    }
+
+    // Only a current booking's missing code counts: reconcile adds codes at
+    // check-in and removes them after checkout
+    int notOnLock = 0
+    v.bookings = known.collect { key, b ->
+        String id = (b.id ?: key).toString()
+        Date checkIn = helperToDate(b.checkIn)
+        Date checkOut = helperToDate(b.checkOut)
+        String status = !checkIn || !checkOut ? 'dates unknown' : now.before(checkIn) ? 'upcoming' : now.after(checkOut) ? 'past' : 'current'
+        List lockIds = (b.lockId instanceof List ? b.lockId : [b.lockId]).findAll { it != null }
+        List lockLines = lockIds.collect { lockId ->
+            Map l = onLock[lockId.toString()]
+            if (!l) {
+                if (status == 'current') notOnLock++
+                return "lock ${bookingsEsc(lockId)} (not selected in this app): <b>not on lock</b>"
+            }
+            if (l.codes == null) return "${l.name}: ${l.problem}"
+            Map c = l.codes[id]
+            if (c) {
+                String slot = "${l.name}: slot ${bookingsEsc(c.key)}"
+                // reconcile removes every code of a booking that isn't current
+                if (status == 'upcoming') return slot + ' (early: reconcile removes it until check-in)'
+                if (status == 'current') return slot
+                return slot + " &mdash; reconcile will remove it (${status == 'past' ? 'past checkout' : 'not current'})"
+            }
+            if (status == 'current') {
+                notOnLock++
+                return "${l.name}: <b>not on lock</b>"
+            }
+            return "${l.name}: not on lock" + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
+        }
+        String line = "<b>ORB${bookingsEsc(id)}</b> ${bookingsEsc(b.guest ?: '')} &middot; ${status} &middot; " +
+            "${bookingsTime(checkIn)} to ${bookingsTime(checkOut)} &middot; code ${bookingsMask(b.code)}<br>" +
+            (lockLines ? lockLines.join('<br>') : 'no locks assigned')
+        return [sortAt: checkIn?.time ?: 0L, line: line]
+    }.sort { it.sortAt }.collect { it.line }
+
+    // Codes of this app that match no known booking assigned to that lock
+    int codesOnLocks = 0
+    onLock.each { lockId, l ->
+        if (l.codes == null) {
+            v.notes << "<b>${l.name}:</b> ${l.problem == 'no codes reported' ? 'has reported no codes yet (run a door code refresh)' : 'its lockCodes could not be read'}, so it is not counted."
+            return
+        }
+        codesOnLocks += l.codes.size()
+        l.codes.each { bookingId, c ->
+            Map b = known[bookingId] ?: known.values().find { it.id?.toString() == bookingId }
+            List lockIds = b ? (b.lockId instanceof List ? b.lockId : [b.lockId]).collect { it?.toString() } : []
+            if (lockIds.contains(lockId)) return
+            String why = b ? " (booking ORB${bookingsEsc(bookingId)} is not assigned to this lock)" : ''
+            v.orphans << "${l.name} &middot; slot ${bookingsEsc(c.key)} &middot; ${bookingsEsc(c.name ?: '(no name)')} &middot; code ${bookingsMask(c.code)}${why}"
+        }
+    }
+
+    v.summary = "<b>${known.size()} bookings known &middot; ${codesOnLocks} codes on locks &middot; ${notOnLock} current not on lock &middot; ${v.orphans.size()} orphans</b>"
+    Map sync = atomicState.lastSync
+    v.notes << (sync ? "<b>Last sync:</b> ${bookingsTime(new Date(sync.at as long))} (${bookingsEsc(sync.source)})" : '<b>Last sync:</b> not recorded yet (recorded from 1.3.7 on)')
+    return v
+}
+
+// POST and PUT share a handler; name the method when the hub provides it
+String bookingsRequestMethod(String fallback) {
+    try {
+        return request?.method ?: fallback
+    } catch (e) {
+        return fallback
+    }
+}
+
+// Last 2 digits only; the full code is never rendered
+String bookingsMask(def code) {
+    String s = code == null ? '' : code.toString()
+    return s.length() >= 4 ? '&bull;&bull;&bull;&bull;' + bookingsEsc(s[-2..-1]) : '&bull;&bull;&bull;&bull;'
+}
+
+String bookingsTime(Date d) {
+    if (!d) return '?'
+    def tz = location?.timeZone
+    return tz ? d.format('yyyy-MM-dd HH:mm', tz) : d.format('yyyy-MM-dd HH:mm')
+}
+
+String bookingsEsc(def s) {
+    return (s == null ? '' : s.toString()).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 }
 
 // Debug page for testing
@@ -174,6 +316,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeAssignments = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
+            atomicState.lastSync = null
             scheduleCodeRefresh()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
@@ -1225,6 +1368,7 @@ Map apiSync() {
         log.debug "apiSync ${request.JSON}"
 
         atomicState.bookings = helperGetBookings(request.JSON)
+        atomicState.lastSync = [at: now(), source: 'PUT /sync']
         atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
@@ -1253,6 +1397,7 @@ Map apiSyncPatch() {
         def combined = atomicState.bookings + request.JSON
 
         atomicState.bookings = helperGetBookings(combined)
+        atomicState.lastSync = [at: now(), source: 'PATCH /sync']
         atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
@@ -1319,6 +1464,7 @@ Map apiSyncBookingByLock() {
         scheduleEvents(bookings)
 
         atomicState.bookings = bookings
+        atomicState.lastSync = [at: now(), source: "${bookingsRequestMethod('POST/PUT')} /sync/${key}"]
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
@@ -1375,6 +1521,7 @@ Map apiDeleteBookingByLock() {
         }
 
         atomicState.bookings = helperGetBookings(bookings)
+        atomicState.lastSync = [at: now(), source: "DELETE /sync/${key}"]
         scheduleEvents(bookings)
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
@@ -1530,8 +1677,9 @@ Map helperFindCurrentBookings(Map bookings) {
 }
 
 // Get only the SignalBricks codes based on code name beginning with the booking Id
-Map helperOnlySbCodes(Map codes, def lockId = null) {
-    log.debug 'helperOnlySbCodes'
+// quiet: no log lines (the Bookings page renders it for every lock)
+Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
+    if (!quiet) log.debug 'helperOnlySbCodes'
 
     String prefix = codeNamePrefix ?: ''
     Map result = [:]
@@ -1546,7 +1694,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null) {
                 String bId = matcher.group(1) // Just the digits, no ORB prefix
                 code.bookingId = bId
                 result[bId] = code
-                log.debug("helperOnlySbCodes: found by name: ${bId} at pos ${key}")
+                if (!quiet) log.debug("helperOnlySbCodes: found by name: ${bId} at pos ${key}")
             }
         }
     }
@@ -1573,7 +1721,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null) {
                 lockCode.bookingId = bId
                 lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
                 result[bId] = lockCode
-                log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
+                if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
             }
         }
     }
