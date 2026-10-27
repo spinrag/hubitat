@@ -110,7 +110,15 @@ app.settings = [locks: ['1', '2', '3'] as String[]]
 Date now = new Date()
 Map bookings = ['88': [id: '88', guest: 'Ann', code: '24681357', lockId: ['1'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.3.5', app.sbAppVersion == '1.3.5')
+check('version is 1.3.6', app.sbAppVersion == '1.3.6')
+
+// Saving the app code runs the main page with no state and no settings
+def savedState = app.state, savedAtomic = app.atomicState, savedSettings = app.settings
+app.state = null; app.atomicState = null; app.settings = null
+String saveError = null
+try { mainPage() } catch (e) { saveError = e.toString() }
+check('save: main page renders without state', saveError == null)
+app.state = savedState; app.atomicState = savedAtomic; app.settings = savedSettings
 
 // --- Off by default: a new install ---
 app.installed()

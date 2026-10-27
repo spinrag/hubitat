@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.5*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.6*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -104,7 +104,7 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **Codes vanished.** Don't use **Reset State** on the Debug page: it clears the app's bookings and code assignments, so the next reconcile removes this app's codes until the dispatcher syncs the bookings again.
 - **A current (in-house) booking's code is missing.** Open **Debug** → **Reconcile Door Codes**. It re-adds codes for every booking the app holds that is active now, about a minute apart per code.
 - **The OwnerRez app's codes are changed or removed.** Check that both apps have a non-empty code name prefix, that the prefixes differ, and that neither is the start of the other, and that Lock Code Manager isn't running on the lock (see [Conflicts](#conflicts)).
-- **Z-Wave is slow or locks time out after midnight** (hubs with many large locks, 1.3.4 or earlier). Update to 1.3.5 or later and click **Done** in the app; check that **Scheduled refresh** is **Off** or Weekly (see [Door code refresh](#door-code-refresh)).
+- **Z-Wave is slow or locks time out after midnight** (hubs with many large locks, 1.3.4 or earlier). Update to 1.3.6 or later and click **Done** in the app; check that **Scheduled refresh** is **Off** or Weekly (see [Door code refresh](#door-code-refresh)).
 - **Status: Not registered** / `skipping outbound POST` in the log: expected, see [Registration status](#registration-status-and-the-outbound-webhook).
 
 ## Development
