@@ -39,6 +39,12 @@
  * `lock_code_result` event (never the code). A pending set keeps its code in
  * app state only, until it is confirmed, superseded, cleared or 24h old.
  *
+ * Relocate (#31): /locks/:id/codes/:slot/relocate renames a code or moves it
+ * to another slot entirely on the hub. The code is read from the lock's own
+ * lockCodes and never appears in the request, response, logs or events. A move
+ * writes the new slot first and deletes the old one only once a re-read shows
+ * the new slot holding the same code, so the code is never in neither slot.
+ *
  * Updates (#13): a daily check-in at a random per-hub time re-registers when
  * the version changed, since an HPM update doesn't run updated().
  *
@@ -61,7 +67,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.3.5'
+@Field static final String APP_VERSION = '1.4.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -120,6 +126,8 @@ import javax.crypto.spec.SecretKeySpec
 // Set + delete requests across the app, and the most changes held at once.
 @Field static final int WRITE_LIMIT_PER_MIN = 30
 @Field static final int MAX_PENDING_CODE_CHANGES = 100
+// Sent at registration so SignalBricks only offers what this version supports.
+@Field static final List<String> CAPABILITIES = ['relocate']
 @Field static final java.util.regex.Pattern REQUEST_ID = ~/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
 
 definition(
@@ -175,6 +183,9 @@ mappings {
     }
     path('/locks/:lockId/codes/:slot/retry') {
         action: [POST: 'apiRetryCode']
+    }
+    path('/locks/:lockId/codes/:slot/relocate') {
+        action: [POST: 'apiRelocateCode']
     }
 }
 
@@ -667,6 +678,7 @@ void registerWithPlatform(Boolean enabledOverride = null) {
         version: APP_VERSION,
         hubFirmwareVersion: hubFirmwareVersion(),
         lockManagement: enabled,
+        capabilities: CAPABILITIES,
     ]
     Map params = [
         uri: "${state.ingestUrl}/register",
@@ -1197,6 +1209,7 @@ Map resolveSet(def lockIdRaw, def slotRaw, String name) {
 // as a new request, and the slot must not have been taken over since. A
 // delete may find the slot already empty (then the check confirms it).
 Map resolvePendingChange(Map p) {
+    if (p.action == 'relocate') return resolvePendingRelocate(p)
     Map r = p.action == 'set' ? resolveSet(p.lockId, p.slot, p.name) : resolveAllowedSlot(p.lockId, p.slot, true)
     if (r.response || !r.occupied) return r
     // Delete: the slot must still hold the name it had at request time.
@@ -1255,6 +1268,7 @@ Map apiSetCode() {
     String name = body.name?.toString()?.trim()
     Map r = resolveSet(params.lockId, body.slot, name)
     if (r.response) return r.response
+    if (changePendingOn(r.lock.id.toString(), r.slot, true)) return relocatePending()
     Map refusal = writeRefusal(r.lock, r.slot)
     if (refusal) return refusal
     startCodeChange(r, 'set', name, code, rid.id)
@@ -1278,6 +1292,7 @@ Map apiDeleteCode() {
     if (rid.response) return rid.response
     Map r = resolveAllowedSlot(params.lockId, params.slot, false)
     if (r.response) return r.response
+    if (changePendingOn(r.lock.id.toString(), r.slot, true)) return relocatePending()
     Map refusal = writeRefusal(r.lock, r.slot)
     if (refusal) return refusal
     startCodeChange(r, 'delete', r.currentName, null, rid.id)
@@ -1295,6 +1310,8 @@ Map apiRetryCode() {
     if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
     Integer slot = parseSlot(params.slot)
     if (slot == null) return jsonResponse([error: 'invalid_slot'], 400)
+    // A relocate (either of its slots) retries on its own.
+    if (changePendingOn(lock.id.toString(), slot, true)) return relocatePending()
     Map p = pendingCodeChanges()[pendingKey(lock.id.toString(), slot)]
     if (!p) return jsonResponse([error: 'no_pending_change', message: 'nothing pending for this slot (confirmed, superseded, expired or no longer allowed)'], 404)
     Map r = resolvePendingChange(p)
@@ -1324,12 +1341,202 @@ Map apiRevealCode() {
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, name: r.currentName, code: code])
 }
 
+// --- Relocate (#31) ---
+
+// True when a change still being verified uses this slot. With relocatesOnly,
+// only relocates count (a set or delete on the slot of another set or delete
+// supersedes it, as before).
+Boolean changePendingOn(String lockId, Integer slot, Boolean relocatesOnly) {
+    return pendingCodeChanges().values().any { p ->
+        p.status == 'pending' && p.lockId == lockId && (!relocatesOnly || p.action == 'relocate') &&
+            ((p.slot as Integer) == slot || (p.fromSlot != null && (p.fromSlot as Integer) == slot))
+    }
+}
+
+Map relocatePending() {
+    return jsonResponse([error: 'change_pending', message: 'a code change is in progress on this slot; wait for its result'], 409)
+}
+
+// Source and target checks for a relocate. Source: an occupied slot the hub
+// would let SignalBricks delete (resolveAllowedSlot). Target: the source itself
+// (rename) or an empty slot within the ceiling, with the same rules as a set
+// (resolveSet: name, booking guard, class marker, maxCodes). The new name must
+// carry SBA: or SBM:, adopted slots included. Returns [lock, slot (target),
+// fromSlot, fromName, prevName, code] or [response, error]. Holds the code:
+// never log the result.
+Map resolveRelocate(def lockIdRaw, def slotRaw, def toSlotRaw, String name) {
+    Map src = resolveAllowedSlot(lockIdRaw, slotRaw, false)
+    if (src.response) return src
+    Integer toSlot = src.slot
+    if (toSlotRaw != null && toSlotRaw.toString() != '') {
+        Integer n = parseIntLoose(toSlotRaw)
+        toSlot = n == null ? null : parseSlot(n)
+        if (toSlot == null) return refuse('invalid_slot', 400, "toSlot must be a slot number 1-${MAX_SLOT}")
+    }
+    Boolean move = toSlot != src.slot
+    if (move && toSlot > managedCeiling()) return refuse('slot_not_allowed', 403, "toSlot must be within slots 1-${managedCeiling()}")
+    Map dst = resolveSet(lockIdRaw, toSlot, name)
+    if (dst.response) return dst
+    if (!name.startsWith(ADMIN_NAME_PREFIX) && !name.startsWith(MANAGED_NAME_PREFIX)) {
+        return refuse('name_not_allowed', 403, "the new name must start with ${ADMIN_NAME_PREFIX} or ${MANAGED_NAME_PREFIX}")
+    }
+    if (move && dst.occupied) return refuse('slot_occupied', 409, 'toSlot already holds a code')
+    // A driver reporting the code as a number has lost any leading zeros, so
+    // writing it back could change the code. Other codes must be what a set
+    // accepts.
+    def code = src.codes[src.slot.toString()].code
+    if (!(code instanceof String) || !(code ==~ /\d{4,10}/)) {
+        return refuse('code_not_copyable', 409, 'the lock reports this code as a number or not as 4-10 digits; it cannot be copied safely')
+    }
+    return [lock: src.lock, slot: toSlot, fromSlot: src.slot, fromName: src.currentName, prevName: dst.currentName, code: code]
+}
+
+// Re-send checks for a relocate, from a fresh read of lockCodes. Set phase:
+// the same rules as the request, and the source must still hold the code and
+// name it had then. Delete phase: the source must still be allowed, the target
+// must hold the code under the new name, and the source must be empty or still
+// hold its request-time name and code. A source delete is only ever sent
+// after these pass on the same read.
+Map resolvePendingRelocate(Map p) {
+    if (p.phase == 'delete') {
+        Map d = resolveAllowedSlot(p.lockId, p.fromSlot, true)
+        if (d.response) return d
+        if (!codeChangeApplied(p, d.codes)) return refuse('target_changed', 409, 'the target slot no longer holds the code')
+        def src = d.codes[p.fromSlot.toString()]
+        if (d.occupied && (d.currentName != p.fromName || !sameCode(src.code, p.code?.toString()))) {
+            return refuse('source_changed', 409, 'the source slot now holds a different code')
+        }
+        return d
+    }
+    Map r = resolveRelocate(p.lockId, p.fromSlot, p.slot, p.name)
+    if (r.response) return r
+    if (r.code != p.code || r.fromName != p.fromName) return refuse('slot_changed', 409, 'the source slot now holds a different code; send a new request')
+    return r
+}
+
+// Body {name, toSlot?, requestId?}. No toSlot (or toSlot equal to :slot)
+// renames the code in place; otherwise moves it to toSlot. The code comes
+// from the lock's own lockCodes and is never returned, logged or sent. The
+// hub verifies the change and reports a relocate_result event.
+Map apiRelocateCode() {
+    if (!lockManagementActive()) return notEnabled()
+    def body = request.JSON
+    if (!(body instanceof Map)) return jsonResponse([error: 'invalid_body'], 400)
+    Map rid = requestIdFrom(body.requestId)
+    if (rid.response) return rid.response
+    String name = body.name?.toString()?.trim()
+    Map r = resolveRelocate(params.lockId, params.slot, body.toSlot, name)
+    if (r.response) return r.response
+    expirePendingCodeChanges()
+    String lockId = r.lock.id.toString()
+    if (changePendingOn(lockId, r.fromSlot, false) || changePendingOn(lockId, r.slot, false)) return relocatePending()
+    Map refusal = writeRefusal(r.lock, r.slot)
+    if (refusal) return refusal
+    // Failed changes held for retry on either slot are replaced by this one.
+    Map all = pendingCodeChanges()
+    all.remove(pendingKey(lockId, r.fromSlot))
+    all.remove(pendingKey(lockId, r.slot))
+    savePendingCodeChanges(all)
+    Map p = [lockId: lockId, slot: r.slot, fromSlot: r.fromSlot, action: 'relocate', phase: 'set', name: name, fromName: r.fromName,
+             prevName: r.prevName, code: r.code, requestId: rid.id, attempts: 0, createdAt: now(), status: 'pending']
+    try {
+        sendCodeChange(p, r.lock)
+    } catch (Exception e) {
+        // Only the class name: the driver's message can carry the code. The
+        // change was never stored, so give the write back to the limit.
+        log.warn "SignalBricks Telemetry: relocate on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot} could not be sent (${e.class.simpleName})"
+        List times = (state.writeTimes ?: []) as List
+        if (times) state.writeTimes = times.take(times.size() - 1)
+        return jsonResponse([error: 'send_error', message: 'the lock driver refused the command'], 502)
+    }
+    log.info "SignalBricks Telemetry: relocate requested on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot}"
+    return jsonResponse([lockId: lockId, fromSlot: r.fromSlot, toSlot: r.slot, status: 'pending', requestId: rid.id], 202)
+}
+
+// Moves a relocate on from one read of lockCodes. Returns true when it settled
+// the change or started its delete phase. The source is only ever deleted
+// right after this same read showed the target holding the code under the new
+// name, so a move never leaves the code in neither slot.
+Boolean relocateProgress(Map p, lock, Map codes) {
+    Boolean targetHolds = codeChangeApplied(p, codes)
+    Boolean startDelete = p.phase != 'delete'
+    if (startDelete) {
+        if (!targetHolds) {
+            if (!targetNameMismatch(p, codes)) return false
+            // Re-sending can't fix it (and the target now fails the set rules).
+            finishCodeChange(p, 'failed', 'target_name_mismatch', true)
+            return true
+        }
+        if ((p.fromSlot as Integer) == (p.slot as Integer)) {
+            finishCodeChange(p, 'confirmed', null, true)
+            return true
+        }
+        p.phase = 'delete'
+    } else if (!targetHolds) {
+        finishCodeChange(p, 'failed', 'target_changed', true)
+        return true
+    }
+    def src = codes[p.fromSlot.toString()]
+    Boolean occupied = src instanceof Map && src.code != null && src.code.toString() != ''
+    if (!occupied) {
+        withdrawApproval(p.lockId, p.fromSlot as Integer)
+        finishCodeChange(p, 'confirmed', null, true)
+        return true
+    }
+    if (src.name?.toString() != p.fromName || !sameCode(src.code, p.code?.toString())) {
+        finishCodeChange(p, 'failed', 'source_changed', true)
+        return true
+    }
+    if (!startDelete) return false
+    Map r = resolvePendingRelocate(p)
+    if (r.response) {
+        finishCodeChange(p, 'failed', r.error, true)
+        return true
+    }
+    p.attempts = 0
+    sendCodeChange(p, lock)
+    return true
+}
+
+// The lock stored the code in the target under a name other than the new one
+// (for a rename, other than the old one too). The source is kept.
+Boolean targetNameMismatch(Map p, Map codes) {
+    def t = codes[p.slot.toString()]
+    return t instanceof Map && sameCode(t.code, p.code?.toString()) && t.name?.toString() != p.name &&
+        ((p.fromSlot as Integer) != (p.slot as Integer) || t.name?.toString() != p.fromName)
+}
+
+// A move that ends failed after its source delete was sent: if the source is
+// empty now, its approval goes, as after a confirmed move.
+void withdrawApprovalIfSourceEmpty(Map p) {
+    if (p.action != 'relocate' || p.phase != 'delete') return
+    def lock = findCodeLock(p.lockId)
+    Map codes = lock ? readLockCodes(lock) : null
+    if (codes == null) return
+    def src = codes[p.fromSlot.toString()]
+    if (!(src instanceof Map) || src.code == null || src.code.toString() == '') withdrawApproval(p.lockId, p.fromSlot as Integer)
+}
+
+// After a move: the source's operator approval (adopted slots above the
+// ceiling) goes with the code, so the emptied slot can't be written again
+// without a new approval. Targets are within the ceiling and need none.
+void withdrawApproval(String lockId, Integer slot) {
+    String key = "${lockId}:${slot}".toString()
+    List approved = approvedAdoptedKeys()
+    if (!approved.contains(key)) return
+    List kept = approved.findAll { it != key }
+    if (kept) app.updateSetting('approvedAdoptedSlots', [type: 'enum', value: kept])
+    else app.removeSetting('approvedAdoptedSlots')
+}
+
 // --- Set/delete verification (#520) ---
 //
 // state.pendingCodeChanges: "<lockId>:<slot>" -> {lockId, slot, action, name,
-// prevName (the slot's name at request time), code (set only), requestId,
-// attempts, createdAt, status, seq, checkAt, check}. One per lock and slot,
-// at most MAX_PENDING_CODE_CHANGES. `status` is pending (being verified) or
+// prevName (the slot's name at request time), code (set and relocate only),
+// requestId, attempts, createdAt, status, seq, checkAt, check}. One per lock
+// and slot, at most MAX_PENDING_CODE_CHANGES. A relocate (#31) is keyed by its
+// target slot and also has fromSlot, fromName and phase (set, then delete for
+// a move). `status` is pending (being verified) or
 // failed (kept only while the retry endpoint could still succeed). Entries go
 // on confirm, supersede, disable/disconnect, when the slot stops being
 // allowed, or 24h after createdAt. The code lives only here: never log it,
@@ -1383,6 +1590,8 @@ void sendCodeChange(Map p, lock) {
     p.seq = ((state.codeChangeSeq ?: 0) as long) + 1
     state.codeChangeSeq = p.seq
     if (p.action == 'set') lock.setCode(p.slot as Integer, p.code, p.name)
+    else if (p.action == 'relocate' && p.phase == 'delete') lock.deleteCode(p.fromSlot as Integer)
+    else if (p.action == 'relocate') lock.setCode(p.slot as Integer, p.code, p.name)
     else lock.deleteCode(p.slot as Integer)
     p.check = 1
     p.checkAt = now() + CODE_FIRST_CHECK_SECONDS * 1000L
@@ -1403,6 +1612,7 @@ Boolean sameCode(def actual, String expected) {
 }
 
 // Set: the slot holds the expected name and code. Delete: the slot is empty.
+// Relocate: the target slot holds the new name and the code (either phase).
 Boolean codeChangeApplied(Map p, Map codes) {
     def entry = codes[p.slot.toString()]
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
@@ -1455,7 +1665,9 @@ void verifyCodeChange(String key) {
         return
     }
     Map codes = readLockCodes(lock)
-    if (codes != null && codeChangeApplied(p, codes)) {
+    if (codes != null && p.action == 'relocate') {
+        if (relocateProgress(p, lock, codes)) return
+    } else if (codes != null && codeChangeApplied(p, codes)) {
         finishCodeChange(p, 'confirmed', null, true)
         return
     }
@@ -1470,7 +1682,8 @@ void verifyCodeChange(String key) {
         return
     }
     if (attempts >= CODE_MAX_ATTEMPTS) {
-        finishCodeChange(p, 'failed', codes == null ? 'lock_codes_unreadable' : 'not_applied', true)
+        String reason = codes == null ? 'lock_codes_unreadable' : (p.phase == 'delete' ? 'source_not_deleted' : 'not_applied')
+        finishCodeChange(p, 'failed', reason, true)
         return
     }
     // Re-send only while the slot is still allowed and still ours.
@@ -1479,12 +1692,19 @@ void verifyCodeChange(String key) {
         finishCodeChange(p, 'failed', r.error, true)
         return
     }
-    log.info "SignalBricks Telemetry: ${p.action} not applied yet on ${lock.displayName} slot ${p.slot}; re-sending (attempt ${attempts + 1})"
+    // The fresh read in resolvePendingRelocate found the source already empty.
+    if (p.action == 'relocate' && p.phase == 'delete' && !r.occupied) {
+        withdrawApproval(p.lockId, p.fromSlot as Integer)
+        finishCodeChange(p, 'confirmed', null, true)
+        return
+    }
+    log.info "SignalBricks Telemetry: ${p.action} not applied yet on ${lock.displayName} slot ${p.action == 'relocate' ? "${p.fromSlot} -> ${p.slot}" : p.slot}; re-sending (attempt ${attempts + 1})"
     sendCodeChange(p, lock)
 }
 
 // Failed reasons the retry endpoint can still fix; any other failure drops
-// the change (and its code).
+// the change (and its code). A failed relocate is always dropped: a new
+// relocate request needs no code, so there is nothing to keep it for.
 @Field static final Set<String> RETRYABLE_FAILURES = ['not_applied', 'lock_codes_unreadable'] as Set
 
 // Reports the outcome (when `report`) and stores the change's final state:
@@ -1492,9 +1712,10 @@ void verifyCodeChange(String key) {
 // kept for the retry endpoint until they expire.
 void finishCodeChange(Map p, String result, String reason, Boolean report) {
     if (report) reportCodeResult(p, result, reason)
+    if (result == 'failed') withdrawApprovalIfSourceEmpty(p)
     Map all = pendingCodeChanges()
     String key = pendingKey(p.lockId, p.slot as Integer)
-    if (result == 'failed' && RETRYABLE_FAILURES.contains(reason)) {
+    if (result == 'failed' && p.action != 'relocate' && RETRYABLE_FAILURES.contains(reason)) {
         p.status = 'failed'
         p.reason = reason
         all[key] = p
@@ -1508,10 +1729,11 @@ void finishCodeChange(Map p, String result, String reason, Boolean report) {
 // in-flight one is reported failed), since they could never be re-sent.
 void dropDisallowedCodeChanges() {
     Map all = pendingCodeChanges()
-    Map gone = all.findAll { k, p -> slotClass(p.lockId, p.slot as Integer) == null }
+    Map gone = all.findAll { k, p -> slotClass(p.lockId, p.slot as Integer) == null || (p.fromSlot != null && slotClass(p.lockId, p.fromSlot as Integer) == null) }
     if (!gone) return
     gone.each { k, p ->
         if (p.status == 'pending') reportCodeResult(p, 'failed', 'slot_not_allowed')
+        withdrawApprovalIfSourceEmpty(p)
         all.remove(k)
     }
     savePendingCodeChanges(all)
@@ -1563,21 +1785,36 @@ void abandonPendingCodeChanges(String reason) {
 }
 
 // Sent like a telemetry event (same ingest URL and token), so it arrives as
-// event type hubitat.lock_code_result. Never carries the code; the name only
-// when it is an SBA:/SBM: name.
+// event type hubitat.lock_code_result (hubitat.relocate_result for a
+// relocate). Never carries the code; the name only when it is an SBA:/SBM:
+// name. A relocate adds fromSlot, toSlot, targetConfirmed (the hub saw the
+// target hold the code under the new name) and then the target's fingerprint
+// when a fingerprint key is held.
 void reportCodeResult(Map p, String result, String reason) {
-    log.info "SignalBricks Telemetry: code ${p.action} ${result} on lock ${p.lockId} slot ${p.slot} after ${p.attempts} attempt(s)${reason ? " (${reason})" : ''}"
+    Boolean relocate = p.action == 'relocate'
+    String slots = relocate ? "${p.fromSlot} -> ${p.slot}" : "${p.slot}"
+    log.info "SignalBricks Telemetry: code ${p.action} ${result} on lock ${p.lockId} slot ${slots} after ${p.attempts} attempt(s)${reason ? " (${reason})" : ''}"
     if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    String eventName = relocate ? 'relocate_result' : 'lock_code_result'
     Map data = [lockId: p.lockId, slot: p.slot as Integer, action: p.action, result: result, attempts: p.attempts as Integer, requestId: p.requestId]
     if (reason) data.reason = reason
+    if (relocate) {
+        Boolean targetConfirmed = result == 'confirmed' || p.phase == 'delete'
+        data.fromSlot = p.fromSlot as Integer
+        data.toSlot = p.slot as Integer
+        data.targetConfirmed = targetConfirmed
+        if (targetConfirmed && state.fingerprintKey && p.code) {
+            data.fingerprint = codeFingerprint(state.fingerprintKey.toString().decodeBase64(), p.code.toString())
+        }
+    }
     String name = p.name?.toString()
     if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isBookingName(name)) {
         data.name = name
     }
     Map payload = [
-        id: "lock_code_result:${p.requestId}:${p.seq}:${result}".toString(),
+        id: "${eventName}:${p.requestId}:${p.seq}:${result}".toString(),
         deviceId: p.lockId,
-        name: 'lock_code_result',
+        name: eventName,
         displayName: findCodeLock(p.lockId)?.displayName,
         value: result,
         data: JsonOutput.toJson(data),
@@ -1592,7 +1829,7 @@ void reportCodeResult(Map p, String result, String reason) {
         body: JsonOutput.toJson(payload),
         timeout: 15,
     ]
-    asynchttpPost('postCallback', params, [name: 'lock_code_result', deviceId: p.lockId])
+    asynchttpPost('postCallback', params, [name: eventName, deviceId: p.lockId])
 }
 
 String escapeHtml(String s) {
