@@ -2,9 +2,9 @@
 
 A Hubitat Elevation app that sends read-only device telemetry to [SignalBricks](https://app.signalbricks.co): lock state, contact sensors, temperature, humidity, and battery levels.
 
-It runs alongside the **SignalBricks Integration** (lock-code) app. The two apps are independent. Telemetry never controls devices.
+It runs alongside the [**SignalBricks Integration**](../signalbricksIntegration/README.md) app (booking door codes). The two apps are independent and versioned separately; each shows its own name next to its version. Telemetry never controls devices.
 
-Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day. Version 1.3.3 adds a [batch fingerprints](#batch-fingerprints) endpoint that reads every lock in one call.
+Version 1.1.0 adds optional **lock code management** (off by default): SignalBricks can list code slots and manage admin and managed codes on locks you select for it. See [Lock code management](#lock-code-management-optional). Version 1.2.0 verifies every code set and delete on the hub, retries it if the lock drops it, and reports the outcome to SignalBricks. See [Verification and results](#verification-and-results). Version 1.3.0 adds code [fingerprints](#fingerprints) so SignalBricks can see which slots share a code across locks (for onboarding) without reading the codes. Version 1.3.1 [re-registers](#registration) by itself after an update, so SignalBricks sees the new version without opening the app. Version 1.3.2 adds a [daily check-in](#updating) so quiet hubs report a new version within a day. Version 1.3.3 adds a [batch fingerprints](#batch-fingerprints) endpoint that reads every lock in one call. Version 1.3.4 shows the app name with the version (*SignalBricks Telemetry 1.3.4*) on the app page and in log lines, so it can't be mistaken for the separately versioned SignalBricks Integration app.
 
 ## Requirements
 
@@ -65,7 +65,7 @@ While a beta is out, HPM's **Install** page also shows **Install beta package** 
 
 Opting in while no beta is out changes nothing: the beta copy is then identical to the stable release.
 
-**Caveat (HPM behaviour).** If HPM updates SignalBricks Telemetry while a beta is out, it records the package as "beta" on any hub that has **install pre-release versions** on for any package, even when SignalBricks Telemetry is not on that hub's list. Such a hub can show the beta's version as installed while it runs the stable code. It still takes the next stable release whose version is at least the beta's. Hubs with pre-releases off are not affected. The app page (*Version …*) and SignalBricks always show the code that actually runs.
+**Caveat (HPM behaviour).** If HPM updates SignalBricks Telemetry while a beta is out, it records the package as "beta" on any hub that has **install pre-release versions** on for any package, even when SignalBricks Telemetry is not on that hub's list. Such a hub can show the beta's version as installed while it runs the stable code. It still takes the next stable release whose version is at least the beta's. Hubs with pre-releases off are not affected. The app page (*SignalBricks Telemetry …*) and SignalBricks always show the code that actually runs.
 
 **How it works.** The manifest's app entry has a `betaLocation` pointing at `beta/app.groovy` on `main`. A beta is "out" when the manifest has a `betaVersion`: opted-in hubs are offered that version, with `betaReleaseNotes`, and install the beta file. Without a `betaVersion`, every hub gets `app.groovy`.
 
@@ -231,7 +231,7 @@ Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots`
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.3", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.3.4", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true}
 ```
 
 Since 1.2.1 it does this only while lock code management is on, or to send a disable (`lockManagement: false`) when an earlier enable may still be stored. A hub that has never used lock code management doesn't register at all.

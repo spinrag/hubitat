@@ -52,7 +52,8 @@ import groovy.transform.Field
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.3.3'
+@Field static final String APP_NAME = 'SignalBricks Telemetry'
+@Field static final String APP_VERSION = '1.3.4'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -254,13 +255,20 @@ Map mainPage() {
 
         section('<b>Logging</b>') {
             input(name: 'debugLogging', type: 'bool', title: 'Enable debug logging (turns off after 30 minutes)', defaultValue: false, submitOnChange: true)
-            paragraph "<small>Version ${APP_VERSION} · <a href='${DOCS_URL}' target='_blank'>Documentation</a></small>"
+            paragraph "<small>${appNameAndVersion()} · <a href='${DOCS_URL}' target='_blank'>Documentation</a></small>"
         }
     }
 }
 
+// Shown on the app page and in log lines that carry the version, e.g.
+// "SignalBricks Telemetry 1.3.4" (#20). Registration and events keep sending
+// the bare `version`.
+String appNameAndVersion() {
+    return "${APP_NAME} ${APP_VERSION}"
+}
+
 void installed() {
-    log.info 'SignalBricks Telemetry installed'
+    log.info "${appNameAndVersion()} installed"
     ensureAccessToken()
     initialize()
 }
@@ -660,7 +668,7 @@ void reregisterIfVersionChanged() {
     if (lockManagementEnabled != true && !lockMgmtPreviouslyRegistered()) return
     if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
     state.reregisterAttemptAt = now()
-    log.info "SignalBricks Telemetry: re-registering after update to ${APP_VERSION}"
+    log.info "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}"
     try {
         registerWithPlatform()
     } catch (Exception e) {
@@ -729,7 +737,7 @@ void registerCallback(resp, Map data) {
     state.registeredVersion = APP_VERSION
     state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
-    log.info "SignalBricks Telemetry: registered with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
+    log.info "SignalBricks Telemetry: registered ${appNameAndVersion()} with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
 }
 
 Map jsonResponse(def data, int status = 200) {

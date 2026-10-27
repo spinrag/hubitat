@@ -1067,7 +1067,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.3.3'
+String VERSION = '1.3.4'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1084,6 +1084,9 @@ def evBody = new JsonSlurper().parseText(app.posts.find { it.cb == 'postCallback
 check('version: event carries the app and firmware versions', evBody.version == VERSION && evBody.hubFirmwareVersion == '2.4.1.177')
 check('version: changed version re-registers on the next event', registers().size() == 1 && regBody().version == VERSION && regBody().lockManagement == true)
 check('version: registration carries the hub firmware version', regBody().hubFirmwareVersion == '2.4.1.177')
+check('version: app name shown with the version', app.appNameAndVersion() == "SignalBricks Telemetry ${VERSION}")
+check('version: re-register log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: re-registering after update to SignalBricks Telemetry ${VERSION}" })
+check('version: registration sends the bare version', regBody().version == VERSION && !regBody().containsKey('appName'))
 event()
 check('version: rate-limited, no second register before the callback', registers().size() == 1)
 app.registerCallback(new FakeResp(status: 500, body: 'not json'), [enabled: true])
@@ -1096,6 +1099,7 @@ app.verifyCodeChanges()
 check('version: scheduled check retries after 30 minutes', registers().size() == 2)
 app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true])
 check('version: success records the registered version', app.state.registeredVersion == VERSION)
+check('version: registered log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: registered SignalBricks Telemetry ${VERSION} with SignalBricks (lock management on)" })
 app.fakeNow += 60L * 60 * 1000
 event()
 check('version: same version never re-registers', registers().size() == 2)
