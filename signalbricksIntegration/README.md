@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.4*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.5*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -12,6 +12,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 - **Timing.** A code is on the lock from before check-in to after checkout: the dispatcher sends the booking window and the app reconciles the lock codes at its start and end.
 - **Which codes it manages.** The app adds, changes and removes codes whose name starts with its code name prefix and contains `ORB` followed by the booking id. It also treats any slot it assigned earlier as its own, by position, even if that slot was later reassigned outside the app (it tracks its assignments because some lock drivers don't keep code names). It writes new codes only into empty slots from its **Minimum Code Position** up. SignalBricks Telemetry never names its admin and managed codes (`SBA:` / `SBM:`) with `ORB` plus a digit, so the app doesn't claim them by name; keep Telemetry's slots below the app's minimum.
 - **Retries.** Each code set is verified and re-sent until the lock confirms it; a reconcile loop catches missed confirmations.
+- **Door code refresh.** Off by default. Reads the codes back from the locks one lock at a time, on a schedule you choose or from the app page (see [Door code refresh](#door-code-refresh)).
 - **API.** A small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher. The dispatcher is not part of this repository.
 
 ## Running alongside the OwnerRez app
@@ -30,6 +31,20 @@ Known-good setup:
 | SignalBricks Telemetry | `SBA:` / `SBM:` | admin and managed slots 1–25 |
 
 The app only uses slots from its **Minimum Code Position** up to the lock's reported `maxCodes`. A lock with fewer slots than the minimum, or a lock that doesn't report `maxCodes`, gets **no codes**, and the log shows `no free code position (>= <minimum>) on lock <id>`. Check the lock's `maxCodes` on its device page (run **Get Codes** on the lock if it is empty) and choose the minimum accordingly.
+
+## Door code refresh
+
+A door code refresh asks each lock for every code it holds (the lock's **Get Codes**), so the hub's copy of the codes is current. Over Z-Wave or Zigbee that walks every slot: a 250-slot lock takes many minutes. The app writes and reconciles its own codes, so it doesn't need a routine full read, and the refresh is **Off** by default.
+
+The **Door code refresh** section of the app page has:
+
+- **Scheduled refresh**: **Off** (default), **Weekly** (Tuesday) or **Daily**, at a time between 01:00 and 03:59 hub time picked at random once per hub. It applies when you click **Done**. The OwnerRez app's weekly refresh runs on Wednesday, so the two don't read the locks on the same night unless one of them is set to Daily.
+- **Refresh now** and **Refresh door codes now**: start a refresh of all locks, or of one chosen lock, right away. The first lock starts about a minute later.
+- Progress: which lock is being read (e.g. *running, lock 2 of 13 (Front Door)*), the schedule, and when the last refresh finished. Reload the page to update it. The Debug page shows the same.
+
+Locks are always read one at a time. The next lock starts when the current one has reported its codes (counted only after 1 second per slot, at least 60 seconds, then 30 seconds to settle), or when its time budget runs out (3 seconds per slot, at least 2 and at most 20 minutes), whichever comes first. A refresh of 13 large locks can take a few hours. Starting a refresh while one is running does nothing. Booking syncs and reconciles carry on during a refresh.
+
+Clicking **Done** never starts a refresh. Up to 1.3.4 the app refreshed every lock at midnight each night, starting a new lock every 90 seconds; on hubs with large locks the reads overlapped and Z-Wave timed out for hours. After updating to 1.3.5 that midnight schedule is removed when you open the app and click **Done**, or else the next time it fires (it then reads no lock).
 
 ## Conflicts
 
@@ -81,7 +96,7 @@ Use Hubitat Package Manager (HPM). Set this up once on each hub:
 4. If **Hub Login Security** is on, enter the hub's username and password under **Hub Security** in HPM settings. If the hub has HTTPS turned on, also turn on **SSL (HTTPS) Enabled**.
 5. Set the update check time outside 2–4am, when the hub runs nightly maintenance and backups.
 
-You don't need to open the app and click **Done** after an update; the existing schedules and subscriptions keep running with the new code.
+You don't need to open the app and click **Done** after an update; the existing schedules and subscriptions keep running with the new code. (After updating to 1.3.5, clicking **Done** removes the old midnight door code refresh right away; see [Door code refresh](#door-code-refresh).)
 
 ## Troubleshooting
 
@@ -89,18 +104,21 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **Codes vanished.** Don't use **Reset State** on the Debug page: it clears the app's bookings and code assignments, so the next reconcile removes this app's codes until the dispatcher syncs the bookings again.
 - **A current (in-house) booking's code is missing.** Open **Debug** → **Reconcile Door Codes**. It re-adds codes for every booking the app holds that is active now, about a minute apart per code.
 - **The OwnerRez app's codes are changed or removed.** Check that both apps have a non-empty code name prefix, that the prefixes differ, and that neither is the start of the other, and that Lock Code Manager isn't running on the lock (see [Conflicts](#conflicts)).
+- **Z-Wave is slow or locks time out after midnight** (hubs with many large locks, 1.3.4 or earlier). Update to 1.3.5 or later and click **Done** in the app; check that **Scheduled refresh** is **Off** or Weekly (see [Door code refresh](#door-code-refresh)).
 - **Status: Not registered** / `skipping outbound POST` in the log: expected, see [Registration status](#registration-status-and-the-outbound-webhook).
 
 ## Development
 
-`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. It is not loaded by Hubitat or HPM. Run it from the repository root with Docker:
+`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. `tests/RefreshHarness.groovy` checks the door code refresh: Off by default and after an upgrade, the old midnight job removed, Done not refreshing, the Weekly/Daily times, the one-lock-at-a-time queue, the manual button and progress, re-arming after a booking sync, and that no code is logged. Neither is loaded by Hubitat or HPM. Run them from the repository root with Docker:
 
 ```bash
-docker run --rm --network none -v "$PWD/signalbricksIntegration:/w:ro" groovy:4.0-jdk17 \
-  groovy /w/tests/IntegrationHarness.groovy /w/app.groovy
+for h in IntegrationHarness RefreshHarness; do
+  docker run --rm --network none -v "$PWD/signalbricksIntegration:/w:ro" groovy:4.0-jdk17 \
+    groovy /w/tests/$h.groovy /w/app.groovy
+done
 ```
 
-It prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. CI runs it on every pull request.
+Each prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. CI runs it on every pull request.
 
 ## License
 
