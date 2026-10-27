@@ -68,17 +68,26 @@ class FakeApp {
 }
 
 // Applies setCode/deleteCode to lockCodes, except the next dropSets /
-// dropDeletes commands (a lock that silently drops them).
+// dropDeletes commands (a lock that silently drops them). unreadableReads:
+// the next reads of lockCodes return an undecryptable value. storedName: the
+// driver stores every set under this name instead. throwOnSet: the driver
+// throws with the code in its message.
 class FakeLock {
     String id; String displayName; String name; String label
     Map attrs = [:]
     List calls = []
-    int dropSets = 0, dropDeletes = 0
-    def currentValue(String a, Boolean skipCache = false) { attrs[a] }
+    int dropSets = 0, dropDeletes = 0, unreadableReads = 0
+    String storedName = null
+    Boolean throwOnSet = false
+    def currentValue(String a, Boolean skipCache = false) {
+        if (a == 'lockCodes' && unreadableReads > 0) { unreadableReads--; return 'ENCRYPTEDBLOB' }
+        attrs[a]
+    }
     void setCode(Integer slot, String code, String name) {
         calls << ['setCode', slot, name]
+        if (throwOnSet) throw new IllegalStateException("setCode(${slot}, ${code}, ${name}) failed")
         if (dropSets > 0) { dropSets--; return }
-        edit { it[slot.toString()] = [name: name, code: code] }
+        edit { it[slot.toString()] = [name: storedName ?: name, code: code] }
     }
     void deleteCode(Integer slot) {
         calls << ['deleteCode', slot]
@@ -120,12 +129,14 @@ Map initial = [
     '14': [name: 'SBM: Numeric', code: 50500014],
     '15': [name: 'SBM: Busy', code: '50500015'],
     '16': [name: 'SBM: Taken', code: '50500016'],
+    '24': [name: 'SBM: Short', code: '123'],
+    '25': [name: 'SBM: Letters', code: '5050ab25'],
     '27': [name: 'Legacy Unapproved', code: '50500027'],
     '28': [name: 'Legacy', code: '50500028'],
     '29': [name: 'SBM: Above', code: '50500029'],
     '30': [name: 'GT:ORB123-x', code: '50500030'],
 ]
-List fakeCodes = ['50500002', '50500005', '50500012', '05050013', '50500014', '50500015', '50500016', '50500027', '50500028', '50500029', '50500030', '50500099', '50500098', '50500097', '50500021', '50500022']
+List fakeCodes = ['5050ab25', '50500031', '50500032', '50500033', '50500002', '50500005', '50500012', '05050013', '50500014', '50500015', '50500016', '50500027', '50500028', '50500029', '50500030', '50500099', '50500098', '50500097', '50500021', '50500022']
 def lock = new FakeLock(id: '9', displayName: 'Side', name: 'Side', label: 'Side')
 lock.attrs.maxCodes = '30'
 lock.attrs.lockCodes = JsonOutput.toJson(initial)
@@ -174,7 +185,7 @@ def tick = { String code = null, List slots = [] ->
     job
 }
 def settle = { String code = null, List slots = [] -> while (tick(code, slots)) {} }
-def fresh = { app.state.writeTimes = []; lock.calls.clear(); lock.dropSets = 0; lock.dropDeletes = 0 }
+def fresh = { app.state.writeTimes = []; lock.calls.clear(); lock.dropSets = 0; lock.dropDeletes = 0; lock.unreadableReads = 0; lock.storedName = null; lock.throwOnSet = false }
 def fp = { String code -> app.codeFingerprint(keyBytes, code) }
 String RID = '3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b'
 
@@ -335,6 +346,8 @@ refused('source an unapproved adopted slot', 27, [name: 'SBA: x', toSlot: 7], 40
 refused('source above the ceiling, not adopted', 29, [name: 'SBM: x', toSlot: 21], 403, 'slot_not_allowed')
 refused('source slot invalid', 'x', [name: 'SBA: x'], 400, 'invalid_slot')
 refused('numeric code (leading zeros unknown)', 14, [name: 'SBM: Numeric 2'], 409, 'code_not_copyable')
+refused('code shorter than 4 digits', 24, [name: 'SBM: Short 2'], 409, 'code_not_copyable')
+refused('code not all digits', 25, [name: 'SBM: Letters 2'], 409, 'code_not_copyable')
 refused('empty name', 2, [name: '  '], 400, 'invalid_name')
 refused('missing name', 2, [toSlot: 7], 400, 'invalid_name')
 refused('non-ASCII name', 2, [name: 'SBA: Café'], 400, 'invalid_name')
@@ -462,6 +475,106 @@ fresh()
 relocate(2, [name: 'SBA: Owner'])
 settle()
 check('no fingerprint key: confirmed without fingerprint', results()[-1].value == 'confirmed' && !results()[-1].d.containsKey('fingerprint'))
+
+// --- Review fixes (#32) ---
+// A source delete is never re-sent unless a fresh read shows the target
+// holding the code and the source unchanged.
+fresh()
+lock.dropDeletes = 1
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+tick()
+check('resend guard: delete phase started, first delete dropped', pending()['9:19']?.phase == 'delete' && lock.calls.count { it == ['deleteCode', 15] } == 1)
+putSlot(19, 'SBM: Intruder', '50500099')
+lock.unreadableReads = 1
+tick()
+lock.unreadableReads = 1
+tick()
+check('resend guard: target lost behind an unreadable read -> failed target_changed', results()[-1].d.reason == 'target_changed' && pending().isEmpty())
+check('resend guard: no second delete, source keeps the code', lock.calls.count { it == ['deleteCode', 15] } == 1 && slotOf(15) == [name: 'SBM: Busy', code: '50500015'])
+putSlot(19, null, null)
+fresh()
+lock.dropDeletes = 1
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+tick()
+putSlot(15, 'SBM: Someone', '50500098')
+lock.unreadableReads = 2
+tick(); tick()
+check('resend guard: source changed behind an unreadable read -> failed source_changed, no second delete',
+    results()[-1].d.reason == 'source_changed' && lock.calls.count { it == ['deleteCode', 15] } == 1 && slotOf(15)?.code == '50500098')
+putSlot(15, 'SBM: Busy', '50500015'); putSlot(19, null, null)
+fresh()
+lock.dropDeletes = 1
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+tick()
+putSlot(15, null, null)
+lock.unreadableReads = 2
+tick(); tick()
+check('resend guard: source found empty on the fresh read -> confirmed, no second delete', results()[-1].value == 'confirmed' && lock.calls.count { it == ['deleteCode', 15] } == 1)
+putSlot(15, 'SBM: Busy', '50500015'); putSlot(19, null, null)
+
+// A driver that throws on the first send: 502, nothing held, write refunded, code not logged
+fresh()
+lock.throwOnSet = true
+app.state.writeTimes = [app.now()]
+int logMark = app.logged.size()
+def thrown = relocate(15, [name: 'SBM: Busy', toSlot: 19])
+check('first send throws: 502 send_error', thrown.status == 502 && body(thrown).error == 'send_error')
+check('first send throws: nothing pending, no job, write refunded', pending().isEmpty() && !verifyJobs() && app.state.writeTimes.size() == 1)
+check('first send throws: logged by class name only', app.logged.drop(logMark).any { it.contains('IllegalStateException') } && !app.logged.any { it.contains('50500015') || it.contains('setCode(') })
+check('first send throws: source untouched', slotOf(15) == [name: 'SBM: Busy', code: '50500015'])
+
+// The lock stores the code under another name: distinct reason, source kept
+fresh()
+lock.storedName = 'Driver Name'
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+settle('50500015', [15, 19])
+check('name mismatch: failed target_name_mismatch on the first check, no delete, source kept', results()[-1].d.reason == 'target_name_mismatch' && results()[-1].d.targetConfirmed == false && results()[-1].d.attempts == 1 &&
+    !lock.calls.any { it[0] == 'deleteCode' } && slotOf(15) == [name: 'SBM: Busy', code: '50500015'])
+putSlot(19, null, null)
+
+// Retry on either slot of a move in flight -> 409
+fresh()
+lock.dropSets = 99
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+app.state.retryTimes = []
+app.params = [lockId: '9', slot: '15']
+def rs = app.apiRetryCode()
+check('retry on a moving source -> 409 change_pending', rs.status == 409 && body(rs).error == 'change_pending')
+app.params = [lockId: '9', slot: '19']
+check('retry on a moving target -> 409 change_pending', app.apiRetryCode().status == 409)
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+
+// Rules narrowed after the source delete was sent: the emptied source's approval goes
+lock.attrs.maxCodes = '40'
+putSlot(31, 'Legacy Three', '50500031')
+Map cfg31 = lockCfg - [fingerprintKey: KEY]
+cfg31.locks = ['9': [adopted: [27, 28, 30, 31]]]
+app.request = [JSON: cfg31]
+app.apiSetLockConfig()
+app.approvedAdoptedSlots = ['9:30', '9:31']
+fresh()
+relocate(31, [name: 'SBA: Legacy Three', toSlot: 8])
+tick()
+check('narrowed after delete: delete sent and applied', pending()['9:8']?.phase == 'delete' && slotOf(31) == null)
+app.request = [JSON: cfg31 + [admin: [from: 1, to: 5]]]
+app.apiSetLockConfig()
+check('narrowed after delete: failed slot_not_allowed', results()[-1].d.reason == 'slot_not_allowed' && pending().isEmpty())
+check('narrowed after delete: emptied source approval withdrawn', app.approvedAdoptedSlots == ['9:30'])
+// ...but not when the source still holds the code
+app.request = [JSON: cfg31]
+app.apiSetLockConfig()
+putSlot(32, 'Legacy Four', '50500032')
+cfg31.locks = ['9': [adopted: [27, 28, 30, 31, 32]]]
+app.request = [JSON: cfg31]
+app.apiSetLockConfig()
+app.approvedAdoptedSlots = ['9:30', '9:32']
+fresh()
+lock.dropDeletes = 99
+relocate(32, [name: 'SBA: Legacy Four', toSlot: 9])
+tick()
+app.request = [JSON: cfg31 + [admin: [from: 1, to: 5]]]
+app.apiSetLockConfig()
+check('narrowed after delete, source still holds the code: approval kept', results()[-1].d.reason == 'slot_not_allowed' && app.approvedAdoptedSlots == ['9:30', '9:32'] && slotOf(32)?.code == '50500032')
 
 // --- No code anywhere outside app state and the lock ---
 String everything = (app.posts.collect { it.params.body } + app.logged + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() } + app.paragraphs).join('\n')

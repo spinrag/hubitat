@@ -1310,10 +1310,10 @@ Map apiRetryCode() {
     if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
     Integer slot = parseSlot(params.slot)
     if (slot == null) return jsonResponse([error: 'invalid_slot'], 400)
+    // A relocate (either of its slots) retries on its own.
+    if (changePendingOn(lock.id.toString(), slot, true)) return relocatePending()
     Map p = pendingCodeChanges()[pendingKey(lock.id.toString(), slot)]
     if (!p) return jsonResponse([error: 'no_pending_change', message: 'nothing pending for this slot (confirmed, superseded, expired or no longer allowed)'], 404)
-    // A relocate retries on its own and is never held after it fails.
-    if (p.action == 'relocate') return relocatePending()
     Map r = resolvePendingChange(p)
     if (r.response) {
         // It can never be re-sent: report it once (if still in flight) and drop it.
@@ -1382,17 +1382,32 @@ Map resolveRelocate(def lockIdRaw, def slotRaw, def toSlotRaw, String name) {
     }
     if (move && dst.occupied) return refuse('slot_occupied', 409, 'toSlot already holds a code')
     // A driver reporting the code as a number has lost any leading zeros, so
-    // writing it back could change the code.
+    // writing it back could change the code. Other codes must be what a set
+    // accepts.
     def code = src.codes[src.slot.toString()].code
-    if (!(code instanceof String)) return refuse('code_not_copyable', 409, 'the lock reports this code as a number; it cannot be copied safely')
+    if (!(code instanceof String) || !(code ==~ /\d{4,10}/)) {
+        return refuse('code_not_copyable', 409, 'the lock reports this code as a number or not as 4-10 digits; it cannot be copied safely')
+    }
     return [lock: src.lock, slot: toSlot, fromSlot: src.slot, fromName: src.currentName, prevName: dst.currentName, code: code]
 }
 
-// Re-send checks for a relocate. Set phase: the same rules as the request, and
-// the source must still hold the code and name it had then. Delete phase: the
-// source must still be allowed (its contents are checked by relocateProgress).
+// Re-send checks for a relocate, from a fresh read of lockCodes. Set phase:
+// the same rules as the request, and the source must still hold the code and
+// name it had then. Delete phase: the source must still be allowed, the target
+// must hold the code under the new name, and the source must be empty or still
+// hold its request-time name and code. A source delete is only ever sent
+// after these pass on the same read.
 Map resolvePendingRelocate(Map p) {
-    if (p.phase == 'delete') return resolveAllowedSlot(p.lockId, p.fromSlot, true)
+    if (p.phase == 'delete') {
+        Map d = resolveAllowedSlot(p.lockId, p.fromSlot, true)
+        if (d.response) return d
+        if (!codeChangeApplied(p, d.codes)) return refuse('target_changed', 409, 'the target slot no longer holds the code')
+        def src = d.codes[p.fromSlot.toString()]
+        if (d.occupied && (d.currentName != p.fromName || !sameCode(src.code, p.code?.toString()))) {
+            return refuse('source_changed', 409, 'the source slot now holds a different code')
+        }
+        return d
+    }
     Map r = resolveRelocate(p.lockId, p.fromSlot, p.slot, p.name)
     if (r.response) return r
     if (r.code != p.code || r.fromName != p.fromName) return refuse('slot_changed', 409, 'the source slot now holds a different code; send a new request')
@@ -1424,7 +1439,16 @@ Map apiRelocateCode() {
     savePendingCodeChanges(all)
     Map p = [lockId: lockId, slot: r.slot, fromSlot: r.fromSlot, action: 'relocate', phase: 'set', name: name, fromName: r.fromName,
              prevName: r.prevName, code: r.code, requestId: rid.id, attempts: 0, createdAt: now(), status: 'pending']
-    sendCodeChange(p, r.lock)
+    try {
+        sendCodeChange(p, r.lock)
+    } catch (Exception e) {
+        // Only the class name: the driver's message can carry the code. The
+        // change was never stored, so give the write back to the limit.
+        log.warn "SignalBricks Telemetry: relocate on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot} could not be sent (${e.class.simpleName})"
+        List times = (state.writeTimes ?: []) as List
+        if (times) state.writeTimes = times.take(times.size() - 1)
+        return jsonResponse([error: 'send_error', message: 'the lock driver refused the command'], 502)
+    }
     log.info "SignalBricks Telemetry: relocate requested on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot}"
     return jsonResponse([lockId: lockId, fromSlot: r.fromSlot, toSlot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
@@ -1437,7 +1461,12 @@ Boolean relocateProgress(Map p, lock, Map codes) {
     Boolean targetHolds = codeChangeApplied(p, codes)
     Boolean startDelete = p.phase != 'delete'
     if (startDelete) {
-        if (!targetHolds) return false
+        if (!targetHolds) {
+            if (!targetNameMismatch(p, codes)) return false
+            // Re-sending can't fix it (and the target now fails the set rules).
+            finishCodeChange(p, 'failed', 'target_name_mismatch', true)
+            return true
+        }
         if ((p.fromSlot as Integer) == (p.slot as Integer)) {
             finishCodeChange(p, 'confirmed', null, true)
             return true
@@ -1467,6 +1496,25 @@ Boolean relocateProgress(Map p, lock, Map codes) {
     p.attempts = 0
     sendCodeChange(p, lock)
     return true
+}
+
+// The lock stored the code in the target under a name other than the new one
+// (for a rename, other than the old one too). The source is kept.
+Boolean targetNameMismatch(Map p, Map codes) {
+    def t = codes[p.slot.toString()]
+    return t instanceof Map && sameCode(t.code, p.code?.toString()) && t.name?.toString() != p.name &&
+        ((p.fromSlot as Integer) != (p.slot as Integer) || t.name?.toString() != p.fromName)
+}
+
+// A move that ends failed after its source delete was sent: if the source is
+// empty now, its approval goes, as after a confirmed move.
+void withdrawApprovalIfSourceEmpty(Map p) {
+    if (p.action != 'relocate' || p.phase != 'delete') return
+    def lock = findCodeLock(p.lockId)
+    Map codes = lock ? readLockCodes(lock) : null
+    if (codes == null) return
+    def src = codes[p.fromSlot.toString()]
+    if (!(src instanceof Map) || src.code == null || src.code.toString() == '') withdrawApproval(p.lockId, p.fromSlot as Integer)
 }
 
 // After a move: the source's operator approval (adopted slots above the
@@ -1644,6 +1692,12 @@ void verifyCodeChange(String key) {
         finishCodeChange(p, 'failed', r.error, true)
         return
     }
+    // The fresh read in resolvePendingRelocate found the source already empty.
+    if (p.action == 'relocate' && p.phase == 'delete' && !r.occupied) {
+        withdrawApproval(p.lockId, p.fromSlot as Integer)
+        finishCodeChange(p, 'confirmed', null, true)
+        return
+    }
     log.info "SignalBricks Telemetry: ${p.action} not applied yet on ${lock.displayName} slot ${p.action == 'relocate' ? "${p.fromSlot} -> ${p.slot}" : p.slot}; re-sending (attempt ${attempts + 1})"
     sendCodeChange(p, lock)
 }
@@ -1658,6 +1712,7 @@ void verifyCodeChange(String key) {
 // kept for the retry endpoint until they expire.
 void finishCodeChange(Map p, String result, String reason, Boolean report) {
     if (report) reportCodeResult(p, result, reason)
+    if (result == 'failed') withdrawApprovalIfSourceEmpty(p)
     Map all = pendingCodeChanges()
     String key = pendingKey(p.lockId, p.slot as Integer)
     if (result == 'failed' && p.action != 'relocate' && RETRYABLE_FAILURES.contains(reason)) {
@@ -1678,6 +1733,7 @@ void dropDisallowedCodeChanges() {
     if (!gone) return
     gone.each { k, p ->
         if (p.status == 'pending') reportCodeResult(p, 'failed', 'slot_not_allowed')
+        withdrawApprovalIfSourceEmpty(p)
         all.remove(k)
     }
     savePendingCodeChanges(all)
