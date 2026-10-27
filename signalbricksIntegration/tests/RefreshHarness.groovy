@@ -199,18 +199,19 @@ check('queue: B not scheduled while A reads', !pending('codeRefreshNext'))
 app.startCodeRefresh()
 check('queue: second start while running does not restart', calls == ['1'] && app.atomicState.codeRefresh.index == 0 && !pending('codeRefreshNext'))
 
-// A's floor is 250 s (1 s/slot): earlier lockCodes events don't finish it
+// A's floor is 650 s (2.6 s/slot): large locks send lockCodes mid-read, so earlier events don't finish it
+check('floor: 2.6 s/slot (250 -> 650 s), 60 s minimum', app.codeRefreshFloorSec(250) == 650 && app.codeRefreshFloorSec(30) == 78 && app.codeRefreshFloorSec(10) == 60)
 app.clock += 100_000
 app.lockCodesHandler([deviceId: 1L, name: 'lockCodes', value: JsonOutput.toJson(fakeCodes)])
 check('floor: lockCodes at 100 s on a 250-slot lock ignored', !pending('codeRefreshSettled'))
-app.clock += 140_000
+app.clock += 545_000
 app.lockCodesHandler([deviceId: 1L, name: 'lockCodes', value: JsonOutput.toJson(fakeCodes)])
-check('floor: lockCodes at 240 s (< 250 s floor) ignored', !pending('codeRefreshSettled'))
-app.clock += 20_000
+check('floor: lockCodes at 645 s (< 650 s floor) ignored', !pending('codeRefreshSettled'))
+app.clock += 15_000
 app.lockCodesHandler([deviceId: 2L, name: 'lockCodes', value: JsonOutput.toJson(fakeCodes)])
 check('lockCodes from another lock ignored', !pending('codeRefreshSettled'))
 app.lockCodesHandler([deviceId: 1L, name: 'lockCodes', value: JsonOutput.toJson(fakeCodes)])
-check('lockCodes from A after its floor -> settle 30 s', pending('codeRefreshSettled')?.secs == 30)
+check('lockCodes from A at 660 s (after its floor) -> settle 30 s', pending('codeRefreshSettled')?.secs == 30)
 app.clock += 10_000
 app.lockCodesHandler([deviceId: 1L, name: 'lockCodes', value: JsonOutput.toJson(fakeCodes)])
 check('settle restarts on a further lockCodes (one settle job)', app.scheduled.count { it.handler == 'codeRefreshSettled' } == 1)
@@ -225,7 +226,7 @@ check('queue: lock B read after A', calls == ['1', '2'])
 check('budget: 30-slot lock gets the 120 s minimum', pending('codeRefreshTimeout')?.secs == 120)
 app.clock += 30_000
 app.lockCodesHandler([deviceId: 2L, name: 'lockCodes'])
-check('floor: 60 s minimum (lockCodes at 30 s ignored)', !pending('codeRefreshSettled'))
+check('floor: 30-slot lock 78 s (lockCodes at 30 s ignored)', !pending('codeRefreshSettled'))
 
 // Timers from an earlier step or run do nothing
 long runId = app.atomicState.codeRefresh.runId

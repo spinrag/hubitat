@@ -42,7 +42,7 @@ The **Door code refresh** section of the app page has:
 - **Refresh now** and **Refresh door codes now**: start a refresh of all locks, or of one chosen lock, right away. The first lock starts about a minute later.
 - Progress: which lock is being read (e.g. *running, lock 2 of 13 (Front Door)*), the schedule, and when the last refresh finished. Reload the page to update it. The Debug page shows the same.
 
-Locks are always read one at a time. The next lock starts when the current one has reported its codes (counted only after 1 second per slot, at least 60 seconds, then 30 seconds to settle), or when its time budget runs out (3 seconds per slot, at least 2 and at most 20 minutes), whichever comes first. A refresh of 13 large locks can take a few hours. Starting a refresh while one is running does nothing. Booking syncs and reconciles carry on during a refresh.
+Locks are always read one at a time. The next lock starts when the current one has reported its codes (counted only after 2.6 seconds per slot, at least 60 seconds, because large locks report codes while still reading; then 30 seconds to settle), or when its time budget runs out (3 seconds per slot, at least 2 and at most 20 minutes), whichever comes first. A refresh of 13 large locks can take a few hours. Starting a refresh while one is running does nothing. Booking syncs and reconciles carry on during a refresh.
 
 Clicking **Done** never starts a refresh. Up to 1.3.4 the app refreshed every lock at midnight each night, starting a new lock every 90 seconds; on hubs with large locks the reads overlapped and Z-Wave timed out for hours. After updating to 1.3.5 that midnight schedule is removed when you open the app and click **Done**, or else the next time it fires (it then reads no lock).
 

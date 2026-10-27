@@ -404,8 +404,8 @@ void scheduleEvents(Map bookings) {
 // midnight, so reads overlapped and Z-Wave timed out on every lock for hours.
 // Now locks are read one at a time (the same approach as our OwnerRez
 // coexistence work): the next lock starts once the current one has reported
-// lockCodes (counted only after 1 s per slot, at least 60 s, then 30 s with no
-// further lockCodes to settle) or once its time budget (3 s per slot, 120 s to
+// lockCodes (counted only after 2.6 s per slot, at least 60 s, because large
+// locks send lockCodes mid-read; then 30 s with no further lockCodes to settle) or once its time budget (3 s per slot, 120 s to
 // 20 min) runs out. The run lives in atomicState.codeRefresh; every timer
 // carries the run id and lock index, so a timer from an earlier step or run
 // does nothing. Off by default: it runs only on the chosen cadence or when
@@ -416,7 +416,7 @@ int getCodeRefreshGapSec() { 5 }
 // A run whose step is this long past its budget lost its timers (e.g. a reboot)
 int getCodeRefreshStaleSec() { 300 }
 
-int codeRefreshFloorSec(int slots) { Math.max(slots, 60) }
+int codeRefreshFloorSec(int slots) { Math.max((int) (slots * 2.6), 60) }
 int codeRefreshBudgetSec(int slots) { Math.min(Math.max(slots * 3, 120), 1200) }
 
 // Start reading door codes from all selected locks (or only lockId), one at a time
