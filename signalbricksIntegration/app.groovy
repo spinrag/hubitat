@@ -3,7 +3,11 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.3' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.3.4' } // major.minor.patch[-prerelease]
+String getSbAppName() { 'SignalBricks Integration' }
+// Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
+// API responses and headers keep the bare version.
+String getSbAppNameAndVersion() { sbAppName + ' ' + sbAppVersion }
 
 import groovy.json.JsonOutput
 
@@ -12,7 +16,7 @@ definition(
     name: 'SignalBricks Integration',
     namespace: 'com.signalbricks.hubitat',
     author: 'SignalBricks',
-    description: 'SignalBricks Hubitat Integration',
+    description: 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to your locks. Runs alongside the OwnerRez app; give each app a different code name prefix.',
     category: 'Convenience', // Unused
     oauth: true, // Unused
     iconUrl: '', // Unused
@@ -25,8 +29,16 @@ definition(
 preferences {
     page(name: 'main', install: true, uninstall: true) {
         section() {
-            paragraph '<b>SignalBricks</b> Property Automation'
-            paragraph 'SignalBricks Hubitat Integration'
+            paragraph '<b>' + sbAppNameAndVersion + '</b>'
+            paragraph 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to the locks selected below. ' +
+                'Each code is named <code>&lt;prefix&gt;ORB&lt;booking id&gt;-&lt;guest&gt;</code> and is on the lock from before check-in to after checkout. ' +
+                'It manages codes named with its prefix + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
+                '(it can treat such a slot as its own by position even if the slot was reassigned outside the app). ' +
+                'It writes new codes only into empty slots from the minimum code position up. ' +
+                'Do not run Hubitat Lock Code Manager on the same locks.'
+            paragraph 'Runs alongside the OwnerRez app. Give the two apps <b>different, non-empty</b> code name prefixes, neither the start of the other ' +
+                '(e.g. OwnerRez <code>G:</code>, SignalBricks Integration <code>GT:</code>) and minimum code positions above the Telemetry slots ' +
+                "(e.g. OwnerRez 30, this app 50; a minimum is a lower bound, not a separate range). <a href='https://github.com/spinrag/hubitat/blob/main/signalbricksIntegration/README.md' target='_blank'>Documentation</a>"
         }
 
         // We can only access the locks the user has selected
@@ -36,6 +48,9 @@ preferences {
             input(name: 'minCodePosition', type: 'number', title: 'Minimum Code Position', submitOnChange: true, defaultValue: 0)
             input(name: 'idAtEnd', type: 'bool', title: 'Booking ID at End?', submitOnChange: true)
             input(name: 'codeNamePrefix', type: 'string', title: 'Prefix for code name', submitOnChange: true, defaultValue: '')
+            if (!settings?.codeNamePrefix) {
+                paragraph '<b>Set a code name prefix</b> (e.g. <code>GT:</code>) that differs from the OwnerRez app\'s prefix. Without one this app treats every <code>ORB</code> booking code on the selected locks as its own.'
+            }
         }
 
         section(title: 'Connection') {
@@ -55,13 +70,15 @@ preferences {
                         paragraph '<b>Local URL:</b> (not available)'
                     }
                     paragraph '<b>Access Token:</b> ' + state.accessToken
-                    paragraph '<b>App Version:</b> ' + sbAppVersion
+                    paragraph '<b>App Version:</b> ' + sbAppNameAndVersion
 
                     if (state.sbId) {
                         paragraph '<b>Status:</b> Connected (ID: ' + state.sbId + ')'
                         input(name: 'btnDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                     } else {
                         paragraph '<b>Status:</b> Not registered (use CLI add-hub to configure)'
+                        paragraph '<small>Expected and harmless: the SignalBricks dispatcher drives this app through its endpoints (<code>/sync</code> etc.) with the access token above. ' +
+                            'Registration only enables an outbound webhook to a SignalBricks backend that was never wired up; lock events reach SignalBricks through the SignalBricks Telemetry app.</small>'
                     }
                 }
             } else {
@@ -225,7 +242,7 @@ mappings {
 
 // Only gets called when the user clicks "Done" on the main page
 void installed() {
-    log.debug 'installed'
+    log.info "${sbAppNameAndVersion} installed"
 
     // Initialize default state
 
@@ -248,7 +265,7 @@ void installed() {
 
 // Called when the settings page is updated (and use clicks done)
 void updated() {
-    log.debug 'updated'
+    log.info "${sbAppNameAndVersion} updated"
 
     // Make sure these defautls are set
 
@@ -620,7 +637,7 @@ void webhook(e) {
     log.debug "webhook: ${e.name}"
 
     if (!state.sbId) {
-        log.debug "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
+        log.trace "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
         return
     }
 

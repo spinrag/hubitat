@@ -41,23 +41,24 @@ Updates an **existing** Cloudflare A or AAAA record with your current public IP.
 
 ---
 
-### 🔹 SignalBricks Integration — *app*
-Manages short-term-rental door codes on Z-Wave / Zigbee locks, driven by booking data pushed in from an external dispatcher (OwnerRez or compatible). Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
+### 🔹 [SignalBricks Integration](signalbricksIntegration/README.md) — *app*
+Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Zigbee locks. Runs alongside the OwnerRez app. Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
-- Sets, updates, and removes lock codes per booking lifecycle
-- Per-code retry-until-confirmed loop with bounded backoff (sets that silently drop on flaky Z-Wave eventually take)
-- Tracks code assignments in `atomicState` so reconcile can recover from missed `codeChanged` events
-- Exposes a small REST API (`/sync`, `/devices`, `/info`, …) used by the upstream dispatcher; access-token gated
-- Configurable code-name prefix, minimum code position, and booking-ID placement
+- Codes are named `<prefix>ORB<booking id>-<guest>` and are on the lock from before check-in to after checkout
+- Both apps need different, non-empty code name prefixes (e.g. OwnerRez `G:`, SignalBricks Integration `GT:`)
+- Manages codes named with its prefix + `ORB<booking id>`, plus slots it assigned earlier; writes new codes only into empty slots from its minimum code position up
+- Don't run Hubitat's Lock Code Manager on the same locks
+- Per-code retry-until-confirmed, with a reconcile loop for missed confirmations
+- Small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher (not included in this repo)
 
 📂 [`signalbricksIntegration`](signalbricksIntegration/)
 
-> **Note:** Not currently distributed via HPM. Install by pasting `app.groovy` into Hubitat's Apps Code editor. Requires an external dispatcher (not included in this repo) to push booking data.
+> **Hand-installed hubs:** use HPM **Match Up** to adopt the existing app code instead of installing it again. See the [README](signalbricksIntegration/README.md#hubs-that-installed-it-by-hand-hpm-match-up).
 
 ---
 
 ### 🔹 [SignalBricks Telemetry](signalbricksTelemetry/README.md) — *app*
-Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app.
+Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app; the two are versioned separately.
 
 - One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste.
 - Telemetry never subscribes to `lockCodes`, never sends PINs, never controls devices
@@ -70,7 +71,7 @@ Sends read-only lock, contact, temperature, humidity and battery events to Signa
 
 ## 🛠 Installation via Hubitat Package Manager (HPM)
 
-The two drivers above are compatible with [Hubitat Package Manager](https://hubitatpackagemanager.hubitatcommunity.com/):
+The drivers and apps above are compatible with [Hubitat Package Manager](https://hubitatpackagemanager.hubitatcommunity.com/):
 
 1. Open HPM on your hub
 2. Choose **Install** > **Search by Keywords**
@@ -78,10 +79,10 @@ The two drivers above are compatible with [Hubitat Package Manager](https://hubi
    - `"DNS Made Easy Updater"`
    - `"DMS Monitor"`
    - `"Cloudflare DNS Updater"`
-   - `"SignalBricks"` (SignalBricks Telemetry)
+   - `"SignalBricks"` (SignalBricks Integration, SignalBricks Telemetry)
 4. Follow prompts to install and configure
 
-Alternatively, use the raw URLs in the `packageManifest.json` files if installing manually. The SignalBricks app must be installed manually (see above).
+Alternatively, use the raw URLs in the `packageManifest.json` files if installing manually.
 
 ---
 

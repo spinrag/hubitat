@@ -21,6 +21,13 @@
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json"
 		},
 		{
+			"name": "SignalBricks Integration",
+			"description": "Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Hubitat locks. Runs alongside the OwnerRez app; each app needs its own different, non-empty code name prefix (e.g. OwnerRez \"G:\", SignalBricks \"GT:\"). Codes are named <prefix>ORB<booking id>-<guest> and exist from before check-in to after checkout. Manages codes named with its prefix + ORB<booking id> (and slots it assigned earlier), writing new codes only into empty slots from its minimum code position up; doesn't claim SignalBricks Telemetry's SBA:/SBM: codes.",
+			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksIntegration/packageManifest.json",
+			"category": "Integrations",
+			"tags": ["Locks", "Cloud"]
+		},
+		{
 			"name": "SignalBricks Telemetry",
 			"description": "Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks; telemetry never sends lock PINs. Optional, off-by-default lock code management for admin and managed codes.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/signalbricksTelemetry/packageManifest.json",

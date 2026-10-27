@@ -184,6 +184,21 @@ check('guard: Guest-ORB12345 booking (idAtEnd)', app.isBookingName('Guest-ORB123
 check('guard: Guest -ORB12345 booking (OwnerRez fork idAtEnd)', app.isBookingName('Guest -ORB12345'))
 check('guard: Orbit not booking', !app.isBookingName('Orbit'))
 check('guard: Re-Orbit not booking', !app.isBookingName('Re-Orbit'))
+// platform#581: ORB followed by a digit anywhere, whatever comes before it
+['GT:ORB123-x', 'G:ORB1-x', 'Name -ORB123', 'GT: ORB123-x', 'xORB9', 'Guest-ORB12345'].each { n ->
+    check("guard: '${n}' booking", app.isBookingName(n))
+}
+['ORBIT', 'Corbin', 'ORB', 'ORB-Guest', 'orb123', 'Orb1', 'SBA: ORBIT'].each { n ->
+    check("guard: '${n}' not booking", !app.isBookingName(n))
+}
+['SBA: ORBIT', 'SBA: Corbin'].each { n ->
+    app.request = [JSON: [slot: 2, code: '12345678', name: n]]
+    check("write name '${n}' allowed", app.apiSetCode().status == 202)
+}
+['SBA: GT:ORB123-x', 'SBA: G:ORB1-x', 'SBA: Name -ORB123'].each { n ->
+    app.request = [JSON: [slot: 2, code: '12345678', name: n]]
+    check("write name '${n}' refused", app.apiSetCode().status == 403)
+}
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: Café']]
 check('non-ASCII name refused', app.apiSetCode().status == 400)
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: a\nb']]
@@ -255,7 +270,19 @@ lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"GT: ORB123-Guest"',
 check('Guest-ORB12345 refused', app.apiDeleteCode().status == 403)
 lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"Guest-ORB12345"', '"name":"Guest -ORB12345"')
 check('Guest -ORB12345 refused', app.apiDeleteCode().status == 403)
-lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"Guest -ORB12345"', '"name":"Old"')
+['GT:ORB123-x', 'G:ORB1-x', 'Name -ORB123'].inject('Guest -ORB12345') { prev, n ->
+    lock.attrs.lockCodes = lock.attrs.lockCodes.replace("\"name\":\"${prev}\"", "\"name\":\"${n}\"")
+    check("current name '${n}' refused (write, delete, reveal)", app.apiDeleteCode().status == 403 && app.apiRevealCode().status == 403 &&
+        { app.request = [JSON: [slot: 5, code: '12345678', name: 'SBA: x']]; app.apiSetCode().status == 403 }())
+    n
+}
+['SBA: ORBIT', 'SBA: Corbin'].inject('Name -ORB123') { prev, n ->
+    lock.attrs.lockCodes = lock.attrs.lockCodes.replace("\"name\":\"${prev}\"", "\"name\":\"${n}\"")
+    app.state.revealTimes = []
+    check("current name '${n}' not a booking code (reveal allowed)", app.apiRevealCode().status == 200)
+    n
+}
+lock.attrs.lockCodes = lock.attrs.lockCodes.replace('"name":"SBA: Corbin"', '"name":"Old"')
 app.state.revealTimes = []
 
 app.params = [lockId: '7', slot: '12']
@@ -893,11 +920,15 @@ lockD.attrs.lockCodes = groovy.json.JsonOutput.toJson([
     '2': [name: 'Someone', code: '55550002'],
     '5': [name: 'ORB9-Guest', code: '55550005'],
     '6': [name: 'Empty', code: ''],
+    '7': [name: 'GT:ORB7-x', code: '55550007'],
+    '8': [name: 'G:ORB1-x', code: '55550008'],
+    '9': [name: 'Name -ORB123', code: '55550009'],
+    '10': [name: 'Corbin', code: '55550010'],
     '12': [name: 'SBM: Cleaner', code: '12340012'],
     '30': [name: 'Above', code: '55550030'],
 ])
 app.codeLocks = [lockA, lockB, lockC, lockD]
-fpCodes += ['55550000', '55550005', '91930003', '91930004']
+fpCodes += ['55550000', '55550005', '55550007', '55550008', '55550009', '55550010', '91930003', '91930004']
 app.state.fingerprintTimes = []; app.state.writeTimes = []; app.state.revealTimes = []; app.state.retryTimes = []
 [[surveyOnly: true, adopted: [1]], [surveyOnly: true, admin: [from: 1, to: 10]], [surveyOnly: 'yes'], [surveyOnly: 1]].each { e ->
     app.request = [JSON: fpCfg + [locks: fpCfg.locks + ['13': e]]]
@@ -923,8 +954,9 @@ app.params = [lockId: '10']
 check('survey: other locks report surveyOnly false', body(fcall('apiListSlots')).surveyOnly == false)
 app.params = [lockId: '13']
 def svFp = fcall('apiListFingerprints')
-check('survey: fingerprints for occupied in-ceiling slots, no booking/empty/above', svFp.status == 200 && body(svFp).slots*.slot == [1, 2, 12])
-check('survey: info log names lock and count, no fp or code', app.logged.any { it.toString() == 'SignalBricks Telemetry: fingerprints listed for FpD (3 slots)' } && !app.logged.any { it.toString().contains(body(svFp).slots[0].fp) || it.toString().contains('12340001') })
+check('survey: fingerprints for occupied in-ceiling slots, no booking/empty/above', svFp.status == 200 && body(svFp).slots*.slot == [1, 2, 10, 12])
+check('survey: GT:ORB / G:ORB / -ORB<digit> names excluded, Corbin included', !(body(svFp).slots*.slot).any { it in [5, 7, 8, 9] } && 10 in body(svFp).slots*.slot)
+check('survey: info log names lock and count, no fp or code', app.logged.any { it.toString() == 'SignalBricks Telemetry: fingerprints listed for FpD (4 slots)' } && !app.logged.any { it.toString().contains(body(svFp).slots[0].fp) || it.toString().contains('12340001') })
 check('survey: fp comparable with onboarded locks', body(svFp).slots.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001'))
 app.request = [JSON: [slot: 2, code: '91930004', name: 'SBA: Take']]
 def svSet = fcall('apiSetCode')
@@ -949,7 +981,7 @@ app.params = [lockId: '13']
 check('survey: switched to normal -> slots allowed', body(fcall('apiListSlots')).slots.find { it.slot == 12 }.allowedAs == 'managed' && body(fcall('apiListSlots')).surveyOnly == false)
 app.request = [JSON: [slot: 3, code: '91930003', name: 'SBA: Onboarded']]
 check('survey: switched to normal -> set ok', fcall('apiSetCode').status == 202)
-check('survey: normal lock fingerprints follow the ranges', body(fcall('apiListFingerprints')).slots*.slot == [1, 2, 12])
+check('survey: normal lock fingerprints follow the ranges', body(fcall('apiListFingerprints')).slots*.slot == [1, 2, 10, 12])
 app.state.remove('pendingCodeChanges'); app.scheduled.clear()
 app.codeLocks = [lockA, lockB, lockC]
 app.request = [JSON: fpCfg]
@@ -971,7 +1003,7 @@ check('batch: 200 {locks} in selection order', all.status == 200 && body(all).ke
 check('batch: each entry is {id, slots}', allLocks.every { it.keySet() == ['id', 'slots'] as Set })
 check('batch: rules parity with per-lock endpoint (ranges, adopted+approved, un-listed, survey-only)',
     ['10', '11', '12', '13'].every { id -> allLocks.find { it.id == id }.slots == perLock(id) })
-check('batch: expected slots per lock', allLocks*.slots.collect { it*.slot } == [[1, 2, 12, 41], [1, 12, 13], [], [1, 2, 12]])
+check('batch: expected slots per lock', allLocks*.slots.collect { it*.slot } == [[1, 2, 12, 41], [1, 12, 13], [], [1, 2, 10, 12]])
 check('batch: same code across locks -> same fp', allLocks[0].slots.find { it.slot == 1 }.fp == allLocks[3].slots.find { it.slot == 1 }.fp && allLocks[0].slots[0].fp == hmac16(key2Bytes, '12340001'))
 app.approvedAdoptedSlots = null
 check('batch: approval withdrawn -> adopted slot above ceiling dropped', body(batch()).locks[0].slots*.slot == [1, 2, 12])
@@ -1067,7 +1099,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.3.3'
+String VERSION = '1.3.4'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1084,6 +1116,9 @@ def evBody = new JsonSlurper().parseText(app.posts.find { it.cb == 'postCallback
 check('version: event carries the app and firmware versions', evBody.version == VERSION && evBody.hubFirmwareVersion == '2.4.1.177')
 check('version: changed version re-registers on the next event', registers().size() == 1 && regBody().version == VERSION && regBody().lockManagement == true)
 check('version: registration carries the hub firmware version', regBody().hubFirmwareVersion == '2.4.1.177')
+check('version: app name shown with the version', app.appNameAndVersion() == "SignalBricks Telemetry ${VERSION}")
+check('version: re-register log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: re-registering after update to SignalBricks Telemetry ${VERSION}" })
+check('version: registration sends the bare version', regBody().version == VERSION && !regBody().containsKey('appName'))
 event()
 check('version: rate-limited, no second register before the callback', registers().size() == 1)
 app.registerCallback(new FakeResp(status: 500, body: 'not json'), [enabled: true])
@@ -1096,6 +1131,7 @@ app.verifyCodeChanges()
 check('version: scheduled check retries after 30 minutes', registers().size() == 2)
 app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true])
 check('version: success records the registered version', app.state.registeredVersion == VERSION)
+check('version: registered log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: registered SignalBricks Telemetry ${VERSION} with SignalBricks (lock management on)" })
 app.fakeNow += 60L * 60 * 1000
 event()
 check('version: same version never re-registers', registers().size() == 2)

@@ -12,8 +12,8 @@
  * reveal one code at a time. The hub enforces which slots may be touched:
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
  * but only up to a ceiling set in this app's UI; adopted slots above it need
- * the operator's approval in the UI. Slots whose name has an upper-case "ORB"
- * at the start or after a space or hyphen (booking codes) are always refused, and
+ * the operator's approval in the UI. Slots whose name contains an upper-case
+ * "ORB" followed by a digit anywhere (booking codes) are always refused, and
  * created names must carry SBA:/SBM: and never such an "ORB".
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
@@ -52,7 +52,8 @@ import groovy.transform.Field
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-@Field static final String APP_VERSION = '1.3.3'
+@Field static final String APP_NAME = 'SignalBricks Telemetry'
+@Field static final String APP_VERSION = '1.3.4'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -219,7 +220,7 @@ Map mainPage() {
         }
 
         section('<b>Lock code management (optional)</b>') {
-            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks selected here. Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (<code>ORB…</code>) are always refused. Codes are never logged or sent as telemetry.'
+            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks selected here. Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (names with <code>ORB</code> followed by a digit) are always refused. Codes are never logged or sent as telemetry.'
             input(name: 'lockManagementEnabled', type: 'bool', title: 'Enable lock code management', defaultValue: false, submitOnChange: true)
             if (lockManagementEnabled) {
                 input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Locks SignalBricks may manage codes on', multiple: true, required: false, submitOnChange: true)
@@ -254,13 +255,20 @@ Map mainPage() {
 
         section('<b>Logging</b>') {
             input(name: 'debugLogging', type: 'bool', title: 'Enable debug logging (turns off after 30 minutes)', defaultValue: false, submitOnChange: true)
-            paragraph "<small>Version ${APP_VERSION} · <a href='${DOCS_URL}' target='_blank'>Documentation</a></small>"
+            paragraph "<small>${appNameAndVersion()} · <a href='${DOCS_URL}' target='_blank'>Documentation</a></small>"
         }
     }
 }
 
+// Shown on the app page and in log lines that carry the version, e.g.
+// "SignalBricks Telemetry 1.3.4" (#20). Registration and events keep sending
+// the bare `version`.
+String appNameAndVersion() {
+    return "${APP_NAME} ${APP_VERSION}"
+}
+
 void installed() {
-    log.info 'SignalBricks Telemetry installed'
+    log.info "${appNameAndVersion()} installed"
     ensureAccessToken()
     initialize()
 }
@@ -660,7 +668,7 @@ void reregisterIfVersionChanged() {
     if (lockManagementEnabled != true && !lockMgmtPreviouslyRegistered()) return
     if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
     state.reregisterAttemptAt = now()
-    log.info "SignalBricks Telemetry: re-registering after update to ${APP_VERSION}"
+    log.info "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}"
     try {
         registerWithPlatform()
     } catch (Exception e) {
@@ -729,7 +737,7 @@ void registerCallback(resp, Map data) {
     state.registeredVersion = APP_VERSION
     state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
-    log.info "SignalBricks Telemetry: registered with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
+    log.info "SignalBricks Telemetry: registered ${appNameAndVersion()} with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
 }
 
 Map jsonResponse(def data, int status = 200) {
@@ -783,17 +791,14 @@ Boolean rangesOverlap(Map a, Map b) {
 }
 
 // Booking codes from the SignalBricks Integration / OwnerRez apps: an
-// upper-case "ORB" at the start of the name or right after whitespace or a
-// hyphen, case-sensitive. Covers "ORB<id>-Guest" (signalbricksIntegration's
-// default with an empty prefix), "<prefix> ORB<id>…" and the idAtEnd forms
-// "Guest-ORB<id>" (signalbricksIntegration) and "Guest -ORB<id>" (OwnerRez
-// fork); ordinary words such as "Forbes" or "Orbit" don't match. The platform
-// mirrors this rule (signalbricks/platform#512).
-@Field static final java.util.regex.Pattern BOOKING_NAME = ~/(^|[\s-])ORB/
-// Stricter rule for names SignalBricks writes: signalbricksIntegration claims
-// any name with "ORB" followed by digits anywhere (helperOnlySbCodes), so such
-// a name could be taken over or deleted by the booking app.
-@Field static final java.util.regex.Pattern CLAIMABLE_NAME = ~/ORB\d/
+// upper-case "ORB" followed by a digit anywhere in the name, case-sensitive
+// (signalbricks/platform#581). Covers every prefix with or without a space,
+// e.g. "ORB123-Guest", "GT:ORB123-Guest", "G:ORB1-Guest", "GT: ORB123-Guest",
+// and the idAtEnd forms "Guest-ORB123" and "Guest -ORB123". It is also the
+// rule signalbricksIntegration uses to claim codes (helperOnlySbCodes), so a
+// name SignalBricks writes must never match it either. Ordinary words such as
+// "Forbes", "Orbit" or "Corbin" don't match. The platform mirrors this rule.
+@Field static final java.util.regex.Pattern BOOKING_NAME = ~/ORB\d/
 
 Boolean isBookingName(String name) {
     return name != null && BOOKING_NAME.matcher(name).find()
@@ -1145,10 +1150,10 @@ Map resolveSet(def lockIdRaw, def slotRaw, String name) {
     if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/)) {
         return refuse('invalid_name', 400, "name must be 1-${MAX_NAME_LENGTH} printable ASCII characters")
     }
-    // Never create a name the booking guard would read as a booking code, or
-    // one signalbricksIntegration would claim (ORB followed by a digit anywhere).
-    if (isBookingName(name) || CLAIMABLE_NAME.matcher(name).find()) {
-        return refuse('name_not_allowed', 403, 'names must not contain ORB followed by a digit, or an upper-case ORB at the start or after a space or hyphen')
+    // Never create a name the booking guard would read as a booking code
+    // (which signalbricksIntegration would also claim).
+    if (isBookingName(name)) {
+        return refuse('name_not_allowed', 403, 'names must not contain ORB followed by a digit')
     }
     Map r = resolveAllowedSlot(lockIdRaw, slotRaw, true)
     if (r.response) return r
@@ -1536,7 +1541,7 @@ void reportCodeResult(Map p, String result, String reason) {
     Map data = [lockId: p.lockId, slot: p.slot as Integer, action: p.action, result: result, attempts: p.attempts as Integer, requestId: p.requestId]
     if (reason) data.reason = reason
     String name = p.name?.toString()
-    if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isBookingName(name) && !CLAIMABLE_NAME.matcher(name).find()) {
+    if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isBookingName(name)) {
         data.name = name
     }
     Map payload = [
