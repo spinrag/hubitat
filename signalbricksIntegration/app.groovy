@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.5' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.3.6' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -577,6 +577,8 @@ String codeRefreshProgress(Map r) {
 
 // Lines for the app page
 List codeRefreshStatus() {
+    // The hub runs the main page with no state when the app code is saved
+    if (state == null || atomicState == null) return []
     List lines = []
     Map r = atomicState.codeRefresh
     if (!r) {
