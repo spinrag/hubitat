@@ -12,6 +12,9 @@ abstract class HubitatStub extends Script {
     def codeLocks = []
     def locks = null, contactSensors = null, temperatureSensors = null, humiditySensors = null
     Boolean lockManagementEnabled = true
+    Boolean includeDoorCodes = false
+    List subscriptions = []
+    void subscribe(def devices, String attribute, String handler) { subscriptions << attribute }
     Boolean debugLogging = false
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
@@ -1099,7 +1102,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.3.4'
+String VERSION = '1.3.5'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1273,6 +1276,68 @@ app.eventHandler(evt)
 check('check-in: disconnected job run or event sends nothing', app.posts.isEmpty())
 check('check-in: nothing rescheduled while disconnected', checkInJobs().isEmpty())
 check('check-in: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
+
+// --- Door codes in telemetry: "Include door codes" (signalbricks/platform#388) ---
+// Made-up PINs only.
+String PIN = '61937'
+def lockEvt = { Map extra -> [id: 900, deviceId: 7, name: 'lock', displayName: 'Front', value: 'unlocked', isStateChange: true, type: 'physical'] + extra }
+def lastEventPost = { app.posts.findAll { it.params.uri == 'https://ingest.test/v1/webhooks/hubitat' }.last() }
+def sentData = { new JsonSlurper().parseText(new JsonSlurper().parseText(lastEventPost().params.body).data ?: 'null') }
+def allSent = { (app.posts.collect { it.params.body } + app.logged.collect { it.toString() }).join('\n') }
+app.appButtonHandler('btnDisconnect')
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.debugLogging = true
+app.posts.clear(); app.logged.clear()
+
+// Off (the default): the code is stripped, slot and name kept
+check('codes: setting defaults to off', app.includeDoorCodes == false)
+app.eventHandler(lockEvt(data: '{"3":{"name":"Guest Smith","code":"' + PIN + '"}}'))
+check('codes off: lock event code stripped, slot and name kept', sentData() == ['3': [name: 'Guest Smith']])
+app.eventHandler(lockEvt(data: '{"usedCode":"' + PIN + '","codeName":"Cleaner","codeNumber":4}'))
+check('codes off: usedCode variant stripped', sentData() == [codeName: 'Cleaner', codeNumber: 4])
+check('codes off: no PIN in any post or log', !allSent().contains(PIN))
+
+// On: only the `code` of lock events passes; everything else is still stripped
+app.includeDoorCodes = true
+app.posts.clear(); app.logged.clear()
+app.eventHandler(lockEvt(data: '{"3":{"name":"Guest Smith","code":"' + PIN + '"}}'))
+check('codes on: lock event code sent with slot and name', sentData() == ['3': [name: 'Guest Smith', code: PIN]])
+app.eventHandler(lockEvt(data: '{"3":{"name":"Guest Smith","code":' + PIN + '}}'))
+check('codes on: numeric code sent as is', sentData() == ['3': [name: 'Guest Smith', code: PIN as Integer]])
+app.eventHandler(lockEvt(data: '{"3":{"name":"Guest","code":{"x":"' + PIN + '"}}}'))
+check('codes on: non-scalar code still stripped', sentData() == ['3': [name: 'Guest']])
+app.eventHandler(lockEvt(data: '{"usedCode":"' + PIN + '","pin":"' + PIN + '","passcode":"' + PIN + '","lockCodes":{"1":{"code":"' + PIN + '"}},"codeName":"Cleaner"}'))
+check('codes on: usedCode, pin, passcode, lockCodes still stripped', sentData() == [codeName: 'Cleaner'])
+app.eventHandler([id: 901, deviceId: 7, name: 'codeChanged', value: 'changed', data: '{"codeNumber":4,"code":"' + PIN + '"}'])
+check('codes on: codeChanged code still stripped', sentData() == [codeNumber: 4])
+app.eventHandler([id: 902, deviceId: 7, name: 'lastCodeName', value: 'Guest Smith', data: '{"code":"' + PIN + '"}'])
+check('codes on: lastCodeName data code still stripped', sentData() == [:])
+app.eventHandler([id: 903, deviceId: 9, name: 'contact', value: 'open', data: '{"pin":"' + PIN + '","code":"E101"}'])
+check('codes on: non-lock event keeps error code, strips pin', sentData() == [code: 'E101'])
+List lockPosts = app.posts.findAll { new JsonSlurper().parseText(it.params.body).name == 'lock' }
+check('codes on: sent over the ingestion URL with the bearer token', lockPosts.every { it.params.uri == 'https://ingest.test/v1/webhooks/hubitat' && it.params.headers.Authorization == 'Bearer ingest-fake' })
+check('codes on: never in the logs (debug logging on)', !app.logged.any { it.toString().contains(PIN) })
+check('codes on: debug log line still written', app.logged.any { it.toString().contains('sending Front lock=unlocked') })
+
+// A post that throws is logged by class name only, never the body (which carries the code)
+app.throwOnPost = true
+app.logged.clear()
+app.eventHandler(lockEvt(data: '{"3":{"name":"Guest Smith","code":"' + PIN + '"}}'))
+app.throwOnPost = false
+check('codes on: failed post logged without the code', app.logged.any { it.toString().contains('IllegalArgumentException') } && !app.logged.any { it.toString().contains(PIN) })
+
+// Never subscribes to lockCodes, with the setting on or off
+app.locks = [new FakeLock(id: '7', displayName: 'Front', name: 'Front', label: 'Front')]
+app.subscriptions.clear()
+app.subscribeToEvents()
+check('codes on: subscriptions unchanged, never lockCodes', app.subscriptions.sort() == ['battery', 'lastCodeName', 'lock'] && !app.subscriptions.contains('lockCodes'))
+app.includeDoorCodes = false
+app.subscriptions.clear()
+app.subscribeToEvents()
+check('codes off: never lockCodes', !app.subscriptions.contains('lockCodes'))
+app.locks = null
+app.debugLogging = false
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

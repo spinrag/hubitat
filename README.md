@@ -62,7 +62,7 @@ Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Z
 Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app; the two are versioned separately.
 
 - One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste.
-- Telemetry never subscribes to `lockCodes`, never sends PINs, never controls devices
+- Telemetry never subscribes to `lockCodes`, never controls devices, and doesn't send PINs unless you turn on *Include door codes* (1.3.5+, off by default; SignalBricks then keeps only a keyed hash, and only if your organization's admin also allows it)
 - Non-blocking `asynchttpPost` delivery
 - Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, with hub-side slot enforcement
 
