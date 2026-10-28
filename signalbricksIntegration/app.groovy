@@ -1992,14 +1992,25 @@ void sbScheduleRegisterRetry() {
 // unschedule() removed a pending registration retry's timer; put it back for the time left
 void sbRegisterRetryRearm() {
     Map r = atomicState?.sbRegisterRetry
-    if (!r || r.exhausted || !state.sbCredential) return
+    // An in-flight retry is answered by sbRegisterCallback, which schedules the next one
+    if (!r || r.exhausted || r.inFlight || !state.sbCredential) return
     long left = (long) (((r.at as long) - now()) / 1000)
     runIn(Math.max(left, 5L), 'sbRegisterRetryRun', [overwrite: true])
 }
 
 void sbRegisterRetryRun() {
-    if (!state.sbCredential || atomicState.sbRegisterRetry?.exhausted) return
+    Map r = atomicState.sbRegisterRetry
+    if (!state.sbCredential || !r || r.exhausted || r.inFlight) return
+    // In flight until the answer arrives: a sync meanwhile must not re-arm a duplicate
+    atomicState.sbRegisterRetry = [attempt: r.attempt, inFlight: true]
     sbRegister(true)
+}
+
+// Worth retrying: not verified yet (403), rate limited (429), the request timed out (408,
+// how Hubitat reports an async timeout), SignalBricks or Hubitat cloud failing (5xx), or no
+// answer at all. Any other 4xx won't change by retrying.
+boolean sbRegisterRetryable(Integer status) {
+    return !status || status in [403, 408, 429] || status >= 500
 }
 
 // The retry line for the app page, or null
@@ -2010,6 +2021,7 @@ String sbRegisterRetryStatus() {
     if (!r) return null
     int total = sbRegisterRetrySeconds.size()
     if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
+    if (r.inFlight) return "<b>Registration retries:</b> retry ${r.attempt} of ${total} in progress"
     String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
     return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
 }
@@ -2026,12 +2038,12 @@ void sbRegisterCallback(resp, Map data) {
 
 void sbRegistered(Integer status, Map body, String failure = null) {
     String why = status ? "HTTP ${status}" : (failure ?: 'no response')
-    if (status in [200, 401, 409]) {
+    if (state.sbCredential && sbRegisterRetryable(status)) {
+        sbScheduleRegisterRetry()
+    } else {
+        // 200, 401, 409 or another 4xx: no (more) retries
         atomicState.sbRegisterRetry = null
         unschedule('sbRegisterRetryRun')
-    } else if (state.sbCredential) {
-        // 403 (not verified yet), 5xx, timeout or no response: retry automatically
-        sbScheduleRegisterRetry()
     }
     if (status == 200) {
         state.sbConnected = true

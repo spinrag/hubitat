@@ -258,6 +258,23 @@ app.apiSync()
 check('retry: a PUT /sync during the retry window re-arms the retry for the time left', retryJob()?.secs == 80 && app.atomicState.sbRegisterRetry?.attempt == 2)
 app.appButtonHandler('btnReset')
 check('retry: Reset State keeps the pending retry too', retryJob() != null)
+// A retry in flight: a sync before its answer must not schedule a duplicate registration
+fireRetry()
+app.http.clear()
+app.apiSync()
+check('retry: in flight, a PUT /sync does not re-arm a duplicate', !retryJob() && app.atomicState.sbRegisterRetry?.inFlight && mainPage().contains('retry 2 of 3 in progress'))
+app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
+check('retry: the in-flight answer schedules the next retry', retryJob()?.secs == 300 && !app.atomicState.sbRegisterRetry?.inFlight)
+// Any 4xx other than 403 and 429 (and 408, a timeout) won't change by retrying
+for (int st : [400, 404, 422]) {
+    app.sbRegister()
+    app.sbRegisterCallback([status: st, data: '{}'], null)
+    check("retry: HTTP ${st} stops without retrying".toString(), !retryJob() && !app.atomicState.sbRegisterRetry)
+}
+app.sbRegister()
+app.sbRegisterCallback([status: 429, data: '{"error":"slow_down"}'], null)
+check('retry: 429 is retried', retryJob()?.secs == 30)
+app.sbRegister()
 app.clock -= 40_000
 app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
 app.atomicState.sbRegisterRetry = [attempt: 1, at: app.clock + 30_000L]
