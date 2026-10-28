@@ -338,6 +338,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeRefresh = null
             atomicState.lastSync = null
             scheduleCodeRefresh()
+            sbRegisterRetryRearm()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
@@ -532,6 +533,8 @@ void scheduleEvents(Map bookings) {
     // timer: put back only what the cadence and the running refresh need (#24)
     codeRefreshRearm()
     scheduleCodeRefresh()
+    // ...and a pending SignalBricks registration retry (#34)
+    sbRegisterRetryRearm()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -1960,7 +1963,7 @@ void sbRegister(boolean retry = false) {
     if (!state.sbCredential || !state.accessToken) return
     if (!retry) {
         // A fresh registration starts a fresh retry sequence
-        state.remove('sbRegisterRetry')
+        atomicState.sbRegisterRetry = null
         unschedule('sbRegisterRetryRun')
     }
     state.sbRegisterAttemptAt = now()
@@ -1973,25 +1976,37 @@ void sbRegister(boolean retry = false) {
 List getSbRegisterRetrySeconds() { [30, 120, 300] }
 
 void sbScheduleRegisterRetry() {
-    int attempt = ((state.sbRegisterRetry?.attempt ?: 0) as int) + 1
+    int attempt = ((atomicState.sbRegisterRetry?.attempt ?: 0) as int) + 1
     if (attempt > sbRegisterRetrySeconds.size()) {
-        state.sbRegisterRetry = [attempt: attempt - 1, exhausted: true]
+        atomicState.sbRegisterRetry = [attempt: attempt - 1, exhausted: true]
         unschedule('sbRegisterRetryRun')
         return
     }
     int delay = sbRegisterRetrySeconds[attempt - 1]
-    state.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L]
+    // Kept in atomicState with its due time, so an app-wide unschedule() (scheduleEvents on
+    // every booking sync, Reset State) can put the timer back: see sbRegisterRetryRearm()
+    atomicState.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L]
     runIn(delay, 'sbRegisterRetryRun', [overwrite: true])
 }
 
+// unschedule() removed a pending registration retry's timer; put it back for the time left
+void sbRegisterRetryRearm() {
+    Map r = atomicState?.sbRegisterRetry
+    if (!r || r.exhausted || !state.sbCredential) return
+    long left = (long) (((r.at as long) - now()) / 1000)
+    runIn(Math.max(left, 5L), 'sbRegisterRetryRun', [overwrite: true])
+}
+
 void sbRegisterRetryRun() {
-    if (!state.sbCredential || state.sbRegisterRetry?.exhausted) return
+    if (!state.sbCredential || atomicState.sbRegisterRetry?.exhausted) return
     sbRegister(true)
 }
 
 // The retry line for the app page, or null
 String sbRegisterRetryStatus() {
-    Map r = state?.sbRegisterRetry
+    // The hub renders the page with no state while it saves the code (#28)
+    if (state == null || atomicState == null) return null
+    Map r = atomicState.sbRegisterRetry
     if (!r) return null
     int total = sbRegisterRetrySeconds.size()
     if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
@@ -2012,7 +2027,7 @@ void sbRegisterCallback(resp, Map data) {
 void sbRegistered(Integer status, Map body, String failure = null) {
     String why = status ? "HTTP ${status}" : (failure ?: 'no response')
     if (status in [200, 401, 409]) {
-        state.remove('sbRegisterRetry')
+        atomicState.sbRegisterRetry = null
         unschedule('sbRegisterRetryRun')
     } else if (state.sbCredential) {
         // 403 (not verified yet), 5xx, timeout or no response: retry automatically
@@ -2082,7 +2097,8 @@ void sbDisconnect() {
 
 void sbForgetConnection() {
     unschedule('sbRegisterRetryRun')
-    ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier', 'sbRegisterRetry'].each {
+    atomicState.sbRegisterRetry = null
+    ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier'].each {
         state.remove(it)
     }
 }

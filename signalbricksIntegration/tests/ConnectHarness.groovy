@@ -249,6 +249,18 @@ check('retry: 403 schedules retry 1 after 30 s', retryJob()?.secs == 30 && mainP
 app.http.clear()
 fireRetry()
 check('retry: the retry registers again in the background', app.http.count { it.async == 'sbRegisterCallback' } == 1)
+// A booking sync during the retry window runs scheduleEvents (app-wide unschedule()): the retry survives
+app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
+check('retry: a second failure schedules retry 2 after 2 min', retryJob()?.secs == 120)
+app.clock += 40_000
+app.request = [JSON: [:]]
+app.apiSync()
+check('retry: a PUT /sync during the retry window re-arms the retry for the time left', retryJob()?.secs == 80 && app.atomicState.sbRegisterRetry?.attempt == 2)
+app.appButtonHandler('btnReset')
+check('retry: Reset State keeps the pending retry too', retryJob() != null)
+app.clock -= 40_000
+app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
+app.atomicState.sbRegisterRetry = [attempt: 1, at: app.clock + 30_000L]
 app.sbRegisterCallback([status: 502, data: null], null)
 check('retry: 5xx schedules retry 2 after 2 min', retryJob()?.secs == 120 && mainPage().contains('retry 2 of 3'))
 fireRetry()
