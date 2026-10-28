@@ -181,7 +181,7 @@ Map bookingsView() {
             Map l = onLock[lockId.toString()]
             if (!l) {
                 if (status == 'current') notOnLock++
-                return "lock ${bookingsEsc(lockId)} (not selected in this app): " + (status == 'current' ? bookingsMissing : 'not on lock')
+                return "lock ${bookingsEsc(lockId)} (not selected in this app): " + (status == 'current' ? bookingsMissing : bookingsNotOnLock(status))
             }
             if (l.codes == null) return "${l.name}: ${l.problem}"
             Map c = l.codes[id]
@@ -196,7 +196,7 @@ Map bookingsView() {
                 notOnLock++
                 return "${l.name}: ${bookingsMissing}"
             }
-            return "${l.name}: not on lock" + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
+            return "${l.name}: ${bookingsNotOnLock(status)}"
         }
         // Heading line, then its locks indented under it
         String line = "<b>ORB${bookingsEsc(id)} ${bookingsEsc(b.guest ?: '')} &middot; ${status} &middot; " +
@@ -240,6 +240,11 @@ String bookingsRequestMethod(String fallback) {
 // A current booking whose code is missing from a lock needs action
 String getBookingsMissing() { "<b style='color:#c62828'>not on lock</b>" }
 
+// Not on lock for a booking that isn't current: expected, so not highlighted
+String bookingsNotOnLock(String status) {
+    return 'not on lock' + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
+}
+
 // Last 2 digits only; the full code is never rendered
 String bookingsMask(def code) {
     String s = code == null ? '' : code.toString()
@@ -271,6 +276,11 @@ def debug() {
         }
         // Direct links to API endpoints
         section(title: '<h2>Links</h2>') {
+            // The links carry the access token, which SignalBricks holds once connected (#36)
+            if (state.sbConnected) {
+                paragraph 'Hidden while connected to SignalBricks: these links carry the app\'s access token. Disconnect to show them.'
+                return
+            }
             String url
 
             // Hub info
@@ -323,6 +333,7 @@ void appButtonHandler(String btnName) {
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
             atomicState.lastSync = null
+            clearLegacySbId()
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
             // Re-establish subscriptions so codeChangedHandler still fires
@@ -465,6 +476,8 @@ void updated() {
     if (state.lastVersion != sbAppVersion) {
         state.lastVersion = sbAppVersion
     }
+
+    clearLegacySbId()
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
@@ -1173,11 +1186,18 @@ Map sbHttpResponseJson(def data, int status = 200) {
     ]
 }
 
+// The old /register sbId (never used since Connect to SignalBricks) turns on the
+// outbound webhook to a placeholder URL; Done and Reset State clear it (#36)
+void clearLegacySbId() {
+    state.sbId = null
+    atomicState.sbId = null
+}
+
 // Register the SignalBricks account with this hub
 // SignalBricks needs to already have the hub's Id and Access Token
 // So just accept whatever is passed in at face value
 Map apiRegister() {
-    log.debug "apiRegister: ${request.JSON}"
+    log.debug 'apiRegister: registration received'
 
     try {
         atomicState.sbId = request.JSON.sbId

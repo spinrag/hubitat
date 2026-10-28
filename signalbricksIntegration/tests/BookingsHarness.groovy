@@ -168,7 +168,7 @@ check('on lock, upcoming: flagged as early', row('22').contains('upcoming') && r
 // Not on lock
 check('not on lock: current booking, assigned lock without the code', row('88').contains('Back &lt;Door&gt;: ' + missing))
 check('not on lock: current booking, lock not selected', row('11').contains('lock 9 (not selected in this app): ' + missing))
-check('not on lock: upcoming says added at check-in', row('77').contains('Back &lt;Door&gt;: not on lock (added at check-in)') && row('55').contains('lock 9 (not selected in this app)'))
+check('not on lock: upcoming says added at check-in', row('77').contains('Back &lt;Door&gt;: not on lock (added at check-in)') && row('55').contains('lock 9 (not selected in this app): not on lock (added at check-in)'))
 check('not on lock: past says removed after checkout', row('44').contains('Front: not on lock (removed after checkout)'))
 check('lock that never reported codes: "no codes reported"', row('88').contains('Garage: no codes reported') && page.contains('<b>Garage:</b> has reported no codes yet'))
 check('unreadable lockCodes: noted, not counted', page.contains('<b>Side:</b> its lockCodes could not be read'))

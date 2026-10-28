@@ -49,6 +49,7 @@ What happens: the app uses OAuth 2.0 with PKCE (S256) through Hubitat's cloud re
 
 - **Reconnect to SignalBricks** runs the same steps again: the access token is replaced again and registered again.
 - **Disconnect from SignalBricks** tells SignalBricks to delete its copy of the token and then replaces the token on the hub, so the dispatcher can no longer reach the app. If SignalBricks can't be reached, the app still disconnects itself and says so: then also click **Disconnect** on the hub's SignalBricks hub page.
+- The **Debug** page's API links carry the access token, so since 1.4.1 they are hidden while the hub is connected; disconnect to show them.
 - **Debug → Refresh Access Token** replaces the token and registers the new one with SignalBricks. An admin can also disconnect the hub on its SignalBricks hub page; the app then shows *Not connected* after its next registration attempt.
 - The app registers again when you click **Done** and once after an update, so SignalBricks shows the current version and addresses.
 - A hub can be connected in only one SignalBricks organization at a time. To move it, disconnect it in the first organization.
@@ -85,7 +86,7 @@ Codes are shown masked, with only their last 2 digits (e.g. `••••12`), a
 
 ## The old registration and the outbound webhook
 
-This is the old outbound registration (`/register`), separate from [Connect to SignalBricks](#connect-to-signalbricks). With trace logging the log shows `webhook: No SignalBricks ID — skipping outbound POST`; that is expected and harmless. Up to 1.4.0 the app page also showed *Status: Not registered (use CLI add-hub to configure)* for it; since 1.4.1 the page shows only the Connect to SignalBricks status. The app is driven inbound: the SignalBricks dispatcher calls its endpoints (`/sync`, `/devices`, `/info`, …) with the app's access token. Registration would only enable an outbound webhook of lock events to a SignalBricks backend, which was never wired up. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead. Since 1.3.4 that log line is at trace level.
+This is the old outbound registration (`/register`), separate from [Connect to SignalBricks](#connect-to-signalbricks). With trace logging the log shows `webhook: No SignalBricks ID — skipping outbound POST`; that is expected and harmless. Up to 1.4.0 the app page also showed *Status: Not registered (use CLI add-hub to configure)* for it; since 1.4.1 the page shows only the Connect to SignalBricks status, and clicking **Done** or **Reset State** clears a leftover ID from that registration, so the old webhook stays off. The app is driven inbound: the SignalBricks dispatcher calls its endpoints (`/sync`, `/devices`, `/info`, …) with the app's access token. Registration would only enable an outbound webhook of lock events to a SignalBricks backend, which was never wired up. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead. Since 1.3.4 that log line is at trace level.
 
 ## Requirements
 

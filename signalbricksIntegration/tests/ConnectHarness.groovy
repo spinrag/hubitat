@@ -123,7 +123,8 @@ String page = mainPage()
 def connect = app.hrefs.find { it.name == 'hrefSbConnect' }
 check('page: Not connected status', page.contains('<b>Status:</b> Not connected') && oneStatus(page))
 check('page: every main page section title is a header', app.sectionTitles == ['<h2>Configuration</h2>', '<h2>Door code refresh</h2>', '<h2>Connection</h2>', '<h2>Diagnostics</h2>'])
-app.sectionTitles.clear(); app.debug()
+app.sectionTitles.clear(); app.hrefs.clear(); app.debug()
+check('debug page: API links with the token while not connected', app.hrefs.any { it.url?.contains("access_token=${firstToken}") })
 check('debug page: every section title is a header', app.sectionTitles == ['<h2>Actions</h2>', '<h2>Door code refresh</h2>', '<h2>Links</h2>'])
 check('page: Connect to SignalBricks link', connect?.title == 'Connect to SignalBricks' && connect?.style == 'external')
 check('page: manual URLs and token still shown while not connected', page.contains('<b>Cloud URL:</b>') && page.contains('<b>Local URL:</b> http://192.168.1.10/apps/api/42') && page.contains(firstToken))
@@ -166,9 +167,21 @@ check('register 200: state connected with names', app.state.sbConnected == true 
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
+app.paragraphs.clear(); app.hrefs.clear(); app.debug()
+String debugPage = (app.paragraphs + app.hrefs.collect { "${it.title} ${it.url}" }).join('\n')
+check('debug page: no access token while connected', !debugPage.contains(app.state.accessToken) && !debugPage.contains('access_token=') && debugPage.contains('Hidden while connected'))
+// Legacy /register (#36): logs no request body; Done and Reset State clear the sbId
+app.logged.clear()
+app.request = [JSON: [sbId: 'sb-legacy-fake', accessToken: 'fake-legacy-token']]
+app.apiRegister()
+check('legacy register: sbId stored, request body not logged', app.atomicState.sbId == 'sb-legacy-fake' && !app.logged.any { it.contains('sb-legacy-fake') || it.contains('fake-legacy-token') })
 app.state.sbId = 'sb-legacy-fake'
 check('page: a legacy sbId adds no second status or Disconnect', oneStatus(mainPage()))
-app.state.sbId = null
+app.updated()
+check('legacy sbId: cleared by Done (updated)', app.state.sbId == null && app.atomicState.sbId == null)
+app.state.sbId = 'sb-legacy-fake'; app.atomicState.sbId = 'sb-legacy-fake'
+app.appButtonHandler('btnReset')
+check('legacy sbId: cleared by Reset State', app.state.sbId == null && app.atomicState.sbId == null)
 check('page: Reconnect and Disconnect when connected', app.hrefs.any { it.name == 'hrefSbReconnect' } && app.inputs.btnSbDisconnect)
 check('page: no access token or credential shown when connected', !page.contains(app.state.accessToken) && !page.contains(CREDENTIAL))
 
