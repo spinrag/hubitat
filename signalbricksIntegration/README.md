@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.3.7*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.4.0*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -14,6 +14,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 - **Retries.** Each code set is verified and re-sent until the lock confirms it; a reconcile loop catches missed confirmations.
 - **Door code refresh.** Off by default. Reads the codes back from the locks one lock at a time, on a schedule you choose or from the app page (see [Door code refresh](#door-code-refresh)).
 - **Bookings page.** Shows the bookings the app knows against its codes on the locks, with codes masked (see [Bookings page](#bookings-page)).
+- **Connect to SignalBricks.** Since 1.4.0 the app connects itself to SignalBricks with OAuth, so the dispatcher gets the hub's addresses and access token from SignalBricks (see [Connect to SignalBricks](#connect-to-signalbricks)).
 - **API.** A small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher. The dispatcher is not part of this repository.
 
 ## Running alongside the OwnerRez app
@@ -32,6 +33,26 @@ Known-good setup:
 | SignalBricks Telemetry | `SBA:` / `SBM:` | admin and managed slots 1–25 |
 
 The app only uses slots from its **Minimum Code Position** up to the lock's reported `maxCodes`. A lock with fewer slots than the minimum, or a lock that doesn't report `maxCodes`, gets **no codes**, and the log shows `no free code position (>= <minimum>) on lock <id>`. Check the lock's `maxCodes` on its device page (run **Get Codes** on the lock if it is empty) and choose the minimum accordingly.
+
+## Connect to SignalBricks
+
+Added in 1.4.0; it replaces copying the app's URLs and access token into the dispatcher config (`hubitat.json`).
+
+1. Open the app. Under **Connection**, click **Connect to SignalBricks**.
+2. Sign in to SignalBricks with an account that has door code admin rights (the **admin** role) in the organization that owns the property.
+3. Choose the organization, the property and the hub record (the hub this hub's SignalBricks Telemetry app connected to is preselected), confirm it is the same physical hub, and click **Connect**.
+4. You return to the hub, which shows *Connecting*. The app registers in the background; reopen the app after a few seconds and it shows **SignalBricks: Connected to** *organization → hub*. If the registration fails for a reason that may pass (SignalBricks couldn't verify the hub yet, SignalBricks or Hubitat cloud unavailable, a timeout), the app retries automatically after about 30 seconds, 2 minutes and 5 minutes, and the page shows *Registration retries: retry N of 3 at …*. It stops retrying once SignalBricks accepts the registration, says the hub was disconnected, or says the hub is connected in another organization.
+
+What happens: the app uses OAuth 2.0 with PKCE (S256) through Hubitat's cloud redirect, like SignalBricks Telemetry. When SignalBricks sends it back, the app **replaces its access token** (the old one was part of the connect link), exchanges the code for a connection credential, and registers the hub UID, app id and version, the hub's name, its local and cloud endpoint addresses and the new access token with SignalBricks (over HTTPS, never logged). Before storing anything, SignalBricks checks that the token really belongs to this hub: it calls the app's `/info` through Hubitat cloud with it, so the hub needs Hubitat cloud access while it connects. SignalBricks then stores the token encrypted and the dispatcher reads it from there.
+
+> **Cancel also replaces the access token.** The app replaces its access token every time SignalBricks sends the browser back to the hub: after **Connect**, after **Cancel** on the SignalBricks page, and after a connect that fails. So if a dispatcher still reads this hub's token from `hubitat.json`, clicking **Connect to SignalBricks** and then **Cancel** breaks that dispatcher's access just like connecting does, until you copy the new token from the **Connection** section into `hubitat.json`. Connect only once the dispatcher reads hub tokens from SignalBricks, or be ready to update the file.
+
+- **Reconnect to SignalBricks** runs the same steps again: the access token is replaced again and registered again.
+- **Disconnect from SignalBricks** tells SignalBricks to delete its copy of the token and then replaces the token on the hub, so the dispatcher can no longer reach the app. If SignalBricks can't be reached, the app still disconnects itself and says so: then also click **Disconnect** on the hub's SignalBricks hub page.
+- **Debug → Refresh Access Token** replaces the token and registers the new one with SignalBricks. An admin can also disconnect the hub on its SignalBricks hub page; the app then shows *Not connected* after its next registration attempt.
+- The app registers again when you click **Done** and once after an update, so SignalBricks shows the current version and addresses.
+- A hub can be connected in only one SignalBricks organization at a time. To move it, disconnect it in the first organization.
+- While a hub is not connected, the **Connection** section still shows the cloud URL, local URL and access token for a dispatcher that reads `hubitat.json`. Connecting, and also cancelling a connect on the SignalBricks page, replaces that token, so such a dispatcher needs the new one. The existing endpoints (`/sync`, `/info`, `/devices`, `/register`) are unchanged.
 
 ## Door code refresh
 
@@ -63,12 +84,13 @@ Codes are shown masked, with only their last 2 digits (e.g. `••••12`), a
 
 ## Registration status and the outbound webhook
 
-The app page shows **Status: Not registered**, and with debug or trace logging the log shows `webhook: No SignalBricks ID — skipping outbound POST`. Both are expected and harmless. The app is driven inbound: the SignalBricks dispatcher calls its endpoints (`/sync`, `/devices`, `/info`, …) with the app's access token. Registration would only enable an outbound webhook of lock events to a SignalBricks backend, which was never wired up. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead. Since 1.3.4 that log line is at trace level.
+This is the old outbound registration (`/register`), separate from [Connect to SignalBricks](#connect-to-signalbricks). The app page shows **Status: Not registered**, and with debug or trace logging the log shows `webhook: No SignalBricks ID — skipping outbound POST`. Both are expected and harmless. The app is driven inbound: the SignalBricks dispatcher calls its endpoints (`/sync`, `/devices`, `/info`, …) with the app's access token. Registration would only enable an outbound webhook of lock events to a SignalBricks backend, which was never wired up. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead. Since 1.3.4 that log line is at trace level.
 
 ## Requirements
 
 - Hubitat Elevation platform **2.5.0** or later
-- The SignalBricks dispatcher configured with this hub's cloud URL and access token
+- A SignalBricks account with door code admin rights to [connect the app](#connect-to-signalbricks) (or, for a dispatcher that still reads `hubitat.json`, the hub's cloud URL and access token in that file)
+- OAuth enabled for the app code (HPM does this; for a manual install see below)
 
 ## Install
 
@@ -78,6 +100,7 @@ The app page shows **Status: Not registered**, and with debug or trace logging t
 2. Choose **Install** → **Search by Keywords** and search for `SignalBricks`.
 3. Select **SignalBricks Integration** and follow the prompts. HPM enables OAuth for the app code.
 4. In **Apps** → **Add User App**, choose **SignalBricks Integration**, select the locks, set the code name prefix and minimum code position (see [above](#running-alongside-the-ownerrez-app)), and click **Done**.
+5. Open the app again and click **Connect to SignalBricks** (see [Connect to SignalBricks](#connect-to-signalbricks)).
 
 ### Hubs that installed it by hand: HPM Match Up
 
@@ -117,6 +140,10 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **The OwnerRez app's codes are changed or removed.** Check that both apps have a non-empty code name prefix, that the prefixes differ, and that neither is the start of the other, and that Lock Code Manager isn't running on the lock (see [Conflicts](#conflicts)).
 - **Z-Wave is slow or locks time out after midnight** (hubs with many large locks, 1.3.4 or earlier). Update to 1.3.6 or later and click **Done** in the app; check that **Scheduled refresh** is **Off** or Weekly (see [Door code refresh](#door-code-refresh)).
 - **Status: Not registered** / `skipping outbound POST` in the log: expected, see [Registration status](#registration-status-and-the-outbound-webhook).
+- **Connect fails with "connected to SignalBricks in another organization".** The hub is connected in another SignalBricks organization; an admin there must disconnect it (hub page → **Disconnect**) first.
+- **Last connect error: SignalBricks could not verify this hub.** SignalBricks couldn't reach the app through Hubitat cloud with the new token. The app retries automatically (about 30 s, 2 min and 5 min after the failure); if *all 3 automatic retries failed*, check the hub's cloud connection and click **Done** to try again (within 10 minutes of connecting, otherwise **Reconnect to SignalBricks**).
+- **Last connect error: Registration failed.** SignalBricks couldn't be reached or refused the registration; click **Done** to retry, or **Reconnect to SignalBricks**.
+- **"SignalBricks disconnected this hub".** The hub was disconnected on its SignalBricks hub page; click **Connect to SignalBricks** to connect it again.
 
 ## Development
 

@@ -27,6 +27,9 @@ abstract class HubitatStub extends Script {
     void paragraph(String s) { paragraphs << s }
     void input(Map m) {}
     void href(Map m) {}
+    def app = [id: 1]
+    def location = [name: 'Test', hub: [name: 'Hub']]
+    String getHubUID() { 'hub-fake' }
     String getFullApiServerUrl() { 'https://cloud.test/api/hub/apps/1' }
     String getFullLocalApiServerUrl() { 'http://hub.local/apps/api/1' }
     void runIn(Number secs, String handler, Map opts = [:]) { scheduled << [secs: secs, handler: handler, data: opts?.data] }

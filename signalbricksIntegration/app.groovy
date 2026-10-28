@@ -3,11 +3,17 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.3.7' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.0' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
 String getSbAppNameAndVersion() { sbAppName + ' ' + sbAppVersion }
+// Connect to SignalBricks (#34): OAuth 2.0 authorization code with PKCE (S256) through
+// Hubitat's cloud stateredirect, SignalBricks as the provider. Public client (this source
+// is public): no client secret.
+String getSbPortalUrl() { 'https://app.signalbricks.co' }
+String getSbOauthClientId() { 'signalbricks-hubitat-integration' }
+String getSbStateRedirect() { 'https://cloud.hubitat.com/oauth/stateredirect' }
 
 import groovy.json.JsonOutput
 
@@ -18,7 +24,7 @@ definition(
     author: 'SignalBricks',
     description: 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to your locks. Runs alongside the OwnerRez app; give each app a different code name prefix.',
     category: 'Convenience', // Unused
-    oauth: true, // Unused
+    oauth: true, // Connect to SignalBricks and the dispatcher's endpoints
     iconUrl: '', // Unused
     iconX2Url: '', // Unused
     singleInstance: true,
@@ -66,7 +72,8 @@ preferences {
         }
 
         section(title: 'Connection') {
-            if (settings) { // Prevents this code from executing during app install, as it will error
+            // The hub runs this page with no state or settings while it saves the app code (#28)
+            if (settings && state != null) { // Prevents this code from executing during app install, as it will error
                 if (!settings.locks || settings.locks.length == 0) {
                     paragraph 'Please configure the locks before connecting to SignalBricks.'
                 }
@@ -74,15 +81,22 @@ preferences {
                     paragraph 'Please click "Done" to complete setup before connecting to SignalBricks.'
                 }
                 else {
-                    // Always show endpoint and access token for CLI configuration
-                    paragraph '<b>Cloud URL:</b> ' + fullApiServerUrl
-                    try {
-                        paragraph '<b>Local URL:</b> ' + fullLocalApiServerUrl
-                    } catch (e) {
-                        paragraph '<b>Local URL:</b> (not available)'
-                    }
-                    paragraph '<b>Access Token:</b> ' + state.accessToken
                     paragraph '<b>App Version:</b> ' + sbAppNameAndVersion
+                    sbConnectionStatus().each { paragraph it }
+                    if (state.sbCredential) {
+                        href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbConnectUrl(),
+                            description: 'Sign in again; replaces this app\'s access token and registers the new one')
+                        input(name: 'btnSbDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
+                        paragraph '<small>Disconnect tells SignalBricks to delete its copy of the access token, then replaces the token here, so the dispatcher can no longer reach this app.</small>'
+                    } else {
+                        href(name: 'hrefSbConnect', title: 'Connect to SignalBricks', style: 'external', url: sbConnectUrl(),
+                            description: 'Sign in as a SignalBricks door code admin and choose the property and hub')
+                        paragraph '<small>Connecting replaces this app\'s access token: a dispatcher still configured with the token below needs the new one (or reads it from SignalBricks once this hub is connected).</small>'
+                        // Manual configuration for a dispatcher that still reads hubitat.json
+                        paragraph '<b>Cloud URL:</b> ' + fullApiServerUrl
+                        paragraph '<b>Local URL:</b> ' + (sbLocalApiUrl() ?: '(not available)')
+                        paragraph '<b>Access Token:</b> ' + state.accessToken
+                    }
 
                     if (state.sbId) {
                         paragraph '<b>Status:</b> Connected (ID: ' + state.sbId + ')'
@@ -287,7 +301,11 @@ void appButtonHandler(String btnName) {
     log.debug "appButtonHandler: $btnName"
 
     switch (btnName) {
-        // Disconnect from SignalBricks
+        // Connect to SignalBricks (#34): revoke on the platform, then replace the access token
+        case 'btnSbDisconnect':
+            sbDisconnect()
+            break
+        // Disconnect from SignalBricks (legacy sbId registration)
         case 'btnDisconnect':
             state.accessToken = null
             state.sbId = null
@@ -298,6 +316,8 @@ void appButtonHandler(String btnName) {
         // Create/refresh access token (this will break the connection until the user reconnects)
         case 'btbAccessToken':
             state.accessToken = createAccessToken()
+            // SignalBricks needs the new token, or the dispatcher can't reach the app (#34)
+            if (state.sbCredential) sbRegister()
             break
         // Manually run the reconcileDoorCodes function
         case 'btnReconcile':
@@ -318,6 +338,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeRefresh = null
             atomicState.lastSync = null
             scheduleCodeRefresh()
+            sbRegisterRetryRearm()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
@@ -344,6 +365,14 @@ void appButtonHandler(String btnName) {
 
 // Mappings define the API endpoints
 mappings {
+    // Connect to SignalBricks (#34): Hubitat cloud forwards the OAuth `code` here (via the
+    // stateredirect `state`). Never log its params: they carry the code and the access token.
+    path('/oauthCallback') {
+        action: [
+            GET: 'oauthCallback',
+        ]
+    }
+
     // Set (or unset) the SignalBricks Id (ORLACT) state variable
     path('/register') {
         action: [
@@ -451,6 +480,9 @@ void updated() {
         state.lastVersion = sbAppVersion
     }
 
+    // Keep SignalBricks' copy of the URLs, version and token current
+    if (state.sbCredential) sbRegister()
+
     SyncState()
 }
 
@@ -501,6 +533,8 @@ void scheduleEvents(Map bookings) {
     // timer: put back only what the cadence and the running refresh need (#24)
     codeRefreshRearm()
     scheduleCodeRefresh()
+    // ...and a pending SignalBricks registration retry (#34)
+    sbRegisterRetryRearm()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -1369,6 +1403,7 @@ Map apiSync() {
 
         atomicState.bookings = helperGetBookings(request.JSON)
         atomicState.lastSync = [at: now(), source: 'PUT /sync']
+        sbReregisterIfVersionChanged()
         atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
@@ -1748,3 +1783,350 @@ List helperFindCodePositions(def lock, Map codes) {
 }
 
 // EOF
+
+// --- Connect to SignalBricks (#34) ---
+//
+// Contract (signalbricks/platform#623):
+// 1. Connect opens <portal>/oauth/hubitat-integration/authorize with client_id,
+//    redirect_uri=<Hubitat stateredirect>, response_type=code, PKCE S256 code_challenge,
+//    hub_uid, app_id, version, location and state=<hubUID>/apps/<appId>/oauthCallback?access_token=<token>.
+// 2. A SignalBricks door code admin picks the organization, property and hub; Hubitat
+//    cloud forwards the code to /oauthCallback.
+// 3. The callback replaces the access token (it travelled in the URL), exchanges the code
+//    at <portal>/oauth/hubitat-integration/token with the PKCE verifier for a connection
+//    credential, then registers hub UID, app id, version, hub name, local and cloud base
+//    URLs and the new access token at <portal>/oauth/hubitat-integration/register.
+// 4. Disconnect revokes the credential (<portal>/oauth/hubitat-integration/revoke) and
+//    replaces the access token.
+// SECURITY: the access token, the PKCE verifier, the state, the code and the credential
+// are never logged or shown; they only go to the https SignalBricks portal.
+
+// PKCE (RFC 7636): code_verifier = 96 hex chars from three random UUIDs (SecureRandom)
+String sbNewCodeVerifier() {
+    return (1..3).collect { UUID.randomUUID().toString().replace('-', '') }.join('')
+}
+
+// code_challenge = BASE64URL(SHA-256(verifier)) without padding (S256 only; never `plain`)
+String sbCodeChallenge(String verifier) {
+    byte[] digest = java.security.MessageDigest.getInstance('SHA-256').digest(verifier.getBytes('US-ASCII'))
+    return digest.encodeBase64().toString().replace('+', '-').replace('/', '_').replace('=', '')
+}
+
+// The authorize URL. It carries this app's access token in `state`: never log it.
+String sbConnectUrl() {
+    if (state == null || !state.accessToken) return null
+    // One verifier per connect attempt, kept until the callback uses it, so page
+    // re-renders don't invalidate a link the user already opened
+    if (!state.sbPkceVerifier) state.sbPkceVerifier = sbNewCodeVerifier()
+    String stateRedirect = URLEncoder.encode("${hubUID}/apps/${app.id}/oauthCallback?access_token=${state.accessToken}", 'UTF-8')
+    Map query = [
+        client_id: sbOauthClientId,
+        redirect_uri: sbStateRedirect,
+        response_type: 'code',
+        code_challenge: sbCodeChallenge(state.sbPkceVerifier),
+        code_challenge_method: 'S256',
+        hub_uid: hubUID,
+        app_id: app.id.toString(),
+        version: sbAppVersion,
+        location: location?.name ?: '',
+    ]
+    String qs = query.collect { k, v -> "${k}=${URLEncoder.encode(v.toString(), 'UTF-8')}" }.join('&')
+    return "${sbPortalUrl}/oauth/hubitat-integration/authorize?${qs}&state=${stateRedirect}"
+}
+
+// Status lines for the app page; names only, never a token
+List sbConnectionStatus() {
+    if (state == null) return []
+    List lines = []
+    if (state.sbConnected) {
+        String to = [state.sbOrgName, state.sbHubName].findAll { it }.collect { bookingsEsc(it) }.join(' &rarr; ')
+        lines << "<b>SignalBricks:</b> Connected${to ? ' to ' + to : ''}${state.sbConnectedAt ? ' since ' + bookingsEsc(state.sbConnectedAt) : ''}"
+    } else if (state.sbCredential) {
+        lines << '<b>SignalBricks:</b> Authorized, not registered yet (click Done to retry, or Reconnect)'
+    } else {
+        lines << '<b>SignalBricks:</b> Not connected'
+    }
+    if (state.sbLastError) lines << "<b>Last connect error:</b> ${bookingsEsc(state.sbLastError)}"
+    String retry = sbRegisterRetryStatus()
+    if (retry) lines << retry
+    return lines
+}
+
+String sbLocalApiUrl() {
+    try {
+        return fullLocalApiServerUrl
+    } catch (e) {
+        return null
+    }
+}
+
+// Never log `params` here: it carries the authorization code and the access token.
+def oauthCallback() {
+    String code = params?.code
+    String error = params?.error
+    String verifier = state.sbPkceVerifier
+    // Single use: the next connect attempt gets a fresh verifier
+    state.remove('sbPkceVerifier')
+    // The access token travelled in the authorize URL's state, so copies can sit in proxy
+    // logs: replace it whatever happens next. SignalBricks gets the new one below.
+    state.accessToken = createAccessToken()
+
+    String message = null
+    if (error || !code) {
+        state.sbLastError = "SignalBricks did not authorize this hub (${error ?: 'no authorization code'})"
+        message = state.sbLastError + '. You can close this window and try again from the app.'
+    } else if (!verifier) {
+        state.sbLastError = 'Connect session expired; start again from the app'
+        message = 'This connect link is no longer valid. Close this window and click Connect to SignalBricks again in the app.'
+    } else {
+        sbExchangeCode(code, verifier)
+    }
+    boolean authorized = !message && !state.sbLastError
+    // Register the new token: with the new credential, or (failed exchange) the one held before.
+    // In the background: SignalBricks verifies the token by calling this app's /info through
+    // Hubitat cloud, which can't run until this callback has returned (the app is single-threaded).
+    if (state.sbCredential) sbRegister()
+
+    if (!message) {
+        message = authorized
+            ? 'SignalBricks authorized this hub. The app is registering with SignalBricks now: reopen the app in a few seconds to see Connected. You can close this window.'
+            : "Could not complete the connection (${state.sbLastError ?: 'unknown error'}). Close this window and try again from the app."
+    }
+    log.info "${sbAppNameAndVersion}: ${authorized ? 'authorized by SignalBricks, registering' : 'SignalBricks connect failed'}"
+    return sbRenderPage(authorized ? 'Connecting' : 'Not connected', bookingsEsc(message))
+}
+
+// Token step: the code + PKCE verifier for the connection credential
+void sbExchangeCode(String code, String verifier) {
+    Map params = [
+        uri: "${sbPortalUrl}/oauth/hubitat-integration/token",
+        requestContentType: 'application/json',
+        contentType: 'application/json',
+        body: JsonOutput.toJson([
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: sbStateRedirect,
+            client_id: sbOauthClientId,
+            code_verifier: verifier,
+        ]),
+        timeout: 20,
+    ]
+    try {
+        httpPost(params) { resp ->
+            Map body = resp.data instanceof Map ? resp.data : [:]
+            if (resp.status == 200 && body.access_token) {
+                state.sbCredential = body.access_token
+                state.sbOrgName = body.organization_name
+                state.sbHubName = body.hub_name
+                state.sbConnected = false
+                state.remove('sbLastError')
+            } else {
+                state.sbLastError = "Token exchange returned HTTP ${resp.status}"
+            }
+        }
+    } catch (Exception e) {
+        // Only the status / class name: the request carried the code and the verifier
+        Integer status = sbHttpStatus(e)
+        state.sbLastError = status == 409
+            ? 'This hub is connected to SignalBricks in another organization; disconnect it there first'
+            : "Token exchange failed (${status ? 'HTTP ' + status : e.class.simpleName})"
+    }
+}
+
+// The registration body: carries the access token, never log it
+Map sbRegistrationBody() {
+    return [
+        hubUid: hubUID,
+        appId: app.id.toString(),
+        version: sbAppVersion,
+        hubName: location?.hub?.name,
+        localUrl: sbLocalApiUrl(),
+        cloudUrl: fullApiServerUrl,
+        appAccessToken: state.accessToken,
+    ]
+}
+
+Map sbRegisterParams() {
+    return [
+        uri: "${sbPortalUrl}/oauth/hubitat-integration/register",
+        requestContentType: 'application/json',
+        contentType: 'application/json',
+        headers: [Authorization: "Bearer ${state.sbCredential}"],
+        body: JsonOutput.toJson(sbRegistrationBody()),
+        timeout: 15,
+    ]
+}
+
+// Register with SignalBricks, always in the background: SignalBricks verifies the token by
+// calling this app's /info, which must be able to run while the registration is pending
+void sbRegister(boolean retry = false) {
+    if (!state.sbCredential || !state.accessToken) return
+    if (!retry) {
+        // A fresh registration starts a fresh retry sequence
+        atomicState.sbRegisterRetry = null
+        unschedule('sbRegisterRetryRun')
+    }
+    state.sbRegisterAttemptAt = now()
+    asynchttpPost('sbRegisterCallback', sbRegisterParams())
+}
+
+// Automatic retries of a registration that failed for a reason that may pass (not verified
+// yet, SignalBricks or Hubitat cloud unavailable, timeout): after about 30 s, 2 min and 5 min,
+// all within the 10 minutes an unverified connection stays valid. Stops on 200, 401 or 409.
+List getSbRegisterRetrySeconds() { [30, 120, 300] }
+
+void sbScheduleRegisterRetry() {
+    int attempt = ((atomicState.sbRegisterRetry?.attempt ?: 0) as int) + 1
+    if (attempt > sbRegisterRetrySeconds.size()) {
+        atomicState.sbRegisterRetry = [attempt: attempt - 1, exhausted: true]
+        unschedule('sbRegisterRetryRun')
+        return
+    }
+    int delay = sbRegisterRetrySeconds[attempt - 1]
+    // Kept in atomicState with its due time, so an app-wide unschedule() (scheduleEvents on
+    // every booking sync, Reset State) can put the timer back: see sbRegisterRetryRearm()
+    atomicState.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L]
+    runIn(delay, 'sbRegisterRetryRun', [overwrite: true])
+}
+
+// unschedule() removed a pending registration retry's timer; put it back for the time left
+void sbRegisterRetryRearm() {
+    Map r = atomicState?.sbRegisterRetry
+    // An in-flight retry is answered by sbRegisterCallback, which schedules the next one
+    if (!r || r.exhausted || r.inFlight || !state.sbCredential) return
+    long left = (long) (((r.at as long) - now()) / 1000)
+    runIn(Math.max(left, 5L), 'sbRegisterRetryRun', [overwrite: true])
+}
+
+void sbRegisterRetryRun() {
+    Map r = atomicState.sbRegisterRetry
+    if (!state.sbCredential || !r || r.exhausted || r.inFlight) return
+    // In flight until the answer arrives: a sync meanwhile must not re-arm a duplicate
+    atomicState.sbRegisterRetry = [attempt: r.attempt, inFlight: true]
+    sbRegister(true)
+}
+
+// Worth retrying: not verified yet (403), rate limited (429), the request timed out (408,
+// how Hubitat reports an async timeout), SignalBricks or Hubitat cloud failing (5xx), or no
+// answer at all. Any other 4xx won't change by retrying.
+boolean sbRegisterRetryable(Integer status) {
+    return !status || status in [403, 408, 429] || status >= 500
+}
+
+// The retry line for the app page, or null
+String sbRegisterRetryStatus() {
+    // The hub renders the page with no state while it saves the code (#28)
+    if (state == null || atomicState == null) return null
+    Map r = atomicState.sbRegisterRetry
+    if (!r) return null
+    int total = sbRegisterRetrySeconds.size()
+    if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
+    if (r.inFlight) return "<b>Registration retries:</b> retry ${r.attempt} of ${total} in progress"
+    String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
+    return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
+}
+
+void sbRegisterCallback(resp, Map data) {
+    Map body = [:]
+    try {
+        if (resp.status == 200) body = parseJson(resp.data ?: '{}') ?: [:]
+    } catch (Exception e) {
+        body = [:]
+    }
+    sbRegistered(resp.status as Integer, body)
+}
+
+void sbRegistered(Integer status, Map body, String failure = null) {
+    String why = status ? "HTTP ${status}" : (failure ?: 'no response')
+    if (state.sbCredential && sbRegisterRetryable(status)) {
+        sbScheduleRegisterRetry()
+    } else {
+        // 200, 401, 409 or another 4xx: no (more) retries
+        atomicState.sbRegisterRetry = null
+        unschedule('sbRegisterRetryRun')
+    }
+    if (status == 200) {
+        state.sbConnected = true
+        if (body.organization_name) state.sbOrgName = body.organization_name
+        if (body.hub_name) state.sbHubName = body.hub_name
+        if (!state.sbConnectedAt) state.sbConnectedAt = new Date().format('yyyy-MM-dd HH:mm', location?.timeZone ?: TimeZone.getDefault())
+        state.sbRegisteredVersion = sbAppVersion
+        state.remove('sbLastError')
+    } else if (status == 401) {
+        // SignalBricks no longer knows this credential (disconnected on the portal, or not
+        // registered within 10 minutes of connecting)
+        sbForgetConnection()
+        state.sbLastError = 'SignalBricks disconnected this hub; click Connect to SignalBricks to connect again'
+        log.warn "${sbAppNameAndVersion}: SignalBricks no longer recognises this hub's connection"
+    } else if (status == 403) {
+        state.sbLastError = 'SignalBricks could not verify this hub through Hubitat cloud (is the hub online with cloud access?)'
+        log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub not verified)"
+    } else if (status == 409) {
+        state.sbLastError = 'This hub is connected to SignalBricks in another organization; disconnect it there first'
+        log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub connected in another organization)"
+    } else {
+        state.sbLastError = "Registration failed (${why})"
+        log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (${why})"
+    }
+}
+
+// After an update (HPM doesn't run updated()), re-register so SignalBricks shows the new
+// version: at most every 30 minutes, from the dispatcher's full sync
+void sbReregisterIfVersionChanged() {
+    if (!state.sbCredential || state.sbRegisteredVersion == sbAppVersion) return
+    if (state.sbRegisterAttemptAt && now() - (state.sbRegisterAttemptAt as long) < 30L * 60 * 1000) return
+    sbRegister()
+}
+
+// Disconnect: revoke on SignalBricks, then replace the access token SignalBricks held
+void sbDisconnect() {
+    boolean revokeFailed = false
+    if (state.sbCredential) {
+        try {
+            httpPost([
+                uri: "${sbPortalUrl}/oauth/hubitat-integration/revoke",
+                requestContentType: 'application/json',
+                contentType: 'application/json',
+                headers: [Authorization: "Bearer ${state.sbCredential}"],
+                body: '{}',
+                timeout: 15,
+            ]) { resp -> }
+        } catch (Exception e) {
+            // Disconnect here anyway: the token SignalBricks holds is replaced below
+            Integer status = sbHttpStatus(e)
+            revokeFailed = true
+            log.warn "${sbAppNameAndVersion}: SignalBricks revoke failed (${status ? 'HTTP ' + status : e.class.simpleName}); disconnected here"
+        }
+    }
+    sbForgetConnection()
+    state.remove('sbLastError')
+    if (revokeFailed) {
+        state.sbLastError = 'Could not reach SignalBricks to disconnect. The app is disconnected here; also click Disconnect on this hub\'s SignalBricks hub page'
+    }
+    state.accessToken = createAccessToken()
+    log.info "${sbAppNameAndVersion}: disconnected from SignalBricks"
+}
+
+void sbForgetConnection() {
+    unschedule('sbRegisterRetryRun')
+    atomicState.sbRegisterRetry = null
+    ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier'].each {
+        state.remove(it)
+    }
+}
+
+Integer sbHttpStatus(Exception e) {
+    try {
+        return e.response?.status as Integer
+    } catch (Exception ignored) {
+        return null
+    }
+}
+
+Map sbRenderPage(String title, String message) {
+    String html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${sbAppName}</title></head>
+<body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
+<h2>${sbAppName}: ${title}</h2><p>${message}</p></body></html>"""
+    return render(contentType: 'text/html', data: html, status: 200)
+}
