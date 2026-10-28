@@ -2,7 +2,8 @@
 // sandbox: the authorize URL (PKCE S256, stateredirect), the OAuth callback (token
 // exchange, access token replaced, registration), reconnect, disconnect (revoke), a
 // portal-side disconnect, re-registering after an update, the app page in each state
-// and while the hub saves the code, and that no secret is ever logged.
+// (one Status line, no legacy registration block, header-style section titles on the
+// main and debug pages) and while the hub saves the code, and that no secret is ever logged.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -29,6 +30,7 @@ abstract class HubitatStub extends Script {
     List logged = []
     def log = [info: { logged << it.toString() }, warn: { logged << it.toString() }, debug: { logged << it.toString() }, trace: { logged << it.toString() }, error: { logged << it.toString() }]
     List paragraphs = []
+    List sectionTitles = []
     List hrefs = []
     Map inputs = [:]
     List http = []
@@ -42,7 +44,11 @@ abstract class HubitatStub extends Script {
     Closure pages
     void page(Map m, Closure c = null) { if (c) c() }
     def dynamicPage(Map m, Closure c) { c() }
-    void section(Object... args) { args.find { it instanceof Closure }?.call() }
+    void section(Object... args) {
+        def m = args.find { it instanceof Map }
+        if (m?.title) sectionTitles << m.title
+        args.find { it instanceof Closure }?.call()
+    }
     void paragraph(String s) { paragraphs << s }
     void input(Map m) { inputs[m.name] = m }
     void href(Map m) { hrefs << m }
@@ -86,14 +92,16 @@ app.run()
 
 int fails = 0
 def check = { String label, boolean ok -> println((ok ? 'PASS ' : 'FAIL ') + label); if (!ok) fails++ }
-def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.inputs.clear(); app.pages(); app.paragraphs.join('\n') }
+def mainPage = { app.paragraphs.clear(); app.sectionTitles.clear(); app.hrefs.clear(); app.inputs.clear(); app.pages(); app.paragraphs.join('\n') }
+// Exactly one Status line, and none of the legacy sbId registration block (#36)
+def oneStatus = { String p -> p.count('<b>Status:</b>') == 1 && !p.contains('SignalBricks:</b>') && !p.contains('add-hub') && !p.contains('Not registered') && !p.contains('App Version') && !app.inputs.btnDisconnect }
 def qs = { String url -> new URI(url).rawQuery.split('&').collectEntries { it.split('=', 2).with { [(it[0]): URLDecoder.decode(it[1], 'UTF-8')] } } }
 def b64url = { String v -> MessageDigest.getInstance('SHA-256').digest(v.getBytes('US-ASCII')).encodeBase64().toString().replace('+', '-').replace('/', '_').replace('=', '') }
 def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.0', app.sbAppVersion == '1.4.0')
+check('version is 1.4.1', app.sbAppVersion == '1.4.1')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -113,7 +121,10 @@ String firstToken = app.state.accessToken
 secrets << firstToken
 String page = mainPage()
 def connect = app.hrefs.find { it.name == 'hrefSbConnect' }
-check('page: Not connected status', page.contains('<b>SignalBricks:</b> Not connected'))
+check('page: Not connected status', page.contains('<b>Status:</b> Not connected') && oneStatus(page))
+check('page: every main page section title is a header', app.sectionTitles == ['<h2>Configuration</h2>', '<h2>Door code refresh</h2>', '<h2>Connection</h2>', '<h2>Diagnostics</h2>'])
+app.sectionTitles.clear(); app.debug()
+check('debug page: every section title is a header', app.sectionTitles == ['<h2>Actions</h2>', '<h2>Door code refresh</h2>', '<h2>Links</h2>'])
 check('page: Connect to SignalBricks link', connect?.title == 'Connect to SignalBricks' && connect?.style == 'external')
 check('page: manual URLs and token still shown while not connected', page.contains('<b>Cloud URL:</b>') && page.contains('<b>Local URL:</b> http://192.168.1.10/apps/api/42') && page.contains(firstToken))
 check('page: no Disconnect while not connected', !app.inputs.btnSbDisconnect)
@@ -124,7 +135,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.0' && q.location == 'Ross Farm House')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.1' && q.location == 'Ross Farm House')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -146,14 +157,18 @@ secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.0', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.1', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
-check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && mainPage().contains('Authorized, not registered yet'))
+page = mainPage()
+check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.0')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.1')
 
 page = mainPage()
-check('page: Connected to org and hub', page.contains('<b>SignalBricks:</b> Connected to Ross Farm House &rarr; Main'))
+check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
+app.state.sbId = 'sb-legacy-fake'
+check('page: a legacy sbId adds no second status or Disconnect', oneStatus(mainPage()))
+app.state.sbId = null
 check('page: Reconnect and Disconnect when connected', app.hrefs.any { it.name == 'hrefSbReconnect' } && app.inputs.btnSbDisconnect)
 check('page: no access token or credential shown when connected', !page.contains(app.state.accessToken) && !page.contains(CREDENTIAL))
 
@@ -218,7 +233,7 @@ app.appButtonHandler('btnSbDisconnect')
 def revokeCall = app.http.find { it.uri.endsWith('/oauth/hubitat-integration/revoke') }
 check('disconnect: revoke with the Bearer credential', revokeCall?.headers?.Authorization == "Bearer ${CREDENTIAL}".toString())
 check('disconnect: state forgotten and token replaced', !app.state.sbCredential && !app.state.sbConnected && app.state.accessToken != beforeDisconnect)
-check('disconnect: page shows Not connected again', mainPage().contains('<b>SignalBricks:</b> Not connected'))
+check('disconnect: page shows Not connected again', mainPage().contains('<b>Status:</b> Not connected'))
 app.replies['/oauth/hubitat-integration/revoke'] = 503
 app.state.sbCredential = CREDENTIAL
 app.appButtonHandler('btnSbDisconnect')
@@ -230,7 +245,10 @@ secrets << app.state.accessToken
 app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.sbRegistered(401, [:])
-check('401: connection forgotten, page explains', !app.state.sbCredential && mainPage().contains('SignalBricks disconnected this hub'))
+page = mainPage()
+int statusAt = app.paragraphs.findIndexOf { it.startsWith('<b>Status:</b>') }
+check('401: connection forgotten, page explains under the one Status line', !app.state.sbCredential && oneStatus(page) &&
+    app.paragraphs[statusAt + 1].startsWith('<b>Last connect error:</b> SignalBricks disconnected this hub'))
 app.state.sbCredential = CREDENTIAL
 app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
 check('403: could not verify through Hubitat cloud, credential kept for a retry', app.state.sbCredential && mainPage().contains('could not verify this hub'))
@@ -312,7 +330,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.0'
+app.state.sbRegisteredVersion = '1.4.1'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -324,7 +342,7 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.0' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.1' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text
