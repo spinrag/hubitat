@@ -49,7 +49,7 @@ abstract class HubitatStub extends Script {
     long now() { clock }
     String getHubUID() { '00000000-0000-4000-8000-0000000000aa' }
     String getFullApiServerUrl() { "https://cloud.hubitat.com/api/${hubUID}/apps/42" }
-    String getFullLocalApiServerUrl() { 'http://192.0.2.10/apps/api/42' }
+    String getFullLocalApiServerUrl() { 'http://192.168.1.10/apps/api/42' }
     void runIn(Number secs, String handler, Map opts = [:]) {}
     void runOnce(Date d, String handler, Map opts = [:]) {}
     void schedule(String cron, String handler) {}
@@ -111,7 +111,7 @@ String page = mainPage()
 def connect = app.hrefs.find { it.name == 'hrefSbConnect' }
 check('page: Not connected status', page.contains('<b>SignalBricks:</b> Not connected'))
 check('page: Connect to SignalBricks link', connect?.title == 'Connect to SignalBricks' && connect?.style == 'external')
-check('page: manual URLs and token still shown while not connected', page.contains('<b>Cloud URL:</b>') && page.contains('<b>Local URL:</b> http://192.0.2.10/apps/api/42') && page.contains(firstToken))
+check('page: manual URLs and token still shown while not connected', page.contains('<b>Cloud URL:</b>') && page.contains('<b>Local URL:</b> http://192.168.1.10/apps/api/42') && page.contains(firstToken))
 check('page: no Disconnect while not connected', !app.inputs.btnSbDisconnect)
 
 Map q = qs(connect.url)
@@ -135,15 +135,18 @@ app.params = [code: 'fake-auth-code-1', access_token: firstToken]
 def result = app.oauthCallback()
 def tokenCall = app.http.find { it.uri.endsWith('/token') }
 def registerCall = app.http.find { it.uri.endsWith('/register') }
-check('callback: renders Connected', result.data.contains('Connected') && !result.data.contains('Not connected'))
+check('callback: renders Connecting (registration runs in the background)', result.data.contains('Connecting') && !result.data.contains('Not connected'))
 check('callback: token exchange with the code and the verifier over https', tokenCall.uri.startsWith('https://') && body(tokenCall) == [grant_type: 'authorization_code', code: 'fake-auth-code-1', redirect_uri: 'https://cloud.hubitat.com/oauth/stateredirect', client_id: 'signalbricks-hubitat-integration', code_verifier: verifier])
 check('callback: the access token from the URL is replaced', app.state.accessToken != firstToken)
 secrets << app.state.accessToken
 Map reg = body(registerCall)
-check('register: Bearer credential over https', registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.0', hubName: 'Main Hub', localUrl: 'http://192.0.2.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
+    registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.0', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
-check('callback: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.0')
+check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && mainPage().contains('Authorized, not registered yet'))
+app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.0')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>SignalBricks:</b> Connected to Ross Farm House &rarr; Main'))
@@ -216,6 +219,7 @@ app.replies['/oauth/hubitat-integration/revoke'] = 503
 app.state.sbCredential = CREDENTIAL
 app.appButtonHandler('btnSbDisconnect')
 check('disconnect: a failed revoke still disconnects here', !app.state.sbCredential && app.logged.any { it.contains('revoke failed (HTTP 503)') })
+check('disconnect: a failed revoke tells the user to disconnect on the SignalBricks hub page too', mainPage().contains("also click Disconnect on this hub's SignalBricks hub page"))
 secrets << app.state.accessToken
 
 // --- Portal-side disconnect: the next registration gets 401 ---
@@ -223,6 +227,19 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.sbRegistered(401, [:])
 check('401: connection forgotten, page explains', !app.state.sbCredential && mainPage().contains('SignalBricks disconnected this hub'))
+app.state.sbCredential = CREDENTIAL
+app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
+check('403: could not verify through Hubitat cloud, credential kept for a retry', app.state.sbCredential && mainPage().contains('could not verify this hub'))
+app.sbRegisterCallback([status: 409, data: '{"error":"hub_bound_elsewhere"}'], null)
+check('409 on register: another organization', mainPage().contains('another organization'))
+
+// --- Refresh Access Token (Debug) re-registers the new token ---
+app.http.clear()
+String beforeRefresh = app.state.accessToken
+app.appButtonHandler('btbAccessToken')
+def refreshed = app.http.find { it.async == 'sbRegisterCallback' }
+check('refresh access token: new token registered', app.state.accessToken != beforeRefresh && refreshed && body(refreshed).appAccessToken == app.state.accessToken)
+secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL

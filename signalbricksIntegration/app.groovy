@@ -316,6 +316,8 @@ void appButtonHandler(String btnName) {
         // Create/refresh access token (this will break the connection until the user reconnects)
         case 'btbAccessToken':
             state.accessToken = createAccessToken()
+            // SignalBricks needs the new token, or the dispatcher can't reach the app (#34)
+            if (state.sbCredential) sbRegister()
             break
         // Manually run the reconcileDoorCodes function
         case 'btnReconcile':
@@ -478,7 +480,7 @@ void updated() {
     }
 
     // Keep SignalBricks' copy of the URLs, version and token current
-    if (state.sbCredential) sbRegister(false)
+    if (state.sbCredential) sbRegister()
 
     SyncState()
 }
@@ -1874,20 +1876,19 @@ def oauthCallback() {
     } else {
         sbExchangeCode(code, verifier)
     }
-    String failure = state.sbLastError
-    // Register the new token: with the new credential, or (failed exchange) the one held before
-    if (state.sbCredential) sbRegister(true)
-    // A registration with the old credential keeps the dispatcher working, but the connect failed
-    if (failure && !state.sbLastError) state.sbLastError = failure
+    boolean authorized = !message && !state.sbLastError
+    // Register the new token: with the new credential, or (failed exchange) the one held before.
+    // In the background: SignalBricks verifies the token by calling this app's /info through
+    // Hubitat cloud, which can't run until this callback has returned (the app is single-threaded).
+    if (state.sbCredential) sbRegister()
 
-    boolean ok = state.sbConnected && !state.sbLastError
     if (!message) {
-        message = ok
-            ? 'This hub is now connected to SignalBricks. You can close this window and return to the app.'
+        message = authorized
+            ? 'SignalBricks authorized this hub. The app is registering with SignalBricks now: reopen the app in a few seconds to see Connected. You can close this window.'
             : "Could not complete the connection (${state.sbLastError ?: 'unknown error'}). Close this window and try again from the app."
     }
-    log.info "${sbAppNameAndVersion}: ${ok ? 'connected to SignalBricks' : 'SignalBricks connect failed'}"
-    return sbRenderPage(ok ? 'Connected' : 'Not connected', bookingsEsc(message))
+    log.info "${sbAppNameAndVersion}: ${authorized ? 'authorized by SignalBricks, registering' : 'SignalBricks connect failed'}"
+    return sbRenderPage(authorized ? 'Connecting' : 'Not connected', bookingsEsc(message))
 }
 
 // Token step: the code + PKCE verifier for the connection credential
@@ -1951,20 +1952,12 @@ Map sbRegisterParams() {
     ]
 }
 
-// Register with SignalBricks: synchronously from the OAuth callback (to show the result),
-// otherwise in the background
-void sbRegister(boolean sync) {
+// Register with SignalBricks, always in the background: SignalBricks verifies the token by
+// calling this app's /info, which must be able to run while the registration is pending
+void sbRegister() {
     if (!state.sbCredential || !state.accessToken) return
     state.sbRegisterAttemptAt = now()
-    if (!sync) {
-        asynchttpPost('sbRegisterCallback', sbRegisterParams())
-        return
-    }
-    try {
-        httpPost(sbRegisterParams()) { resp -> sbRegistered(resp.status as Integer, resp.data instanceof Map ? resp.data : [:]) }
-    } catch (Exception e) {
-        sbRegistered(sbHttpStatus(e) ?: 0, [:], e.class.simpleName)
-    }
+    asynchttpPost('sbRegisterCallback', sbRegisterParams())
 }
 
 void sbRegisterCallback(resp, Map data) {
@@ -1987,10 +1980,17 @@ void sbRegistered(Integer status, Map body, String failure = null) {
         state.sbRegisteredVersion = sbAppVersion
         state.remove('sbLastError')
     } else if (status == 401) {
-        // SignalBricks no longer knows this credential (disconnected on the portal)
+        // SignalBricks no longer knows this credential (disconnected on the portal, or not
+        // registered within 10 minutes of connecting)
         sbForgetConnection()
         state.sbLastError = 'SignalBricks disconnected this hub; click Connect to SignalBricks to connect again'
         log.warn "${sbAppNameAndVersion}: SignalBricks no longer recognises this hub's connection"
+    } else if (status == 403) {
+        state.sbLastError = 'SignalBricks could not verify this hub through Hubitat cloud (is the hub online with cloud access?); click Done to retry'
+        log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub not verified)"
+    } else if (status == 409) {
+        state.sbLastError = 'This hub is connected to SignalBricks in another organization; disconnect it there first'
+        log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub connected in another organization)"
     } else {
         state.sbLastError = "Registration failed (${why})"
         log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (${why})"
@@ -2002,11 +2002,12 @@ void sbRegistered(Integer status, Map body, String failure = null) {
 void sbReregisterIfVersionChanged() {
     if (!state.sbCredential || state.sbRegisteredVersion == sbAppVersion) return
     if (state.sbRegisterAttemptAt && now() - (state.sbRegisterAttemptAt as long) < 30L * 60 * 1000) return
-    sbRegister(false)
+    sbRegister()
 }
 
 // Disconnect: revoke on SignalBricks, then replace the access token SignalBricks held
 void sbDisconnect() {
+    boolean revokeFailed = false
     if (state.sbCredential) {
         try {
             httpPost([
@@ -2020,11 +2021,15 @@ void sbDisconnect() {
         } catch (Exception e) {
             // Disconnect here anyway: the token SignalBricks holds is replaced below
             Integer status = sbHttpStatus(e)
+            revokeFailed = true
             log.warn "${sbAppNameAndVersion}: SignalBricks revoke failed (${status ? 'HTTP ' + status : e.class.simpleName}); disconnected here"
         }
     }
     sbForgetConnection()
     state.remove('sbLastError')
+    if (revokeFailed) {
+        state.sbLastError = 'Could not reach SignalBricks to disconnect. The app is disconnected here; also click Disconnect on this hub\'s SignalBricks hub page'
+    }
     state.accessToken = createAccessToken()
     log.info "${sbAppNameAndVersion}: disconnected from SignalBricks"
 }
