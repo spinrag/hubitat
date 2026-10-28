@@ -50,11 +50,15 @@ abstract class HubitatStub extends Script {
     String getHubUID() { '00000000-0000-4000-8000-0000000000aa' }
     String getFullApiServerUrl() { "https://cloud.hubitat.com/api/${hubUID}/apps/42" }
     String getFullLocalApiServerUrl() { 'http://192.168.1.10/apps/api/42' }
-    void runIn(Number secs, String handler, Map opts = [:]) {}
+    List scheduled = []
+    void runIn(Number secs, String handler, Map opts = [:]) {
+        if (opts?.overwrite) scheduled.removeAll { it.handler == handler }
+        scheduled << [secs: secs, handler: handler]
+    }
     void runOnce(Date d, String handler, Map opts = [:]) {}
     void schedule(String cron, String handler) {}
-    void unschedule() {}
-    void unschedule(String handler) {}
+    void unschedule() { scheduled.clear() }
+    void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
     void unsubscribe() {}
     def parseJson(String s) { new JsonSlurper().parseText(s) }
@@ -232,6 +236,42 @@ app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
 check('403: could not verify through Hubitat cloud, credential kept for a retry', app.state.sbCredential && mainPage().contains('could not verify this hub'))
 app.sbRegisterCallback([status: 409, data: '{"error":"hub_bound_elsewhere"}'], null)
 check('409 on register: another organization', mainPage().contains('another organization'))
+
+// --- Automatic registration retries: 30 s, 2 min, 5 min; stop on 200 / 401 / 409 ---
+def retryJob = { app.scheduled.find { it.handler == 'sbRegisterRetryRun' } }
+// The hub scheduler runs the job (and it is no longer pending)
+def fireRetry = { app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }; app.sbRegisterRetryRun() }
+app.state.sbCredential = CREDENTIAL
+app.sbRegister()
+check('retry: a fresh registration clears any retry state', !app.state.sbRegisterRetry && !retryJob())
+app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
+check('retry: 403 schedules retry 1 after 30 s', retryJob()?.secs == 30 && mainPage().contains('retry 1 of 3'))
+app.http.clear()
+fireRetry()
+check('retry: the retry registers again in the background', app.http.count { it.async == 'sbRegisterCallback' } == 1)
+app.sbRegisterCallback([status: 502, data: null], null)
+check('retry: 5xx schedules retry 2 after 2 min', retryJob()?.secs == 120 && mainPage().contains('retry 2 of 3'))
+fireRetry()
+app.sbRegisterCallback([status: 408, data: null], null)
+check('retry: a timeout schedules retry 3 after 5 min', retryJob()?.secs == 300 && mainPage().contains('retry 3 of 3'))
+fireRetry()
+app.sbRegisterCallback([status: 503, data: null], null)
+check('retry: after 3 retries it stops and says so', !retryJob() && mainPage().contains('all 3 automatic retries failed'))
+app.http.clear()
+fireRetry()
+check('retry: no registration once retries are exhausted', app.http.isEmpty())
+app.sbRegister()
+app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
+fireRetry()
+app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
+check('retry: 200 stops the retries and connects', !retryJob() && !app.state.sbRegisterRetry && app.state.sbConnected && !mainPage().contains('Registration retries'))
+app.sbRegisterCallback([status: 500, data: null], null)
+app.sbRegisterCallback([status: 409, data: '{"error":"hub_bound_elsewhere"}'], null)
+check('retry: 409 stops the retries', !retryJob() && !app.state.sbRegisterRetry)
+app.sbRegisterCallback([status: 500, data: null], null)
+app.sbRegisterCallback([status: 401, data: '{}'], null)
+check('retry: 401 stops the retries and forgets the connection', !retryJob() && !app.state.sbRegisterRetry && !app.state.sbCredential)
+app.state.sbCredential = CREDENTIAL
 
 // --- Refresh Access Token (Debug) re-registers the new token ---
 app.http.clear()

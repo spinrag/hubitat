@@ -1844,6 +1844,8 @@ List sbConnectionStatus() {
         lines << '<b>SignalBricks:</b> Not connected'
     }
     if (state.sbLastError) lines << "<b>Last connect error:</b> ${bookingsEsc(state.sbLastError)}"
+    String retry = sbRegisterRetryStatus()
+    if (retry) lines << retry
     return lines
 }
 
@@ -1954,10 +1956,47 @@ Map sbRegisterParams() {
 
 // Register with SignalBricks, always in the background: SignalBricks verifies the token by
 // calling this app's /info, which must be able to run while the registration is pending
-void sbRegister() {
+void sbRegister(boolean retry = false) {
     if (!state.sbCredential || !state.accessToken) return
+    if (!retry) {
+        // A fresh registration starts a fresh retry sequence
+        state.remove('sbRegisterRetry')
+        unschedule('sbRegisterRetryRun')
+    }
     state.sbRegisterAttemptAt = now()
     asynchttpPost('sbRegisterCallback', sbRegisterParams())
+}
+
+// Automatic retries of a registration that failed for a reason that may pass (not verified
+// yet, SignalBricks or Hubitat cloud unavailable, timeout): after about 30 s, 2 min and 5 min,
+// all within the 10 minutes an unverified connection stays valid. Stops on 200, 401 or 409.
+List getSbRegisterRetrySeconds() { [30, 120, 300] }
+
+void sbScheduleRegisterRetry() {
+    int attempt = ((state.sbRegisterRetry?.attempt ?: 0) as int) + 1
+    if (attempt > sbRegisterRetrySeconds.size()) {
+        state.sbRegisterRetry = [attempt: attempt - 1, exhausted: true]
+        unschedule('sbRegisterRetryRun')
+        return
+    }
+    int delay = sbRegisterRetrySeconds[attempt - 1]
+    state.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L]
+    runIn(delay, 'sbRegisterRetryRun', [overwrite: true])
+}
+
+void sbRegisterRetryRun() {
+    if (!state.sbCredential || state.sbRegisterRetry?.exhausted) return
+    sbRegister(true)
+}
+
+// The retry line for the app page, or null
+String sbRegisterRetryStatus() {
+    Map r = state?.sbRegisterRetry
+    if (!r) return null
+    int total = sbRegisterRetrySeconds.size()
+    if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
+    String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
+    return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
 }
 
 void sbRegisterCallback(resp, Map data) {
@@ -1972,6 +2011,13 @@ void sbRegisterCallback(resp, Map data) {
 
 void sbRegistered(Integer status, Map body, String failure = null) {
     String why = status ? "HTTP ${status}" : (failure ?: 'no response')
+    if (status in [200, 401, 409]) {
+        state.remove('sbRegisterRetry')
+        unschedule('sbRegisterRetryRun')
+    } else if (state.sbCredential) {
+        // 403 (not verified yet), 5xx, timeout or no response: retry automatically
+        sbScheduleRegisterRetry()
+    }
     if (status == 200) {
         state.sbConnected = true
         if (body.organization_name) state.sbOrgName = body.organization_name
@@ -1986,7 +2032,7 @@ void sbRegistered(Integer status, Map body, String failure = null) {
         state.sbLastError = 'SignalBricks disconnected this hub; click Connect to SignalBricks to connect again'
         log.warn "${sbAppNameAndVersion}: SignalBricks no longer recognises this hub's connection"
     } else if (status == 403) {
-        state.sbLastError = 'SignalBricks could not verify this hub through Hubitat cloud (is the hub online with cloud access?); click Done to retry'
+        state.sbLastError = 'SignalBricks could not verify this hub through Hubitat cloud (is the hub online with cloud access?)'
         log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub not verified)"
     } else if (status == 409) {
         state.sbLastError = 'This hub is connected to SignalBricks in another organization; disconnect it there first'
@@ -2035,7 +2081,8 @@ void sbDisconnect() {
 }
 
 void sbForgetConnection() {
-    ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier'].each {
+    unschedule('sbRegisterRetryRun')
+    ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier', 'sbRegisterRetry'].each {
         state.remove(it)
     }
 }
