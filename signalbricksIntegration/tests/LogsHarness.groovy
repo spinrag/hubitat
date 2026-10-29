@@ -176,6 +176,30 @@ step('lock events (lockCodes webhook, failed code)') {
     def pos = app.atomicState.codeAssignments['1']?.keySet()?.first()
     app.codeChangedHandler([name: 'codeChanged', value: 'failed', data: JsonOutput.toJson([codeNumber: pos as int]), device: [id: '1']])
 }
+// A malformed body (a List, not a Map of bookings) makes the handler throw; the
+// exception message can list the body, code included (#38). Neither the logs nor
+// the 500 response may carry it: the class name and a fixed message only.
+String BAD_CODE = '80009900'
+secrets << BAD_CODE
+[
+    ['PUT /sync', 'apiSync', [:]],
+    ['PATCH /sync', 'apiSyncPatch', [:]],
+    ['PUT /sync/<id>/<lock>', 'apiSyncBookingByLock', [bookingId: '22', lockId: '1', access_token: TOKEN]],
+].each { String label, String handler, Map p ->
+    Map resp = null
+    String logsBad = step("${label} with a List body") {
+        app.params = p
+        app.request = [JSON: [[id: '22', guest: 'Hal', code: BAD_CODE, lockId: ['1'], checkIn: t - h, checkOut: t + h]]]
+        resp = app."${handler}"()
+    }
+    String body = resp?.data ?: ''
+    def error = body ? new JsonSlurper().parseText(body).error : null
+    check("${label} with a List body: 500 without the code in the response".toString(),
+        resp?.status == 500 && !body.contains(BAD_CODE) && error ==~ /${handler} failed \(\w+\)/)
+    check("${label} with a List body: logs the handler and exception class".toString(),
+        logsBad.contains("error ${error}"))
+}
+
 step('DELETE /sync/<id>/<lock> and /sync/<id>') {
     app.params = [bookingId: '66', lockId: '1', access_token: TOKEN]
     app.apiDeleteBookingByLock()

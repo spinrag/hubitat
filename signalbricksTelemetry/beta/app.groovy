@@ -67,7 +67,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.4.0'
+@Field static final String APP_VERSION = '1.4.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -1255,6 +1255,16 @@ Map writeRefusal(lock, Integer slot) {
     return null
 }
 
+// The driver threw on the first send of a change (#33). Only the class name:
+// the driver's message can carry the command's arguments, i.e. the code. The
+// caller holds nothing for it; the call goes back to its rate limit (limitKey).
+Map sendErrorResponse(String action, lock, String slots, Exception e, String limitKey) {
+    log.warn "SignalBricks Telemetry: ${action} on ${lock.displayName} slot ${slots} could not be sent (${e.class.simpleName})"
+    List times = (state[limitKey] ?: []) as List
+    if (times) state[limitKey] = times.take(times.size() - 1)
+    return jsonResponse([error: 'send_error', message: 'the lock driver refused the command'], 502)
+}
+
 // Body {slot, code, name, requestId?}. The hub verifies the change and
 // reports a lock_code_result event; /slots shows the lock's current state.
 Map apiSetCode() {
@@ -1271,7 +1281,11 @@ Map apiSetCode() {
     if (changePendingOn(r.lock.id.toString(), r.slot, true)) return relocatePending()
     Map refusal = writeRefusal(r.lock, r.slot)
     if (refusal) return refusal
-    startCodeChange(r, 'set', name, code, rid.id)
+    try {
+        startCodeChange(r, 'set', name, code, rid.id)
+    } catch (Exception e) {
+        return sendErrorResponse('setCode', r.lock, "${r.slot}", e, 'writeTimes')
+    }
     log.info "SignalBricks Telemetry: setCode requested on ${r.lock.displayName} slot ${r.slot}"
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
@@ -1295,7 +1309,11 @@ Map apiDeleteCode() {
     if (changePendingOn(r.lock.id.toString(), r.slot, true)) return relocatePending()
     Map refusal = writeRefusal(r.lock, r.slot)
     if (refusal) return refusal
-    startCodeChange(r, 'delete', r.currentName, null, rid.id)
+    try {
+        startCodeChange(r, 'delete', r.currentName, null, rid.id)
+    } catch (Exception e) {
+        return sendErrorResponse('deleteCode', r.lock, "${r.slot}", e, 'writeTimes')
+    }
     log.info "SignalBricks Telemetry: deleteCode requested on ${r.lock.displayName} slot ${r.slot}"
     return jsonResponse([lockId: r.lock.id.toString(), slot: r.slot, status: 'pending', requestId: rid.id], 202)
 }
@@ -1320,10 +1338,17 @@ Map apiRetryCode() {
         if (r.error != 'lock_codes_unreadable') finishCodeChange(p, 'failed', r.error, p.status == 'pending')
         return r.response
     }
+    Boolean wasPending = p.status == 'pending'
     p.attempts = 0
     p.status = 'pending'
     p.remove('reason')
-    sendCodeChange(p, lock)
+    try {
+        sendCodeChange(p, lock)
+    } catch (Exception e) {
+        // Dropped (with its code), as when a scheduled re-send throws.
+        finishCodeChange(p, 'failed', 'send_error', wasPending)
+        return sendErrorResponse("${p.action} retry", lock, "${slot}", e, 'retryTimes')
+    }
     log.info "SignalBricks Telemetry: ${p.action} retry requested on ${lock.displayName} slot ${slot}"
     return jsonResponse([lockId: p.lockId, slot: slot, action: p.action, status: 'pending', requestId: p.requestId], 202)
 }
@@ -1442,12 +1467,8 @@ Map apiRelocateCode() {
     try {
         sendCodeChange(p, r.lock)
     } catch (Exception e) {
-        // Only the class name: the driver's message can carry the code. The
-        // change was never stored, so give the write back to the limit.
-        log.warn "SignalBricks Telemetry: relocate on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot} could not be sent (${e.class.simpleName})"
-        List times = (state.writeTimes ?: []) as List
-        if (times) state.writeTimes = times.take(times.size() - 1)
-        return jsonResponse([error: 'send_error', message: 'the lock driver refused the command'], 502)
+        // The change was never stored.
+        return sendErrorResponse('relocate', r.lock, "${r.fromSlot} -> ${r.slot}", e, 'writeTimes')
     }
     log.info "SignalBricks Telemetry: relocate requested on ${r.lock.displayName} slot ${r.fromSlot} -> ${r.slot}"
     return jsonResponse([lockId: lockId, fromSlot: r.fromSlot, toSlot: r.slot, status: 'pending', requestId: rid.id], 202)
@@ -1574,14 +1595,23 @@ long secondsUntil(long atMs) {
     return Math.max(1L, (long) Math.ceil((atMs - now()) / 1000.0d))
 }
 
+// Throws when the driver does; then nothing is stored and the change it would
+// replace is left as it was (so it is reported superseded only after the send).
 void startCodeChange(Map r, String action, String name, String code, String requestId) {
     expirePendingCodeChanges()
     String lockId = r.lock.id.toString()
     Map old = pendingCodeChanges()[pendingKey(lockId, r.slot)]
-    if (old?.status == 'pending' && old.requestId != requestId) reportCodeResult(old, 'superseded', null)
     Map p = [lockId: lockId, slot: r.slot, action: action, name: name, prevName: r.currentName, requestId: requestId, attempts: 0, createdAt: now(), status: 'pending']
     if (code) p.code = code
     sendCodeChange(p, r.lock)
+    if (old?.status == 'pending' && old.requestId != requestId) {
+        // The new change is stored: a failed report must not fail the request.
+        try {
+            reportCodeResult(old, 'superseded', null)
+        } catch (Exception e) {
+            log.warn "SignalBricks Telemetry: superseded report failed for lock ${lockId} slot ${r.slot} (${e.class.simpleName})"
+        }
+    }
 }
 
 // Sends the command, stores the change and schedules its first check.

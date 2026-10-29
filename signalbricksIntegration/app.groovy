@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.1' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.2' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -360,7 +360,7 @@ void appButtonHandler(String btnName) {
             ]
 
             sbHttpPostJson('/hubitat', testEvent, { r ->
-                log.debug "Test Webhook: ${r.data}"
+                log.debug "Test Webhook: HTTP ${r.status}"
             })
             break
     }
@@ -1066,7 +1066,7 @@ void webhook(e) {
     ]
 
     sbHttpPostJson('/hubitat', payload, { r ->
-        log.debug "Webhook: ${r.data}"
+        log.debug "Webhook: HTTP ${r.status}"
     })
 }
 
@@ -1119,7 +1119,8 @@ void codeChangedHandler(e) {
             }
         }
     } catch (Exception ex) {
-        log.debug "codeChangedHandler: ${ex.message}"
+        // Class only: the message can carry the assignment, code included (#38)
+        log.debug "codeChangedHandler: ${ex.class.simpleName}"
     }
 
     webhook(e)
@@ -1191,6 +1192,16 @@ Map sbHttpResponseJson(def data, int status = 200) {
     ]
 }
 
+// An API handler failed: log and return the exception class and a fixed message
+// only. The message can carry the request's values, e.g. a MissingMethodException
+// from a malformed body lists the booking maps with their codes (#38)
+String sbApiError(String handler, Exception ex) {
+    String error = "${handler} failed (${ex.class.simpleName})".toString()
+    log.error error
+    log.trace ex.stackTrace
+    return error
+}
+
 // The old /register sbId (never used since Connect to SignalBricks) turns on the
 // outbound webhook to a placeholder URL; Done and Reset State clear it (#36)
 void clearLegacySbId() {
@@ -1214,10 +1225,7 @@ Map apiRegister() {
 
         return apiGetInfo()
     } catch (Exception ex) {
-        log.error "apiRegister: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiRegister', ex) ], 500)
     }
 }
 
@@ -1238,10 +1246,7 @@ Map apiUnregister() {
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {
-        log.error "apiUnregister: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiUnregister', ex) ], 500)
     }
 }
 
@@ -1262,10 +1267,7 @@ Map apiGetInfo() {
             nextBooking: helperFindNextBooking(null),
         ])
     } catch (Exception ex) {
-        log.error "apiGetInfo: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiGetInfo', ex) ], 500)
     }
 }
 
@@ -1282,10 +1284,7 @@ Map apiGetDevices() {
 
         return sbHttpResponseJson(resp)
     } catch (Exception ex) {
-        log.error "apiGetDevices: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiGetDevices', ex) ], 500)
     }
 }
 
@@ -1351,10 +1350,7 @@ Map apiGetDevice() {
 
     return sbHttpResponseJson(resp)
     } catch (Exception ex) {
-        log.error "apiGetDevice: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiGetDevice', ex) ], 500)
     }
 }
 
@@ -1399,10 +1395,7 @@ def apiExecuteCommand() {
                 return sbHttpResponseJson([ error: 'Command not supported' ], 400)
         }
     } catch (Exception ex) {
-        log.error "apiExecuteCommand: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiExecuteCommand', ex) ], 500)
     }
 }
 
@@ -1424,13 +1417,12 @@ Map apiSync() {
             nextBooking: helperFindNextBooking(atomicState.bookings),
         ])
     } catch (Exception ex) {
-        log.error "apiSync: ${ex.message}"
-        log.trace ex.stackTrace
+        String error = sbApiError('apiSync', ex)
 
         return sbHttpResponseJson([
             bookings: atomicState.bookings,
             nextBooking: helperFindNextBooking(atomicState.bookings),
-            error: ex.message
+            error: error
         ], 500)
     }
 }
@@ -1453,13 +1445,12 @@ Map apiSyncPatch() {
             nextBooking: helperFindNextBooking(atomicState.bookings),
         ])
     } catch (Exception ex) {
-        log.error "apiSyncPatch: ${ex.message}"
-        log.trace ex.stackTrace
+        String error = sbApiError('apiSyncPatch', ex)
 
         return sbHttpResponseJson([
             bookings: atomicState.bookings,
             nextBooking: helperFindNextBooking(atomicState.bookings),
-            error: ex.message
+            error: error
         ], 500)
     }
 }
@@ -1473,10 +1464,7 @@ Map apiSyncBooking() {
 
         return apiSyncBookingByLock()
     } catch (Exception ex) {
-        log.error "apiSyncBooking: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiSyncBooking', ex) ], 500)
     }
 }
 
@@ -1526,10 +1514,7 @@ Map apiSyncBookingByLock() {
 
         return sbHttpResponseJson(atomicState.bookings[key])
     } catch (Exception ex) {
-        log.error "apiSyncBookingByLock: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiSyncBookingByLock', ex) ], 500)
     }
 }
 
@@ -1542,10 +1527,7 @@ Map apiDeleteBooking() {
 
         return apiDeleteBookingByLock()
     } catch (Exception ex) {
-        log.error "apiDeleteBooking: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiDeleteBooking', ex) ], 500)
     }
 }
 
@@ -1574,10 +1556,7 @@ Map apiDeleteBookingByLock() {
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {
-        log.error "apiDeleteBookingByLock: ${ex.message}"
-        log.trace ex.stackTrace
-
-        return sbHttpResponseJson([ error: ex.message ], 500)
+        return sbHttpResponseJson([ error: sbApiError('apiDeleteBookingByLock', ex) ], 500)
     }
 }
 
