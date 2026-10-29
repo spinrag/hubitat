@@ -45,6 +45,19 @@
  * writes the new slot first and deletes the old one only once a re-read shows
  * the new slot holding the same code, so the code is never in neither slot.
  *
+ * Registered slots and full lock control (signalbricks/platform#684): a lock
+ * in /lockConfig may list `registered` slots, each a slot plus the exact name
+ * SignalBricks expects there (and, during a rename, a `pendingName`). Unlike
+ * adopted slots, the hub only lets SignalBricks touch a registered slot while
+ * the lock shows one of those names, so custom names without SBA:/SBM: stay
+ * safe. `fullControl` on a lock lets new codes go into empty registered slots
+ * outside the admin/managed ranges (never above the ceiling), and lets
+ * SignalBricks reach registered codes above the ceiling only on locks the hub
+ * operator also allowed here. A stricter booking rule guards these paths:
+ * names with "orb" + digit in any case, an upper-case "ORB" starting a word,
+ * or a G:/GT: prefix, and unnamed slots, are never registered or touched.
+ * Without these fields everything works exactly as before.
+ *
  * Updates (#13): a daily check-in at a random per-hub time re-registers when
  * the version changed, since an HPM update doesn't run updated().
  *
@@ -67,7 +80,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.4.1'
+@Field static final String APP_VERSION = '1.5.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -127,7 +140,10 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int WRITE_LIMIT_PER_MIN = 30
 @Field static final int MAX_PENDING_CODE_CHANGES = 100
 // Sent at registration so SignalBricks only offers what this version supports.
-@Field static final List<String> CAPABILITIES = ['relocate']
+@Field static final List<String> CAPABILITIES = ['relocate', 'registered_slots', 'full_control']
+// The /lockConfig fields this version reads (signalbricks/platform#684), returned
+// with every config reply so SignalBricks can tell it isn't talking to an older app.
+@Field static final List<String> CONFIG_FEATURES = ['registered_slots', 'full_control']
 @Field static final java.util.regex.Pattern REQUEST_ID = ~/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
 
 definition(
@@ -252,6 +268,10 @@ Map mainPage() {
             if (lockManagementEnabled) {
                 input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Locks SignalBricks may manage codes on', multiple: true, required: false, submitOnChange: true)
                 input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may manage (admin + managed codes; keep it below the booking apps' minimum code position)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
+                if (codeLocks) {
+                    paragraph '<b>Full lock control (optional).</b> On the locks chosen here, and only once SignalBricks also turns full control on for them, SignalBricks may reach codes above the ceiling that it registered by slot and name (codes an admin adopted in SignalBricks). It never writes into empty slots above the ceiling, and never touches booking codes (names with <code>ORB</code> followed by a digit, or starting with <code>G:</code> or <code>GT:</code>) or codes without a name. Leave empty to keep everything above the ceiling behind the approvals below.'
+                    input(name: 'fullControlLocks', type: 'enum', title: 'Locks SignalBricks may fully control', options: codeLocks.collectEntries { [(it.id.toString()): escapeHtml(it.displayName?.toString())] }, multiple: true, required: false, submitOnChange: true)
+                }
                 Map pending = pendingAdoptedOptions()
                 if (pending) {
                     paragraph '<b>Existing codes above the ceiling that SignalBricks asks to manage.</b> Approve only codes you recognise as admin or managed codes; never booking codes.'
@@ -337,6 +357,7 @@ Boolean syncLockManagementEnabled() {
     state.remove('fingerprintTimes')
     state.remove('fingerprintBatchTimes')
     app.removeSetting('approvedAdoptedSlots')
+    app.removeSetting('fullControlLocks')
     registerWithPlatform(false)
     return true
 }
@@ -390,6 +411,7 @@ void appButtonHandler(String btn) {
         state.remove('lockConfig')
         state.remove('fingerprintKey')
         app.removeSetting('approvedAdoptedSlots')
+        app.removeSetting('fullControlLocks')
         state.remove('sbToken')
         state.remove('ingestUrl')
         state.remove('connectedAt')
@@ -846,10 +868,50 @@ Boolean isBookingName(String name) {
     return name != null && BOOKING_NAME.matcher(name).find()
 }
 
+// The stricter booking rule for registered slots and full lock control
+// (signalbricks/platform#684), mirrored by the platform's isBookingSlotName:
+// "orb" followed by a digit in any case, an upper-case "ORB" at the start of a
+// word (the pre-1.3.4 guard), or a name starting with the booking apps' G: or
+// GT: prefix (any case, spaces allowed before the colon). An unnamed slot
+// isn't a booking name, but it can never be registered (it could be a booking
+// code on a driver that drops names), so it is never reached either. The
+// older paths (SBA:/SBM: ranges, adopted slots) keep isBookingName.
+@Field static final java.util.regex.Pattern STRICT_BOOKING_NAME = ~/(?i:orb\d)|(^|[\s-])ORB|^\s*(?i:gt?)\s*:/
+@Field static final java.util.regex.Pattern CLASS_PREFIX_NAME = ~/^\s*(?i:sb[am])\s*:/
+
+Boolean isStrictBookingName(String name) {
+    return name != null && STRICT_BOOKING_NAME.matcher(name).find()
+}
+
+// A name the hub may hold as a registered slot's `name` (what the lock shows):
+// 1-64 printable ASCII without surrounding spaces, never a booking name.
+// Null when acceptable.
+String registeredNameError(def raw) {
+    if (!(raw instanceof String)) return 'must be a string'
+    String name = raw
+    if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/) || name != name.trim()) {
+        return "must be 1-${MAX_NAME_LENGTH} printable ASCII characters without leading or trailing spaces"
+    }
+    if (isBookingName(name) || isStrictBookingName(name)) return 'looks like a booking code name'
+    return null
+}
+
+// A custom name SignalBricks writes (a `pendingName`): a registered name that
+// also doesn't start with SBA:/SBM: (those keep the class-range rules).
+String customNameError(def raw) {
+    String err = registeredNameError(raw)
+    if (err) return err
+    if (CLASS_PREFIX_NAME.matcher(raw).find()) return 'must not start with SBA: or SBM:'
+    return null
+}
+
 // Validates a /lockConfig body. Returns [config: Map] or [error: String].
 //   { admin: {from, to}, managed: {from, to},
-//     locks: { "<lockId>": { admin?: {from, to}, managed?: {from, to}, adopted?: [slot, ...] }
+//     locks: { "<lockId>": { admin?: {from, to}, managed?: {from, to}, adopted?: [slot, ...],
+//                            registered?: [{slot, name, pendingName?}], fullControl?: bool }
 //              | { surveyOnly: true } } }
+// `registered` and `fullControl` (#684) are kept only when given, so a config
+// without them is stored exactly as before.
 // A surveyOnly lock (#532) is listed for reading only (/slots, /fingerprints):
 // every write, delete, reveal and retry on it is refused.
 // Ranges must stay within the hub-local ceiling. Adopted slots above it are
@@ -892,9 +954,78 @@ Map validateLockConfig(def body) {
         Map out = [adopted: adopted.unique().sort()]
         if (v.admin != null) out.admin = lockAdmin
         if (v.managed != null) out.managed = lockManaged
+        Map reg = parseRegistered(lockId, v.registered, out.adopted)
+        if (reg.error) return [error: reg.error]
+        if (reg.registered) out.registered = reg.registered
+        if (v.containsKey('fullControl')) {
+            if (!(v.fullControl instanceof Boolean)) return [error: "lock ${lockId}: fullControl must be true or false"]
+            if (v.fullControl) out.fullControl = true
+        }
         locksOut[lockId] = out
     }
     return [config: [admin: admin, managed: managed, locks: locksOut]]
+}
+
+// `registered` (#684): [{slot, name, pendingName?}]. Returns [registered: List]
+// (null when absent or empty) or [error: String]. A slot is either adopted or
+// registered, never both; together at most MAX_ADOPTED_PER_LOCK.
+Map parseRegistered(String lockId, def raw, List adopted) {
+    if (raw == null) return [registered: null]
+    if (!(raw instanceof List) || raw.size() + adopted.size() > MAX_ADOPTED_PER_LOCK) {
+        return [error: "lock ${lockId}: registered must be a list, with adopted at most ${MAX_ADOPTED_PER_LOCK} slots"]
+    }
+    List out = []
+    for (r in raw) {
+        if (!(r instanceof Map) || r.keySet().any { !(it in ['slot', 'name', 'pendingName']) }) {
+            return [error: "lock ${lockId}: registered entries must be {slot, name, pendingName?}"]
+        }
+        Integer slot = r.slot instanceof Number ? parseSlot(parseIntLoose(r.slot)) : null
+        if (slot == null) return [error: "lock ${lockId}: registered slots must be integers 1-${MAX_SLOT}"]
+        if (adopted.contains(slot) || out.any { it.slot == slot }) return [error: "lock ${lockId}: slot ${slot} is listed twice (registered and adopted, or registered twice)"]
+        String nameErr = registeredNameError(r.name)
+        if (nameErr) return [error: "lock ${lockId}: registered slot ${slot} name ${nameErr}"]
+        Map e = [slot: slot, name: r.name]
+        if (r.pendingName != null) {
+            String pendingErr = customNameError(r.pendingName)
+            if (pendingErr) return [error: "lock ${lockId}: registered slot ${slot} pendingName ${pendingErr}"]
+            if (r.pendingName == r.name) return [error: "lock ${lockId}: registered slot ${slot} pendingName must differ from name"]
+            e.pendingName = r.pendingName
+        }
+        out << e
+    }
+    return [registered: out ? out.sort { it.slot } : null]
+}
+
+// The registration of a slot on a lock, or null.
+Map registeredEntry(String lockId, Integer slot) {
+    def l = state.lockConfig?.locks?.get(lockId)
+    if (!(l instanceof Map) || slot == null) return null
+    return (l.registered ?: []).find { (it.slot as Integer) == slot } as Map
+}
+
+// Whether `name` is one the registration accepts: its name, or the new name
+// of a rename in progress (both are accepted until the hub confirms it).
+Boolean registeredNameMatches(Map entry, String name) {
+    return entry != null && name != null && (name == entry.name || (entry.pendingName != null && name == entry.pendingName))
+}
+
+Boolean fullControlOn(String lockId) {
+    def l = state.lockConfig?.locks?.get(lockId)
+    return l instanceof Map && l.fullControl == true
+}
+
+// Lock ids the hub operator allowed full control on, in this app's UI only
+// (never via the API): registered codes above the ceiling are reachable there
+// when SignalBricks also turned full control on for the lock.
+List fullControlAllowedIds() {
+    def v = fullControlLocks
+    if (!v) return []
+    List ids = (v instanceof Collection ? v : [v]).collect { it.toString() }
+    return ids.findAll { findCodeLock(it) }
+}
+
+Boolean fullControlAboveCeiling(String lockId) {
+    return fullControlOn(lockId) && fullControlAllowedIds().contains(lockId)
 }
 
 List approvedAdoptedKeys() {
@@ -903,7 +1034,9 @@ List approvedAdoptedKeys() {
     return (v instanceof Collection ? v : [v]).collect { it.toString() }
 }
 
-// Adopted slots above the ceiling, as "<lockId>:<slot>" keys.
+// Adopted slots above the ceiling, as "<lockId>:<slot>" keys, plus registered
+// slots above it on locks without full control allowed here (#684): those
+// need the operator's approval slot by slot, as adopted slots do.
 List adoptedAboveCeiling() {
     Map cfg = state.lockConfig
     if (!cfg) return []
@@ -911,6 +1044,9 @@ List adoptedAboveCeiling() {
     List out = []
     (cfg.locks ?: [:]).each { lockId, l ->
         (l.adopted ?: []).collect { it as Integer }.findAll { it > ceiling }.each { out << "${lockId}:${it}".toString() }
+        if (!fullControlAboveCeiling(lockId.toString())) {
+            (l.registered ?: []).collect { it.slot as Integer }.findAll { it > ceiling }.each { out << "${lockId}:${it}".toString() }
+        }
     }
     return out
 }
@@ -931,14 +1067,15 @@ Map pendingAdoptedOptions() {
         def entry = codes?.get(parts[1])
         String name = entry instanceof Map ? entry.name?.toString() : null
         String label = "${lock.displayName}: slot ${parts[1]}${name ? " (${escapeHtml(name)})" : ' (empty)'}"
-        if (isBookingName(name)) label += ' - booking code, always refused'
+        if (isBookingName(name) || isStrictBookingName(name)) label += ' - booking code, always refused'
         options[key] = label
     }
     return options
 }
 
-// Which class a slot belongs to on this lock: 'adopted', 'admin', 'managed',
-// or null when the hub must refuse it. No config yet = nothing allowed. A
+// Which class a slot belongs to on this lock: 'registered' (#684), 'adopted',
+// 'admin', 'managed', or null when the hub must refuse it. A registered slot
+// has further rules (registeredSlotRefusal). No config yet = nothing allowed. A
 // lock not listed in config.locks (not onboarded) allows nothing: the global
 // ranges are only defaults for listed locks. Nothing above the ceiling is
 // allowed unless it is an adopted slot the operator approved in the app UI.
@@ -949,6 +1086,12 @@ String slotClass(String lockId, Integer slot) {
     Map lockCfg = cfg.locks?.get(lockId)
     if (!(lockCfg instanceof Map) || lockCfg.surveyOnly == true) return null
     Integer ceiling = managedCeiling()
+    // Registered (#684): within the ceiling, or above it on a lock with full
+    // control allowed here, or with the operator's approval for the slot.
+    if ((lockCfg.registered ?: []).any { (it.slot as Integer) == slot }) {
+        if (slot <= ceiling || fullControlAboveCeiling(lockId) || approvedAdoptedKeys().contains("${lockId}:${slot}".toString())) return 'registered'
+        return null
+    }
     if ((lockCfg.adopted ?: []).collect { it as Integer }.contains(slot)) {
         if (slot <= ceiling || approvedAdoptedKeys().contains("${lockId}:${slot}".toString())) return 'adopted'
     }
@@ -1000,7 +1143,8 @@ Integer maxCodesOf(lock) {
 // GET and POST /lockConfig reply. Says whether a fingerprint key is held,
 // never the key itself.
 Map lockConfigReply() {
-    return [config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys(), fingerprintKeySet: state.fingerprintKey != null]
+    return [config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys(), fingerprintKeySet: state.fingerprintKey != null,
+            features: CONFIG_FEATURES, fullControlAllowed: fullControlAllowedIds()]
 }
 
 Map apiGetLockConfig() {
@@ -1061,6 +1205,13 @@ Map apiListSlots() {
         String name = v instanceof Map ? v.name?.toString() : null
         Boolean set = v instanceof Map ? (v.code != null && v.code.toString() != '') : false
         String cls = isBookingName(name) ? null : slotClass(lock.id.toString(), slot)
+        // Registered slots (#684) are reported as adopted (older SignalBricks
+        // versions know no other value) plus registered: true, and only while
+        // the hub would let SignalBricks touch them.
+        if (cls == 'registered') {
+            Boolean ok = registeredSlotRefusal(lock.id.toString(), slot, name, set, true, codes) == null
+            return [slot: slot, name: name, set: set, allowedAs: ok ? 'adopted' : null, registered: true]
+        }
         [slot: slot, name: name, set: set, allowedAs: cls]
     }.sort { it.slot }
     return jsonResponse([lockId: lock.id.toString(), maxCodes: maxCodesOf(lock), surveyOnly: isSurveyOnly(lock.id.toString()), slots: slots])
@@ -1096,6 +1247,9 @@ Map lockFingerprints(lock, byte[] key) {
         Integer slot = k.toString().toInteger()
         if (isBookingName(v.name?.toString())) return
         if (slot < 1 || (survey ? slot > ceiling : !slotClass(lockId, slot))) return
+        // A registered slot (#684) only while it holds its registered name.
+        if (!survey && slotClass(lockId, slot) == 'registered' &&
+            (isStrictBookingName(v.name?.toString()) || !registeredNameMatches(registeredEntry(lockId, slot), v.name?.toString()))) return
         slots << [slot: slot, fp: codeFingerprint(key, code)]
     }
     return [slots: slots.sort { it.slot }]
@@ -1178,12 +1332,60 @@ Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
     String currentName = entry instanceof Map ? entry.name?.toString() : null
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
     if (isBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
+    if (cls == 'registered') {
+        Map refusal = registeredSlotRefusal(lock.id.toString(), slot, currentName, occupied, allowEmpty, codes)
+        if (refusal) return refusal
+    }
     String prefix = classPrefix(cls)
     if (prefix && occupied && !(currentName?.startsWith(prefix))) {
         return refuse('slot_not_managed', 403, "slot holds a code without the ${prefix} marker; adopt it first")
     }
     if (!occupied && !allowEmpty) return refuse('slot_empty', 404)
     return [lock: lock, slot: slot, slotClass: cls, codes: codes, currentName: currentName, occupied: occupied]
+}
+
+// Registered slots (#684), on top of slotClass: the stricter booking rule on
+// the lock's current name; an occupied slot only while it shows the registered
+// name (or the rename's pendingName), so a code replaced outside SignalBricks
+// is never taken over; an empty slot is written only within the ceiling (never
+// where the booking apps pick free slots), and outside the admin/managed
+// ranges only on a full-control lock. Null when allowed.
+// A booking-named code (strict rule) at or under the ceiling means the booking
+// apps also write there (their minimum code position is at or below the
+// ceiling), so new codes outside the class ranges could race them: refused
+// (fail closed) until the overlap is fixed. `codes` is the lock's lockCodes.
+Map registeredSlotRefusal(String lockId, Integer slot, String currentName, Boolean occupied, Boolean allowEmpty, Map codes) {
+    if (isStrictBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
+    Map entry = registeredEntry(lockId, slot)
+    if (occupied) {
+        if (!registeredNameMatches(entry, currentName)) return refuse('name_mismatch', 403, 'slot holds a code under a name other than the registered one')
+        return null
+    }
+    if (!allowEmpty) return null
+    if (slot > managedCeiling()) return refuse('slot_not_allowed', 403, 'empty slots above the ceiling are never written')
+    if (!fullControlOn(lockId) && !inClassRange(lockId, slot)) {
+        return refuse('slot_not_allowed', 403, 'empty registered slots outside the admin and managed ranges need full control on the lock')
+    }
+    if (!inClassRange(lockId, slot) && bookingCodeAtOrUnderCeiling(codes)) {
+        return refuse('booking_region_overlap', 409, 'a booking code sits at or under the ceiling; keep the booking apps\' minimum code position above the ceiling')
+    }
+    return null
+}
+
+Boolean bookingCodeAtOrUnderCeiling(Map codes) {
+    Integer ceiling = managedCeiling()
+    return (codes ?: [:]).any { k, v ->
+        k.toString() ==~ /\d{1,4}/ && k.toString().toInteger() <= ceiling && v instanceof Map &&
+            v.code != null && v.code.toString() != '' && (isBookingName(v.name?.toString()) || isStrictBookingName(v.name?.toString()))
+    }
+}
+
+Boolean inClassRange(String lockId, Integer slot) {
+    Map cfg = state.lockConfig
+    Map lockCfg = cfg?.locks?.get(lockId) ?: [:]
+    Map admin = lockCfg.admin ?: cfg.admin
+    Map managed = lockCfg.managed ?: cfg.managed
+    return (slot >= (admin.from as Integer) && slot <= (admin.to as Integer)) || (slot >= (managed.from as Integer) && slot <= (managed.to as Integer))
 }
 
 // Name and slot rules for a set. Checked on the request and again before
@@ -1199,6 +1401,13 @@ Map resolveSet(def lockIdRaw, def slotRaw, String name) {
     }
     Map r = resolveAllowedSlot(lockIdRaw, slotRaw, true)
     if (r.response) return r
+    // Registered slots take only their registered name or the rename's new name.
+    if (r.slotClass == 'registered') {
+        if (isStrictBookingName(name) || !registeredNameMatches(registeredEntry(r.lock.id.toString(), r.slot), name)) {
+            return refuse('name_not_allowed', 403, 'registered slots take only their registered name')
+        }
+        return r
+    }
     // Created codes carry their class marker; adopted slots keep their name.
     String prefix = classPrefix(r.slotClass)
     if (prefix && !name.startsWith(prefix)) return refuse('name_not_allowed', 403, "${r.slotClass} slots need a ${prefix} name")
@@ -1399,10 +1608,13 @@ Map resolveRelocate(def lockIdRaw, def slotRaw, def toSlotRaw, String name) {
         if (toSlot == null) return refuse('invalid_slot', 400, "toSlot must be a slot number 1-${MAX_SLOT}")
     }
     Boolean move = toSlot != src.slot
+    // A registered slot (#684) is renamed in place only, to its registered
+    // name or the rename's pendingName (checked by resolveSet).
+    if (move && src.slotClass == 'registered') return refuse('move_not_supported', 409, 'registered slots are renamed in place only')
     if (move && toSlot > managedCeiling()) return refuse('slot_not_allowed', 403, "toSlot must be within slots 1-${managedCeiling()}")
     Map dst = resolveSet(lockIdRaw, toSlot, name)
     if (dst.response) return dst
-    if (!name.startsWith(ADMIN_NAME_PREFIX) && !name.startsWith(MANAGED_NAME_PREFIX)) {
+    if (dst.slotClass != 'registered' && !name.startsWith(ADMIN_NAME_PREFIX) && !name.startsWith(MANAGED_NAME_PREFIX)) {
         return refuse('name_not_allowed', 403, "the new name must start with ${ADMIN_NAME_PREFIX} or ${MANAGED_NAME_PREFIX}")
     }
     if (move && dst.occupied) return refuse('slot_occupied', 409, 'toSlot already holds a code')
@@ -1741,6 +1953,7 @@ void verifyCodeChange(String key) {
 // confirmed or permanently failed changes are dropped, retryable failures are
 // kept for the retry endpoint until they expire.
 void finishCodeChange(Map p, String result, String reason, Boolean report) {
+    if (result == 'confirmed' && p.action != 'delete') promoteRegisteredName(p.lockId, p.slot as Integer, p.name?.toString())
     if (report) reportCodeResult(p, result, reason)
     if (result == 'failed') withdrawApprovalIfSourceEmpty(p)
     Map all = pendingCodeChanges()
@@ -1755,14 +1968,43 @@ void finishCodeChange(Map p, String result, String reason, Boolean report) {
     savePendingCodeChanges(all)
 }
 
+// Rename handshake (#684): once the hub has seen the slot hold the code under
+// a registration's pendingName, that name becomes the registered one and the
+// old name is no longer accepted. Until then both are. SignalBricks then sends
+// {name: <new>} itself; a config it sends meanwhile with both names is fine.
+void promoteRegisteredName(String lockId, Integer slot, String name) {
+    Map entry = registeredEntry(lockId, slot)
+    if (entry?.pendingName == null || entry.pendingName != name) return
+    Map cfg = state.lockConfig
+    List regs = cfg.locks[lockId].registered.collect { Map e ->
+        (e.slot as Integer) == slot ? [slot: slot, name: name] : e
+    }
+    cfg.locks[lockId].registered = regs
+    // Reassigned so Hubitat persists the nested change.
+    state.lockConfig = cfg
+    log.info "SignalBricks Telemetry: registered name updated on lock ${lockId} slot ${slot}"
+}
+
 // After POST /lockConfig: drop changes whose slot is no longer allowed (an
 // in-flight one is reported failed), since they could never be re-sent.
+// Also drops a set or relocate on a registered slot whose name the new config
+// no longer accepts (#684: e.g. a rename cancelled back to the old name), so a
+// late re-send can't leave a name on the lock that no registration accepts.
 void dropDisallowedCodeChanges() {
     Map all = pendingCodeChanges()
-    Map gone = all.findAll { k, p -> slotClass(p.lockId, p.slot as Integer) == null || (p.fromSlot != null && slotClass(p.lockId, p.fromSlot as Integer) == null) }
+    Map reasons = [:]
+    all.each { k, p ->
+        if (slotClass(p.lockId, p.slot as Integer) == null || (p.fromSlot != null && slotClass(p.lockId, p.fromSlot as Integer) == null)) {
+            reasons[k] = 'slot_not_allowed'
+        } else if (p.action != 'delete' && slotClass(p.lockId, p.slot as Integer) == 'registered' &&
+                   !registeredNameMatches(registeredEntry(p.lockId, p.slot as Integer), p.name?.toString())) {
+            reasons[k] = 'name_not_allowed'
+        }
+    }
+    Map gone = all.findAll { k, p -> reasons.containsKey(k) }
     if (!gone) return
     gone.each { k, p ->
-        if (p.status == 'pending') reportCodeResult(p, 'failed', 'slot_not_allowed')
+        if (p.status == 'pending') reportCodeResult(p, 'failed', reasons[k])
         withdrawApprovalIfSourceEmpty(p)
         all.remove(k)
     }

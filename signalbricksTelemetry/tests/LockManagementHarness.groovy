@@ -18,6 +18,7 @@ abstract class HubitatStub extends Script {
     Boolean debugLogging = false
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
+    def fullControlLocks = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -1199,7 +1200,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.4.1'
+String VERSION = '1.5.0'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
