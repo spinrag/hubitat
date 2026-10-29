@@ -21,6 +21,7 @@ abstract class HubitatStub extends Script {
     Boolean debugLogging = false
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
+    def fullControlLocks = null
     List logged = []
     List posts = []
     def log = [info: { logged << it.toString() }, warn: { logged << it.toString() }, debug: { logged << it.toString() }, error: { logged << it.toString() }]
@@ -458,7 +459,7 @@ app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.posts.clear()
 app.registerWithPlatform()
 def reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
-check('register: capabilities [relocate], version 1.4.1', reg.capabilities == ['relocate'] && reg.version == '1.4.1' && reg.lockManagement == true)
+check('register: capabilities [relocate, registered_slots, full_control], version 1.5.0', reg.capabilities == ['relocate', 'registered_slots', 'full_control'] && reg.version == '1.5.0' && reg.lockManagement == true)
 app.posts.clear()
 app.lockManagementEnabled = false
 app.state.lockMgmtRegistered = true
