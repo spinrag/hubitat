@@ -66,7 +66,7 @@ app.settings = [locks: ['x'] as String[], codeNamePrefix: 'GT:']
 app.state.accessToken = 'tok-fake'
 app.pages()
 check('page: header shows name and version', app.paragraphs.contains("<b>SignalBricks Integration ${version}</b>".toString()))
-check('page: version line shows name and version', app.paragraphs.contains("<b>App Version:</b> SignalBricks Integration ${version}".toString()))
+check('page: name and version shown once, in the header (#36)', app.paragraphs.count { it.contains("SignalBricks Integration ${version}".toString()) } == 1 && !app.paragraphs.any { it.contains('App Version') })
 check('page: no prefix warning with a prefix set', !app.paragraphs.any { it.contains('Set a code name prefix') })
 app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: '']

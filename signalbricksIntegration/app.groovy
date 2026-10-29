@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.0' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.1' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -60,7 +60,7 @@ preferences {
         }
 
         // #24: re-reading every slot over Z-Wave is slow, so it is one lock at a time and Off by default
-        section(title: 'Door code refresh') {
+        section(title: '<h2>Door code refresh</h2>') {
             paragraph 'Re-reads all door codes from the locks, one lock at a time, so the hub has the current codes. ' +
                 'The app writes and reconciles its own codes, so a routine full read is not needed. ' +
                 'A large lock can take several minutes; a refresh of many locks can take hours.'
@@ -71,7 +71,7 @@ preferences {
             codeRefreshStatus().each { paragraph it }
         }
 
-        section(title: 'Connection') {
+        section(title: '<h2>Connection</h2>') {
             // The hub runs this page with no state or settings while it saves the app code (#28)
             if (settings && state != null) { // Prevents this code from executing during app install, as it will error
                 if (!settings.locks || settings.locks.length == 0) {
@@ -81,7 +81,6 @@ preferences {
                     paragraph 'Please click "Done" to complete setup before connecting to SignalBricks.'
                 }
                 else {
-                    paragraph '<b>App Version:</b> ' + sbAppNameAndVersion
                     sbConnectionStatus().each { paragraph it }
                     if (state.sbCredential) {
                         href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbConnectUrl(),
@@ -97,22 +96,13 @@ preferences {
                         paragraph '<b>Local URL:</b> ' + (sbLocalApiUrl() ?: '(not available)')
                         paragraph '<b>Access Token:</b> ' + state.accessToken
                     }
-
-                    if (state.sbId) {
-                        paragraph '<b>Status:</b> Connected (ID: ' + state.sbId + ')'
-                        input(name: 'btnDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
-                    } else {
-                        paragraph '<b>Status:</b> Not registered (use CLI add-hub to configure)'
-                        paragraph '<small>Expected and harmless: the SignalBricks dispatcher drives this app through its endpoints (<code>/sync</code> etc.) with the access token above. ' +
-                            'Registration only enables an outbound webhook to a SignalBricks backend that was never wired up; lock events reach SignalBricks through the SignalBricks Telemetry app.</small>'
-                    }
                 }
             } else {
                 paragraph 'Please configure the locks before connecting to SignalBricks.'
             }
         }
 
-        section(title: 'Diagnostics') {
+        section(title: '<h2>Diagnostics</h2>') {
             href(name: 'hrefBookings', title: 'Bookings', description: 'Bookings this app knows vs its codes on the locks (codes masked)', page: 'bookingsPage')
             href(name: 'hrefDebug', title: 'Debug', description: 'API links, manual reconcile, reset state', page: 'debug')
         }
@@ -127,21 +117,21 @@ preferences {
 def bookingsPage() {
     Map v = bookingsView()
     dynamicPage(name: 'bookingsPage', title: 'Bookings') {
-        section {
+        section(title: '<h2>Summary</h2>') {
             paragraph v.summary
             v.notes.each { paragraph it }
             paragraph '<small>From this hub\'s state and the locks\' last reported codes; reload the page to update. ' +
                 'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
                 'Codes show only their last 2 digits.</small>'
         }
-        section(title: 'Known bookings') {
+        section(title: '<h2>Known bookings</h2>') {
             if (v.bookings) {
                 v.bookings.each { paragraph it }
             } else {
                 paragraph 'No bookings known.'
             }
         }
-        section(title: 'Orphans') {
+        section(title: '<h2>Orphans</h2>') {
             if (v.orphans) {
                 paragraph '<small>Codes with this app\'s prefix + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
                     'The next reconcile removes them.</small>'
@@ -191,7 +181,7 @@ Map bookingsView() {
             Map l = onLock[lockId.toString()]
             if (!l) {
                 if (status == 'current') notOnLock++
-                return "lock ${bookingsEsc(lockId)} (not selected in this app): <b>not on lock</b>"
+                return "lock ${bookingsEsc(lockId)} (not selected in this app): " + (status == 'current' ? bookingsMissing : bookingsNotOnLock(status))
             }
             if (l.codes == null) return "${l.name}: ${l.problem}"
             Map c = l.codes[id]
@@ -204,13 +194,14 @@ Map bookingsView() {
             }
             if (status == 'current') {
                 notOnLock++
-                return "${l.name}: <b>not on lock</b>"
+                return "${l.name}: ${bookingsMissing}"
             }
-            return "${l.name}: not on lock" + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
+            return "${l.name}: ${bookingsNotOnLock(status)}"
         }
-        String line = "<b>ORB${bookingsEsc(id)}</b> ${bookingsEsc(b.guest ?: '')} &middot; ${status} &middot; " +
-            "${bookingsTime(checkIn)} to ${bookingsTime(checkOut)} &middot; code ${bookingsMask(b.code)}<br>" +
-            (lockLines ? lockLines.join('<br>') : 'no locks assigned')
+        // Heading line, then its locks indented under it
+        String line = "<b>ORB${bookingsEsc(id)} ${bookingsEsc(b.guest ?: '')} &middot; ${status} &middot; " +
+            "${bookingsTime(checkIn)} to ${bookingsTime(checkOut)} &middot; code ${bookingsMask(b.code)}</b>" +
+            "<div style='margin-left:1.5em'>${lockLines ? lockLines.join('<br>') : 'no locks assigned'}</div>"
         return [sortAt: checkIn?.time ?: 0L, line: line]
     }.sort { it.sortAt }.collect { it.line }
 
@@ -246,6 +237,20 @@ String bookingsRequestMethod(String fallback) {
     }
 }
 
+// A current booking whose code is missing from a lock needs action
+String getBookingsMissing() { "<b style='color:#c62828'>not on lock</b>" }
+
+// Not on lock for a booking that isn't current: expected, so not highlighted
+String bookingsNotOnLock(String status) {
+    return 'not on lock' + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
+}
+
+// Last 2 digits only, as plain text for API error messages
+String helperMaskCode(def code) {
+    String s = code == null ? '' : code.toString()
+    return s.length() >= 4 ? '\u2022\u2022\u2022\u2022' + s[-2..-1] : '\u2022\u2022\u2022\u2022'
+}
+
 // Last 2 digits only; the full code is never rendered
 String bookingsMask(def code) {
     String s = code == null ? '' : code.toString()
@@ -265,18 +270,23 @@ String bookingsEsc(def s) {
 // Debug page for testing
 def debug() {
     dynamicPage(name: 'debug', title: 'Debug') {
-        section {
+        section(title: '<h2>Actions</h2>') {
             input(name: 'btbAccessToken', type: 'button', title: 'Refresh Access Token')
             input(name: 'btnTest', type: 'button', title: 'Test Webhook')
             input(name: 'btnReconcile', type: 'button', title: 'Reconcile Door Codes')
             input(name: 'btnRefreshCodes', type: 'button', title: 'Refresh Door Codes (one lock at a time)')
             input(name: 'btnReset', type: 'button', title: 'Reset State')
         }
-        // Direct links to API endpoints
-        section(title: 'Door code refresh') {
+        section(title: '<h2>Door code refresh</h2>') {
             codeRefreshStatus().each { paragraph it }
         }
-        section(title: 'Links') {
+        // Direct links to API endpoints
+        section(title: '<h2>Links</h2>') {
+            // The links carry the access token, which SignalBricks holds once connected (#36)
+            if (state.sbConnected) {
+                paragraph 'Hidden while connected to SignalBricks: these links carry the app\'s access token. Disconnect to show them.'
+                return
+            }
             String url
 
             // Hub info
@@ -305,14 +315,6 @@ void appButtonHandler(String btnName) {
         case 'btnSbDisconnect':
             sbDisconnect()
             break
-        // Disconnect from SignalBricks (legacy sbId registration)
-        case 'btnDisconnect':
-            state.accessToken = null
-            state.sbId = null
-            unschedule()
-            unsubscribe()
-            atomicState.codeRefresh = null
-            break
         // Create/refresh access token (this will break the connection until the user reconnects)
         case 'btbAccessToken':
             state.accessToken = createAccessToken()
@@ -337,6 +339,7 @@ void appButtonHandler(String btnName) {
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
             atomicState.lastSync = null
+            clearLegacySbId()
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
             // Re-establish subscriptions so codeChangedHandler still fires
@@ -480,6 +483,8 @@ void updated() {
         state.lastVersion = sbAppVersion
     }
 
+    clearLegacySbId()
+
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
 
@@ -561,12 +566,12 @@ void scheduleEvents(Map bookings) {
                 // Only schedule check-in if its in the future
                 if (checkIn.after(now)) {
                     if (!schedules.contains(checkIn)) {
-                        log.debug "scheduleEvents: schedule reconcileDoorCodes for ${booking}"
+                        log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
                         runOnce(checkIn, 'reconcileDoorCodes', [overwrite: false])
                         schedules.add(checkIn)
                     }
                 } else if (!schedules.contains(checkOut)) {
-                    log.debug "scheduleEvents: schedule reconcileDoorCodes for ${booking}"
+                    log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
                     runOnce(checkOut, 'reconcileDoorCodes', [overwrite: false])
                     schedules.add(checkOut)
                 }
@@ -828,7 +833,7 @@ void reconcileDoorCodes(Map bookings) {
             }
             .collectEntries { key, booking -> [(booking.id): booking] }
 
-        log.trace "reconcileDoorCodes: current lock bookings ${currentLockBookings}"
+        log.trace "reconcileDoorCodes: current lock bookings ${helperLogBookings(currentLockBookings)}"
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
         def lockCodesRaw = lock.currentValue('lockCodes', true)
@@ -840,8 +845,7 @@ void reconcileDoorCodes(Map bookings) {
 
         Map lockCodes = parseJson(lockCodesRaw)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
-        log.trace "reconcileDoorCodes: lock codes ${lockCodes}"
-        log.trace "reconcileDoorCodes: sb codes ${sbCodes}"
+        log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
 
         // Remove all codes that are not in the current bookings
         sbCodes.each { bookingId, lockCode ->
@@ -885,7 +889,7 @@ void reconcileDoorCodes(Map bookings) {
                     index++
                     int codePosition = nextPosition
 
-                    log.debug "reconcileDoorCodes: trySetCode ${booking}"
+                    log.debug "reconcileDoorCodes: trySetCode ${helperLogBooking(booking)}"
 
                     // Create the code
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
@@ -902,7 +906,7 @@ void reconcileDoorCodes(Map bookings) {
                     }
 
                     // Re-set the code
-                    log.debug "reconcileDoorCodes: re-running trySetCode ${codePosition} ${booking}"
+                    log.debug "reconcileDoorCodes: re-running trySetCode ${codePosition} ${helperLogBooking(booking)}"
 
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
                 }
@@ -940,7 +944,7 @@ void reconcileDoorCodes(Map bookings) {
 int getSbMaxRetryDelaySec() { 600 }
 
 void trySetCode(Map data) {
-    log.debug "trySetCode (${data})"
+    log.debug "trySetCode: lock ${data.lockId} pos ${data.codePosition} ${data.codeName} (attempt ${(data.attempt ?: 0) + 1})"
 
     def lock = locks.find { lock -> lock.id == data.lockId }
 
@@ -985,7 +989,7 @@ void trySetCode(Map data) {
 // already flipped confirmed=true, no-op. Otherwise, re-issue trySetCode (which
 // increments the attempt counter and reschedules another verify).
 void verifySetCode(Map data) {
-    log.debug "verifySetCode (${data})"
+    log.debug "verifySetCode: lock ${data.lockId} pos ${data.codePosition} ${data.codeName}"
 
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
@@ -1008,7 +1012,7 @@ void verifySetCode(Map data) {
 }
 
 void tryDeleteCode(Map data) {
-    log.debug "tryDeleteCode (${data})"
+    log.debug "tryDeleteCode: lock ${data.lockId} pos ${data.codePosition}"
 
     def lock = locks.find { lock -> lock.id == data.lockId }
 
@@ -1149,7 +1153,7 @@ String getSbConnectUrl() {
 
 // Send API request to SignalBricks FastApi application
 void sbHttpPostJson(String uri, Map body, Closure closure) {
-    log.debug "sbHttpPostJson: $uri, $body"
+    log.debug "sbHttpPostJson: $uri"
     log.debug "sbBaseFastUrl: $sbBaseFastUrl"
 
     Map params = [
@@ -1187,11 +1191,18 @@ Map sbHttpResponseJson(def data, int status = 200) {
     ]
 }
 
+// The old /register sbId (never used since Connect to SignalBricks) turns on the
+// outbound webhook to a placeholder URL; Done and Reset State clear it (#36)
+void clearLegacySbId() {
+    state.sbId = null
+    atomicState.sbId = null
+}
+
 // Register the SignalBricks account with this hub
 // SignalBricks needs to already have the hub's Id and Access Token
 // So just accept whatever is passed in at face value
 Map apiRegister() {
-    log.debug "apiRegister: ${request.JSON}"
+    log.debug 'apiRegister: registration received'
 
     try {
         atomicState.sbId = request.JSON.sbId
@@ -1280,7 +1291,7 @@ Map apiGetDevices() {
 
 // Get detailed per-device info
 Map apiGetDevice() {
-    log.debug "apiGetDevice: $params"
+    log.debug "apiGetDevice: ${params?.deviceId}"
 
     try {
     def deviceId = params.deviceId
@@ -1314,7 +1325,6 @@ Map apiGetDevice() {
                                 if (key.toInteger() < minCodePosition) {
                                     code.code = '<redacted>'
                                 }
-                                log.debug("Code: ${key} ${code}")
                             }
                         }
                     } else {
@@ -1351,7 +1361,7 @@ Map apiGetDevice() {
 // Execute a command on a device
 // Only allows a subset of commands
 def apiExecuteCommand() {
-    log.debug "apiExecuteCommand: $params ${request.JSON}"
+    log.debug "apiExecuteCommand: ${params?.command} on device ${params?.deviceId}"
 
     try {
         def deviceId = params.deviceId
@@ -1399,7 +1409,7 @@ def apiExecuteCommand() {
 // Sync all bookings (replaces state.bookings), schedule tasks, and reconcile door codes
 Map apiSync() {
     try {
-        log.debug "apiSync ${request.JSON}"
+        log.debug "apiSync: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
         atomicState.bookings = helperGetBookings(request.JSON)
         atomicState.lastSync = [at: now(), source: 'PUT /sync']
@@ -1427,7 +1437,7 @@ Map apiSync() {
 
 Map apiSyncPatch() {
     try {
-        log.debug "apiSyncPatch ${request.JSON}"
+        log.debug "apiSyncPatch: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
         def combined = atomicState.bookings + request.JSON
 
@@ -1510,7 +1520,8 @@ Map apiSyncBookingByLock() {
         }
 
         if (helperHasDuplicateCode(params.lockId, atomicState.bookings[key], atomicState.bookings)) {
-            return sbHttpResponseJson([ error: "Duplicate code: '${booking.code}'."], 409)
+            // The dispatcher may log error bodies: last 2 digits only (#36)
+            return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
         }
 
         return sbHttpResponseJson(atomicState.bookings[key])
@@ -1601,6 +1612,15 @@ String helperGetCodeName(Map booking) {
     return prefix + orbId + '-' + guest
 }
 
+// Log text for bookings: id and guest only, never a code (#36)
+String helperLogBooking(def b) {
+    return b instanceof Map ? "ORB${b.id} ${b.guest ?: ''}".trim() : ''
+}
+
+String helperLogBookings(def bookings) {
+    return bookings instanceof Map ? bookings.values().collect { helperLogBooking(it) }.join(', ') : ''
+}
+
 // Format booking (ensure keyed by id, dates are objects), and only return future bookings
 Map helperGetBookings(Map bookings) {
     log.debug 'helperGetBookings'
@@ -1608,7 +1628,7 @@ Map helperGetBookings(Map bookings) {
     Date now = new Date()
 
     return bookings.collect { key, booking ->
-        log.trace "helperGetBookings state.bookings.collect ${key} ${booking}"
+        log.trace "helperGetBookings state.bookings.collect ${key} ${helperLogBooking(booking)}"
         booking.checkIn = helperToDate(booking.checkIn)
         booking.checkOut = helperToDate(booking.checkOut)
         return booking
@@ -1617,18 +1637,18 @@ Map helperGetBookings(Map bookings) {
         return booking.checkIn >= now || booking.checkOut >= now
     }
     .groupBy { booking ->
-        log.trace "helperGetBookings state.bookings.groupBy ${booking}"
+        log.trace "helperGetBookings state.bookings.groupBy ${helperLogBooking(booking)}"
         return booking.id
     }
     .collectEntries { k, group ->
-        log.trace "helperGetBookings state.bookings.collectEntries ${k} ${group}"
+        log.trace "helperGetBookings state.bookings.collectEntries ${k} (${group.size()} lock entries)"
         return [ k, group.inject(group[0] + [lockId: []]) { acc, v -> acc.lockId += v.lockId; acc } ]
     }
 }
 
 // Check for duplicate code
 boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) {
-    log.debug "helperHasDuplicateCode ${lockId} ${booking.id} ${booking.code}"
+    log.debug "helperHasDuplicateCode ${lockId} ${helperLogBooking(booking)}"
 
     def lock = locks.find { lock -> lock.id == lockId }
 
@@ -1662,7 +1682,7 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
                 if (bookings && bookings.containsKey(bookingId)) {
                     // Only warn if the bookings overlap check-in to check-out
                     Map otherBooking = bookings[bookingId]
-                    log.debug "helperHasDuplicateCode: checking active booking ${otherBooking}"
+                    log.debug "helperHasDuplicateCode: checking active booking ${helperLogBooking(otherBooking)}"
                     // Other booking already active - only need check-out after check-in
                     return otherBooking.checkOut > booking.checkIn
                 }
@@ -1703,7 +1723,7 @@ Map helperFindCurrentBookings(Map bookings) {
 
     return bookings.findAll { id, booking ->
         if (booking.checkIn <= now && booking.checkOut >= now) {
-            log.trace "helperFindCurrentBooking ${booking}"
+            log.trace "helperFindCurrentBooking ${helperLogBooking(booking)}"
             return true
         }
 
@@ -1840,11 +1860,11 @@ List sbConnectionStatus() {
     List lines = []
     if (state.sbConnected) {
         String to = [state.sbOrgName, state.sbHubName].findAll { it }.collect { bookingsEsc(it) }.join(' &rarr; ')
-        lines << "<b>SignalBricks:</b> Connected${to ? ' to ' + to : ''}${state.sbConnectedAt ? ' since ' + bookingsEsc(state.sbConnectedAt) : ''}"
+        lines << "<b>Status:</b> Connected${to ? ' to ' + to : ''}${state.sbConnectedAt ? ' since ' + bookingsEsc(state.sbConnectedAt) : ''}"
     } else if (state.sbCredential) {
-        lines << '<b>SignalBricks:</b> Authorized, not registered yet (click Done to retry, or Reconnect)'
+        lines << '<b>Status:</b> Authorized, not registered yet (click Done to retry, or Reconnect)'
     } else {
-        lines << '<b>SignalBricks:</b> Not connected'
+        lines << '<b>Status:</b> Not connected'
     }
     if (state.sbLastError) lines << "<b>Last connect error:</b> ${bookingsEsc(state.sbLastError)}"
     String retry = sbRegisterRetryStatus()

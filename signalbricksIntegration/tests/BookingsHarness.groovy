@@ -1,7 +1,9 @@
 // Bookings page (#29) for SignalBricks Integration with a stubbed Hubitat
 // sandbox: renders with no state (as when the hub saves the code), each
 // booking's lock status (on lock by name or by tracked slot, not on lock),
-// orphans, the summary and last sync, and that codes are masked to their last
+// orphans, the summary and last sync, the layout (bold booking heading, its
+// locks indented under it, a current booking's "not on lock" highlighted,
+// header-style section titles), and that codes are masked to their last
 // 2 digits and never rendered or logged in full.
 // Fake values only; nothing is sent to a hub.
 import groovy.json.JsonOutput
@@ -30,6 +32,7 @@ abstract class HubitatStub extends Script {
     def log = [info: { logged << it.toString() }, warn: { logged << it.toString() }, debug: { logged << it.toString() }, trace: { logged << it.toString() }, error: { logged << it.toString() }]
     List scheduled = []
     List paragraphs = []
+    List sectionTitles = []
     List hrefs = []
     Map inputs = [:]
     def app = [id: 1]
@@ -40,7 +43,11 @@ abstract class HubitatStub extends Script {
     Closure pages
     void page(Map m, Closure c = null) { if (c) c() }
     def dynamicPage(Map m, Closure c) { c() }
-    void section(Object... args) { args.find { it instanceof Closure }?.call() }
+    void section(Object... args) {
+        def m = args.find { it instanceof Map }
+        if (m?.title) sectionTitles << m.title
+        args.find { it instanceof Closure }?.call()
+    }
     void paragraph(String s) { paragraphs << s }
     void input(Map m) { inputs[m.name] = m }
     void href(Map m) { hrefs << m }
@@ -84,7 +91,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.0', app.sbAppVersion == '1.4.0')
+check('version is 1.4.1', app.sbAppVersion == '1.4.1')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -140,17 +147,28 @@ app.logged.clear()
 String page = bookingsPage()
 check("render: no log lines while rendering (${app.logged.size()})", app.logged.isEmpty())
 Map v = app.bookingsView()
-def row = { String id -> v.bookings.find { it.contains("<b>ORB${id}</b>") } ?: '' }
+def row = { String id -> v.bookings.find { it.startsWith("<b>ORB${id} ") } ?: '' }
+String missing = app.bookingsMissing
+String indent = "<div style='margin-left:1.5em'>"
+
+// Layout (#36)
+app.sectionTitles.clear(); bookingsPage()
+check('layout: section titles are headers', app.sectionTitles == ['<h2>Summary</h2>', '<h2>Known bookings</h2>', '<h2>Orphans</h2>'])
+check('layout: booking heading is bold with name, status, dates and masked code, its locks indented under it',
+    row('88') ==~ /<b>ORB88 Ann &middot; current &middot; \d{4}-\d\d-\d\d \d\d:\d\d to \d{4}-\d\d-\d\d \d\d:\d\d &middot; code ${bullets}88<\/b>${indent}.*<\/div>/)
+check('layout: one paragraph per booking', v.bookings.size() == 8 && v.bookings.every { it.count('<b>ORB') == 1 && it.count(indent) == 1 })
+check('layout: "not on lock" is highlighted', missing.contains('not on lock') && missing.contains('color:'))
+check('layout: only a current booking\'s "not on lock" is highlighted', ['77', '55', '44'].every { !row(it).contains(missing) })
 
 // On lock
-check('on lock: by name, with its slot', row('88').contains('Front: slot 50<br>'))
+check('on lock: by name, with its slot', row('88').contains(indent + 'Front: slot 50<br>'))
 check('on lock: by a slot the app assigned earlier', row('66').contains('Front: slot 54') && !row('66').contains('reconcile'))
 check('on lock, past: flagged as removed by reconcile', row('33').contains('past') && row('33').contains('Front: slot 55 &mdash; reconcile will remove it (past checkout)'))
 check('on lock, upcoming: flagged as early', row('22').contains('upcoming') && row('22').contains('Front: slot 56 (early: reconcile removes it until check-in)'))
 // Not on lock
-check('not on lock: current booking, assigned lock without the code', row('88').contains('Back &lt;Door&gt;: <b>not on lock</b>'))
-check('not on lock: current booking, lock not selected', row('11').contains('lock 9 (not selected in this app): <b>not on lock</b>'))
-check('not on lock: upcoming says added at check-in', row('77').contains('Back &lt;Door&gt;: not on lock (added at check-in)') && row('55').contains('lock 9 (not selected in this app)'))
+check('not on lock: current booking, assigned lock without the code', row('88').contains('Back &lt;Door&gt;: ' + missing))
+check('not on lock: current booking, lock not selected', row('11').contains('lock 9 (not selected in this app): ' + missing))
+check('not on lock: upcoming says added at check-in', row('77').contains('Back &lt;Door&gt;: not on lock (added at check-in)') && row('55').contains('lock 9 (not selected in this app): not on lock (added at check-in)'))
 check('not on lock: past says removed after checkout', row('44').contains('Front: not on lock (removed after checkout)'))
 check('lock that never reported codes: "no codes reported"', row('88').contains('Garage: no codes reported') && page.contains('<b>Garage:</b> has reported no codes yet'))
 check('unreadable lockCodes: noted, not counted', page.contains('<b>Side:</b> its lockCodes could not be read'))
@@ -172,7 +190,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.0'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.1'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')
