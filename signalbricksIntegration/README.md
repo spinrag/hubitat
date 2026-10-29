@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.4.1*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.4.2*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -78,7 +78,7 @@ Added in 1.3.7. Open the app and click **Bookings** under **Diagnostics**. The p
 - **Known bookings:** one entry per booking, with a bold heading line: booking id, guest, whether it is current, upcoming or past, check-in and checkout in hub time, and the masked code. Under it, indented, one line for each lock assigned to the booking: the slot that holds its code, matched the same way reconcile matches (its prefix + `ORB<booking id>`, or a slot the app assigned earlier), or *not on lock*. For a current booking, *not on lock* is shown in bold red. An upcoming booking's line says *added at check-in*, a past one's *removed after checkout*. A current booking that is not on a lock is the case to look at (try **Debug** → **Reconcile Door Codes**). A code still on the lock for an upcoming or past booking is flagged, because the next reconcile removes it (an upcoming booking's code is added again at check-in). A lock that has never reported its codes shows *no codes reported* and is not counted (reconcile skips it too); run a [door code refresh](#door-code-refresh) for it.
 - **Orphans:** codes on the selected locks that carry the app's prefix and an `ORB` booking id (or sit in a slot it assigned) but match no known booking for that lock. The next reconcile removes them. Many orphans and few known bookings usually means the dispatcher's last full sync left bookings out.
 
-Codes are shown masked, with only their last 2 digits (e.g. `••••12`), and are never logged. Since 1.4.1 no log line, at any level, carries a door code or the access token: the sync endpoints log the number of bookings with their ids and guest names, and reconcile logs lock ids and slot numbers. A lock whose codes the hub can't read (e.g. encrypted lock codes) is noted and not counted.
+Codes are shown masked, with only their last 2 digits (e.g. `••••12`), and are never logged. Since 1.4.1 no log line, at any level, carries a door code or the access token: the sync endpoints log the number of bookings with their ids and guest names, and reconcile logs lock ids and slot numbers. Since 1.4.2 an endpoint that fails (`500`) logs and returns only the handler and the exception's class, e.g. `apiSync failed (MissingMethodException)`, never the exception's message, which can carry the request body and its codes. A lock whose codes the hub can't read (e.g. encrypted lock codes) is noted and not counted.
 
 ## Conflicts
 
