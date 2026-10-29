@@ -356,6 +356,14 @@ docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-
 
 Each prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It checks behaviour in the stub only, not on a real hub. Pass `/w/beta/app.groovy` instead to test the [beta copy](#beta-channel); CI runs both.
 
+To look at the Connect confirmation pages without connecting a hub, give `ConnectHarness` a writable directory as a second argument. It writes each outcome page there as `connected.html`, `failed.html`, `denied.html`, `missing.html` and `expired.html` (with fake values), to open in a browser on a phone-sized window and a desktop, in light and dark mode:
+
+```bash
+mkdir -p /tmp/sb-pages
+docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" -v /tmp/sb-pages:/out groovy:4.0-jdk17 \
+  groovy /w/tests/ConnectHarness.groovy /w/app.groovy /out
+```
+
 ## Privacy
 
 - **By default, door codes (PINs) are never sent; only the code slot/name used.** The app never subscribes to `lockCodes`. Lock drivers include the code used in an unlock event's `data`. Before sending any event, the app removes every code/PIN field from `data` (keeping slot numbers and code names) and drops `data` entirely if it can't be parsed. `lastCodeName` is the *name* of the code that was used (for example, a guest or booking label), not the code.

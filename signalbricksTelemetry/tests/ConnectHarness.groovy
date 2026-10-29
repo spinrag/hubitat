@@ -3,8 +3,11 @@
 // missing code, expired link), styled like SignalBricks Integration's (#40):
 // headline and marker, inline CSS only, no-referrer, the back link and its
 // validation, escaped text, and no token, code, verifier or request param on
-// the page. Also checks the token is still rotated on every callback.
+// the page. Also checks the token is still rotated on every callback, and that
+// the app page's Last error is escaped.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
+// Optional second argument: a directory to write each outcome page to as
+// <outcome>.html, to open in a browser (see the README's Development section).
 import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
@@ -147,24 +150,35 @@ check('page connected: says Connected on reopen', pages.connected.contains('<b>S
 // --- Dynamic text is escaped, request params are never rendered ---
 withVerifier('c')
 app.tokenReply = new IllegalStateException('<script>alert(0)</script>')
+app.logged.clear()
 result = callback([code: '<script>fake-code</script>', access_token: '<script>fake-token</script>'])
 check('escape: exception message not on the page', result.data.contains('Connection failed') && !result.data.contains('alert(0)'))
 check('escape: no request param on the page', !result.data.contains('fake-code') && !result.data.contains('fake-token') && !result.data.contains('<script'))
-app.state.sbToken = null
-app.metaClass.handleOauthCallback = { ->
-    delegate.state.lastError = '<script>alert(1)</script> & "x"'
-    delegate.renderPage(false, 'Connection failed', "Could not complete the connection: ${delegate.escapeHtml(delegate.state.lastError)}.")
-}
+check('logs: token exchange failure logs the exception class only', app.logged.any { it.contains('token exchange failed: IllegalStateException') } && !app.logged.any { it.contains('alert(0)') })
+// The real failed-exchange path with markup in the reason: "HTTP <script>..."
+withVerifier('d')
+app.tokenReply = '<script>alert(1)</script> & "x"'
 result = callback([code: 'fake-auth-code-6'])
-check('escape: the error text is escaped', result.data.contains('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;') && !result.data.contains('<script'))
-app.metaClass = null
+check('escape: the error text is escaped', app.state.lastError == 'Token exchange returned HTTP <script>alert(1)</script> & "x"' && result.data.contains('HTTP &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;') && !result.data.contains('<script'))
+// Connected app page: Last error escaped
+app.paragraphs.clear()
+app.mainPage()
+String connectedHtml = app.paragraphs.join('\n')
+check('app page connected: Last error escaped', app.state.sbToken && connectedHtml.contains('<b>Status:</b> Connected') && connectedHtml.contains('<b>Last error:</b> Token exchange returned HTTP &lt;script&gt;alert(1)&lt;/script&gt;') && !connectedHtml.contains('<script'))
+app.state.sbToken = null
+app.logged.clear()
+callback([error: 'access_denied'])
+check('logs: access_denied logged as fixed text', app.logged.any { it == 'SignalBricks connect cancelled: access denied' } && !app.logged.any { it.contains('access_denied') })
+app.logged.clear()
 result = callback([error: '<script>alert(2)</script>'])
 check('escape: the error param is not rendered', !result.data.contains('alert(2)') && !result.data.contains('<script') && result.data.contains('Not connected'))
+check('logs: the error param is not logged, fixed text instead', app.logged.any { it == 'SignalBricks connect cancelled: other error' } && !app.logged.any { it.contains('alert(2)') })
+
 // The raw error is only on the app page, escaped there
 app.paragraphs.clear()
 app.mainPage()
 String mainHtml = app.paragraphs.join('\n')
-check('app page: Last error shows the raw error escaped', mainHtml.contains('<b>Last error:</b> SignalBricks did not authorize this hub (&lt;script&gt;alert(2)&lt;/script&gt;)') && !mainHtml.contains('<script'))
+check('app page not connected: Last error shows the raw error escaped', mainHtml.contains('<b>Last error:</b> SignalBricks did not authorize this hub (&lt;script&gt;alert(2)&lt;/script&gt;)') && !mainHtml.contains('<script'))
 
 // --- Back link validation: guidance instead of the link ---
 String goodIp = app.location.hub.localIP
@@ -186,6 +200,11 @@ check('no location: still renders, no link', result.data.contains('Not connected
 
 // --- Nothing secret logged ---
 check('logs: no token, verifier or code', !app.logged.any { l -> secrets.any { it && l.contains(it) } || l.contains('fake-auth-code') })
+
+if (args.length > 1) {
+    pages.each { k, html -> new File(args[1], "${k}.html").text = html }
+    println "Wrote ${pages.keySet().join(', ')} to ${args[1]}"
+}
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

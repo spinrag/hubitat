@@ -682,7 +682,8 @@ Map handleOauthCallback() {
     state.remove('pkceVerifier')
     if (params.error || !code) {
         String reason = params.error ?: 'no authorization code returned'
-        log.warn "SignalBricks connect cancelled: ${reason}"
+        // Fixed text only: the error param comes from the request.
+        log.warn "SignalBricks connect cancelled: ${params.error == 'access_denied' ? 'access denied' : (params.error ? 'other error' : 'no authorization code')}"
         // The raw error goes to the app page only; the callback page never shows a request param.
         state.lastError = "SignalBricks did not authorize this hub (${reason})"
         return renderPage(false, 'Not connected',
@@ -725,7 +726,7 @@ Map handleOauthCallback() {
     } catch (Exception e) {
         // Do not log the exception body; it may echo request data.
         state.lastError = "Token exchange failed: ${e.class.simpleName}"
-        log.warn "SignalBricks token exchange failed: ${e.message}"
+        log.warn "SignalBricks token exchange failed: ${e.class.simpleName}"
     }
 
     if (state.sbToken && !state.lastError) {
