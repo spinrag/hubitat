@@ -252,6 +252,7 @@ headlines.each { k, h ->
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Integration: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
     check("page ${k}: inline CSS only, light and dark", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
     check("page ${k}: back link to the app on the hub, with guidance", html.contains('<a class="btn" href="http://192.168.1.10/installedapp/configure/42">Back to the app</a>') && html.contains('Apps</b> &rarr; <b>SignalBricks Integration'))
+    check("page ${k}: no-referrer, so the back link doesn't send the callback URL", html.contains('<meta name="referrer" content="no-referrer">'))
     check("page ${k}: no token, code or verifier", !secrets.any { it && html.contains(it) } && !html.contains('access_token') && !html.contains('fake-auth-code') && !html.contains('fake-app-token'))
 }
 check('page authorized: says Connected on reopen', callbackPages.authorized.contains('<b>Connected</b>') && callbackPages.authorized.contains('finishing registration'))

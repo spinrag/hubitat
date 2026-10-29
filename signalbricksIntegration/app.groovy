@@ -2143,7 +2143,7 @@ Map sbRenderPage(boolean ok, String headline, String detailHtml, String nextHtml
 @media (prefers-color-scheme:dark){:root{--bg:#0b0f14;--card:#161b22;--text:#e6edf3;--muted:#9da7b3;--border:#30363d;--ok:#3fb950;--err:#f85149;--on-mark:#0b0f14;--link:#58a6ff}}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{width:100%;max-width:28rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px}
+main{width:100%;max-width:28rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;overflow-wrap:anywhere}
 .app{margin:0 0 16px;color:var(--muted);font-size:14px}
 h1{display:flex;align-items:center;gap:12px;margin:0 0 12px;font-size:22px;line-height:1.3}
 .mark{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;color:var(--on-mark);font-size:18px;font-weight:700}
