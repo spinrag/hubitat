@@ -763,6 +763,24 @@ check('set: first send throws -> logged by class name only', app.logged.any { it
 app.state.remove('pendingCodeChanges'); app.scheduled.clear()
 check('set: first send throws on an empty slot -> nothing pending, no job', { lock3.throwOnSet = true; def r = call('apiSetCode'); lock3.throwOnSet = false; r.status == 502 }() && pendingFor(22) == null && !verifyJobs())
 
+// The send works but reporting the old change as superseded throws: the new
+// change stays stored, the request still succeeds and the write is not refunded
+String SS = 'dddddddd-0000-4000-8000-000000000005'
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 22, code: '91922225', name: 'SBM: Before report throw', requestId: SR]]
+call('apiSetCode')
+app.state.writeTimes = [app.now()]
+app.logged.clear()
+postMark = app.posts.size()
+app.throwOnPost = true
+app.request = [JSON: [slot: 22, code: '91922226', name: 'SBM: Report throws', requestId: SS]]
+def reportThrows = call('apiSetCode')
+app.throwOnPost = false
+check('superseded report throws -> 202, new change stored, write kept',
+    reportThrows.status == 202 && pendingFor(22)?.requestId == SS && verifyJobs().size() == 1 && app.state.writeTimes.size() == 2)
+check('superseded report throws -> logged by class name only', app.logged.any { it.toString().contains('superseded report failed') && it.toString().contains('IllegalArgumentException') } && !leaked('91922226', postMark) && !leaked('91922225', postMark))
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+
 putSlot(25, 'SBM: Delete me', '91925555')
 postMark = app.posts.size()
 app.logged.clear()

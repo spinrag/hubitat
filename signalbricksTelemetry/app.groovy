@@ -1604,7 +1604,14 @@ void startCodeChange(Map r, String action, String name, String code, String requ
     Map p = [lockId: lockId, slot: r.slot, action: action, name: name, prevName: r.currentName, requestId: requestId, attempts: 0, createdAt: now(), status: 'pending']
     if (code) p.code = code
     sendCodeChange(p, r.lock)
-    if (old?.status == 'pending' && old.requestId != requestId) reportCodeResult(old, 'superseded', null)
+    if (old?.status == 'pending' && old.requestId != requestId) {
+        // The new change is stored: a failed report must not fail the request.
+        try {
+            reportCodeResult(old, 'superseded', null)
+        } catch (Exception e) {
+            log.warn "SignalBricks Telemetry: superseded report failed for lock ${lockId} slot ${r.slot} (${e.class.simpleName})"
+        }
+    }
 }
 
 // Sends the command, stores the change and schedules its first check.
