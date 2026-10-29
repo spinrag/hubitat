@@ -194,6 +194,14 @@ check('fullControl alone: unregistered slots stay refused', [3, 28, 22, 33].ever
 check('fullControl alone: no lock commands', lock.calls.isEmpty())
 app.fullControlLocks = null
 
+// fullControl: false grants nothing and isn't stored
+check('fullControl false: accepted, not stored', push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: false]]).status == 200 &&
+    lockCfg() == [adopted: [], registered: [[slot: 22, name: 'Dog Walker']]])
+app.fullControlLocks = ['9']
+check('fullControl false: empty registered slot outside the ranges refused', body(setCode(22, 'Dog Walker', '60600099')).error == 'slot_not_allowed' && slotOf(22) == null)
+app.fullControlLocks = null
+check('fullControl false: no lock commands', lock.calls.isEmpty())
+
 // --- Config validation ---
 Map before = app.state.lockConfig
 def bad = { String label, Map lockEntry ->
@@ -272,6 +280,32 @@ check('custom name in range: fingerprinted', fps().contains(18))
 check('custom name in range: reveal ok', body(reveal(18)).code == '60600098')
 check('empty registered slot outside the ranges: refused without full control', body(setCode(22, 'Dog Walker', '60600097')).error == 'slot_not_allowed')
 check('empty registered slot above the ceiling: refused', body(setCode(33, 'Painter', '60600097')).error == 'slot_not_allowed')
+
+// --- Empty slot holding only a strict-only booking name (no code): refused ---
+// isBookingName misses these (lower case, G: without ORB); the strict rule must catch them.
+['g: guest', 'orb5', 'G: Gardener'].each { String n ->
+    push(['9': [registered: [[slot: 19, name: 'Helper']], fullControl: true]])
+    lock.edit { it['19'] = [name: n, code: ''] }
+    fresh()
+    check("empty slot named '${n}': set refused as booking_code", body(setCode(19, 'Helper', '60600099')).error == 'booking_code' && lock.calls.isEmpty() && slotOf(19) == [name: n, code: ''])
+    check("empty slot named '${n}': not allowed in /slots", slots()[19].allowedAs == null)
+}
+lock.edit { it.remove('19') }
+
+// --- A booking code at or under the ceiling blocks writes outside the ranges (fail closed) ---
+push(['9': [registered: [[slot: 22, name: 'Dog Walker'], [slot: 18, name: 'Cleaner Two']], fullControl: true]])
+app.fullControlLocks = ['9']
+fresh()
+def ov = setCode(22, 'Dog Walker', '60600097')
+check('overlap: booking code in slot 5 refuses empty writes outside the ranges', ov.status == 409 && body(ov).error == 'booking_region_overlap' && slotOf(22) == null && lock.calls.isEmpty())
+check('overlap: /slots shows the slot not allowed', slots()[22] == null || slots()[22].allowedAs == null)
+check('overlap: in-range registered writes still allowed', setCode(18, 'Cleaner Two', '60600096').status == 202)
+settle()
+putSlot(5, null, null)
+lock.edit { it['7'] = [name: 'g: guest two', code: '60600094'] }
+fresh()
+check('overlap: a strict-only booking name at or under the ceiling also blocks', body(setCode(22, 'Dog Walker', '60600097')).error == 'booking_region_overlap')
+lock.edit { it.remove('7') }
 
 // --- Full control: empty slots outside the ranges, never above the ceiling ---
 push(['9': [registered: [[slot: 18, name: 'Cleaner Two'], [slot: 22, name: 'Dog Walker'], [slot: 33, name: 'Painter']], fullControl: true]])
@@ -393,6 +427,33 @@ lock.dropSets = 0
 settle()
 check('registration removed in range: the custom name is not re-sent, failed', lock.calls == [['setCode', 18, 'Cleaner 2']] &&
     lastResult().result == 'failed' && lastResult().reason in ['slot_not_managed', 'name_not_allowed'] && slotOf(18) == [name: 'Cleaner 2', code: '60600096'])
+
+// --- A rename cancelled while a set under the new name is in flight (H1) ---
+push(['9': [registered: [[slot: 22, name: 'Dog Walker', pendingName: 'Dog Walker Two']], fullControl: true]])
+fresh()
+lock.dropSets = 99
+check('cancelled rename: set under the pending name accepted', setCode(22, 'Dog Walker Two', '60600093').status == 202)
+push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]])
+check('cancelled rename: the set is dropped by the push itself (not at its next check)', !app.state.pendingCodeChanges && lastResult().reason == 'name_not_allowed' && !verifyJobs())
+lock.dropSets = 0
+settle()
+check('cancelled rename: in-flight change dropped as name_not_allowed, never re-sent', !app.state.pendingCodeChanges && lastResult().result == 'failed' &&
+    lastResult().reason == 'name_not_allowed' && lock.calls.count { it[0] == 'setCode' } == 1 && slotOf(22) == [name: 'Dog Walker', code: '60600097'])
+// Same for a relocate (rename) in flight.
+push(['9': [registered: [[slot: 22, name: 'Dog Walker', pendingName: 'Dog Walker Two']], fullControl: true]])
+fresh()
+lock.dropSets = 99
+check('cancelled rename: relocate accepted', relocate(22, [name: 'Dog Walker Two']).status == 202)
+push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]])
+check('cancelled rename: the relocate is dropped by the push itself', !app.state.pendingCodeChanges && !verifyJobs())
+lock.dropSets = 0
+settle()
+def lastRelocate = app.posts.findAll { it.params.body?.contains('"relocate_result"') }.collect { new JsonSlurper().parseText(new JsonSlurper().parseText(it.params.body).data) }[-1]
+check('cancelled rename: relocate dropped as name_not_allowed, slot keeps the old name', !app.state.pendingCodeChanges && lastRelocate.reason == 'name_not_allowed' &&
+    lock.calls.count { it[0] == 'setCode' } == 1 && slotOf(22) == [name: 'Dog Walker', code: '60600097'])
+check('cancelled rename: a delete in flight is kept', { push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]]); fresh(); lock.dropDeletes = 99
+    deleteCode(22); push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]]); lock.dropDeletes = 0
+    boolean kept = app.state.pendingCodeChanges?.containsKey('9:22'); settle(); kept && slotOf(22) == null }())
 
 // --- Turning lock management off, or disconnecting, drops the hub switch ---
 app.fullControlLocks = ['9']

@@ -1067,7 +1067,7 @@ Map pendingAdoptedOptions() {
         def entry = codes?.get(parts[1])
         String name = entry instanceof Map ? entry.name?.toString() : null
         String label = "${lock.displayName}: slot ${parts[1]}${name ? " (${escapeHtml(name)})" : ' (empty)'}"
-        if (isBookingName(name)) label += ' - booking code, always refused'
+        if (isBookingName(name) || isStrictBookingName(name)) label += ' - booking code, always refused'
         options[key] = label
     }
     return options
@@ -1209,7 +1209,7 @@ Map apiListSlots() {
         // versions know no other value) plus registered: true, and only while
         // the hub would let SignalBricks touch them.
         if (cls == 'registered') {
-            Boolean ok = registeredSlotRefusal(lock.id.toString(), slot, name, set, true) == null
+            Boolean ok = registeredSlotRefusal(lock.id.toString(), slot, name, set, true, codes) == null
             return [slot: slot, name: name, set: set, allowedAs: ok ? 'adopted' : null, registered: true]
         }
         [slot: slot, name: name, set: set, allowedAs: cls]
@@ -1333,7 +1333,7 @@ Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
     if (isBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
     if (cls == 'registered') {
-        Map refusal = registeredSlotRefusal(lock.id.toString(), slot, currentName, occupied, allowEmpty)
+        Map refusal = registeredSlotRefusal(lock.id.toString(), slot, currentName, occupied, allowEmpty, codes)
         if (refusal) return refusal
     }
     String prefix = classPrefix(cls)
@@ -1350,7 +1350,11 @@ Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
 // is never taken over; an empty slot is written only within the ceiling (never
 // where the booking apps pick free slots), and outside the admin/managed
 // ranges only on a full-control lock. Null when allowed.
-Map registeredSlotRefusal(String lockId, Integer slot, String currentName, Boolean occupied, Boolean allowEmpty) {
+// A booking-named code (strict rule) at or under the ceiling means the booking
+// apps also write there (their minimum code position is at or below the
+// ceiling), so new codes outside the class ranges could race them: refused
+// (fail closed) until the overlap is fixed. `codes` is the lock's lockCodes.
+Map registeredSlotRefusal(String lockId, Integer slot, String currentName, Boolean occupied, Boolean allowEmpty, Map codes) {
     if (isStrictBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
     Map entry = registeredEntry(lockId, slot)
     if (occupied) {
@@ -1362,7 +1366,18 @@ Map registeredSlotRefusal(String lockId, Integer slot, String currentName, Boole
     if (!fullControlOn(lockId) && !inClassRange(lockId, slot)) {
         return refuse('slot_not_allowed', 403, 'empty registered slots outside the admin and managed ranges need full control on the lock')
     }
+    if (!inClassRange(lockId, slot) && bookingCodeAtOrUnderCeiling(codes)) {
+        return refuse('booking_region_overlap', 409, 'a booking code sits at or under the ceiling; keep the booking apps\' minimum code position above the ceiling')
+    }
     return null
+}
+
+Boolean bookingCodeAtOrUnderCeiling(Map codes) {
+    Integer ceiling = managedCeiling()
+    return (codes ?: [:]).any { k, v ->
+        k.toString() ==~ /\d{1,4}/ && k.toString().toInteger() <= ceiling && v instanceof Map &&
+            v.code != null && v.code.toString() != '' && (isBookingName(v.name?.toString()) || isStrictBookingName(v.name?.toString()))
+    }
 }
 
 Boolean inClassRange(String lockId, Integer slot) {
@@ -1972,12 +1987,24 @@ void promoteRegisteredName(String lockId, Integer slot, String name) {
 
 // After POST /lockConfig: drop changes whose slot is no longer allowed (an
 // in-flight one is reported failed), since they could never be re-sent.
+// Also drops a set or relocate on a registered slot whose name the new config
+// no longer accepts (#684: e.g. a rename cancelled back to the old name), so a
+// late re-send can't leave a name on the lock that no registration accepts.
 void dropDisallowedCodeChanges() {
     Map all = pendingCodeChanges()
-    Map gone = all.findAll { k, p -> slotClass(p.lockId, p.slot as Integer) == null || (p.fromSlot != null && slotClass(p.lockId, p.fromSlot as Integer) == null) }
+    Map reasons = [:]
+    all.each { k, p ->
+        if (slotClass(p.lockId, p.slot as Integer) == null || (p.fromSlot != null && slotClass(p.lockId, p.fromSlot as Integer) == null)) {
+            reasons[k] = 'slot_not_allowed'
+        } else if (p.action != 'delete' && slotClass(p.lockId, p.slot as Integer) == 'registered' &&
+                   !registeredNameMatches(registeredEntry(p.lockId, p.slot as Integer), p.name?.toString())) {
+            reasons[k] = 'name_not_allowed'
+        }
+    }
+    Map gone = all.findAll { k, p -> reasons.containsKey(k) }
     if (!gone) return
     gone.each { k, p ->
-        if (p.status == 'pending') reportCodeResult(p, 'failed', 'slot_not_allowed')
+        if (p.status == 'pending') reportCodeResult(p, 'failed', reasons[k])
         withdrawApprovalIfSourceEmpty(p)
         all.remove(k)
     }
