@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.2' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.3' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -1870,29 +1870,34 @@ def oauthCallback() {
     // logs: replace it whatever happens next. SignalBricks gets the new one below.
     state.accessToken = createAccessToken()
 
-    String message = null
+    // Page text is fixed or built from the app's own state, never from a request param
+    Map page = null
     if (error || !code) {
         state.sbLastError = "SignalBricks did not authorize this hub (${error ?: 'no authorization code'})"
-        message = state.sbLastError + '. You can close this window and try again from the app.'
+        page = [headline: 'Not connected',
+            detail: error == 'access_denied' ? 'Sign-in was cancelled, or SignalBricks denied access.' : 'SignalBricks did not authorize this hub.']
     } else if (!verifier) {
         state.sbLastError = 'Connect session expired; start again from the app'
-        message = 'This connect link is no longer valid. Close this window and click Connect to SignalBricks again in the app.'
+        page = [headline: 'Connect link expired', detail: 'This connect link is no longer valid.']
     } else {
         sbExchangeCode(code, verifier)
     }
-    boolean authorized = !message && !state.sbLastError
+    boolean authorized = !page && !state.sbLastError
     // Register the new token: with the new credential, or (failed exchange) the one held before.
     // In the background: SignalBricks verifies the token by calling this app's /info through
     // Hubitat cloud, which can't run until this callback has returned (the app is single-threaded).
     if (state.sbCredential) sbRegister()
 
-    if (!message) {
-        message = authorized
-            ? 'SignalBricks authorized this hub. The app is registering with SignalBricks now: reopen the app in a few seconds to see Connected. You can close this window.'
-            : "Could not complete the connection (${state.sbLastError ?: 'unknown error'}). Close this window and try again from the app."
+    if (authorized) {
+        page = [headline: 'Hub authorized', ok: true,
+            detail: 'The app is finishing registration with SignalBricks.',
+            next: 'Reopen the app in a few seconds: it shows <b>Connected</b>. You can close this window.']
+    } else if (!page) {
+        page = [headline: 'Connection failed', detail: "Could not complete the connection: ${state.sbLastError ?: 'unknown error'}."]
     }
     log.info "${sbAppNameAndVersion}: ${authorized ? 'authorized by SignalBricks, registering' : 'SignalBricks connect failed'}"
-    return sbRenderPage(authorized ? 'Connecting' : 'Not connected', bookingsEsc(message))
+    return sbRenderPage(page.ok == true, page.headline, bookingsEsc(page.detail),
+        page.next ?: 'Close this window, open the app and connect again from its <b>Connection</b> section.')
 }
 
 // Token step: the code + PKCE verifier for the connection credential
@@ -2122,10 +2127,48 @@ Integer sbHttpStatus(Exception e) {
     }
 }
 
-Map sbRenderPage(String title, String message) {
-    String html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${sbAppName}</title></head>
-<body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
-<h2>${sbAppName}: ${title}</h2><p>${message}</p></body></html>"""
+// The page oauthCallback returns through Hubitat cloud (#40): one self-contained response,
+// inline CSS only. detailHtml and nextHtml must be escaped by the caller.
+Map sbRenderPage(boolean ok, String headline, String detailHtml, String nextHtml) {
+    String title = bookingsEsc(sbAppName + ': ' + headline)
+    String back = sbAppPageUrl()
+    String backHtml = back
+        ? """<a class="btn" href="${bookingsEsc(back)}">Back to the app</a>
+<p class="hint">The link works on the hub's local network. Elsewhere, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${bookingsEsc(sbAppName)}</b> on the hub.</p>"""
+        : """<p class="hint">To get back to the app, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${bookingsEsc(sbAppName)}</b> on the hub.</p>"""
+    String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>${title}</title>
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;--ok:#15803d;--err:#b91c1c;--on-mark:#fff;--link:#1d4ed8}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0f14;--card:#161b22;--text:#e6edf3;--muted:#9da7b3;--border:#30363d;--ok:#3fb950;--err:#f85149;--on-mark:#0b0f14;--link:#58a6ff}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{width:100%;max-width:28rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px}
+.app{margin:0 0 16px;color:var(--muted);font-size:14px}
+h1{display:flex;align-items:center;gap:12px;margin:0 0 12px;font-size:22px;line-height:1.3}
+.mark{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;color:var(--on-mark);font-size:18px;font-weight:700}
+.ok .mark{background:var(--ok)}.err .mark{background:var(--err)}
+p{margin:0 0 12px}
+.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;color:var(--link);font-weight:600;text-decoration:none}
+.btn:hover,.btn:focus{text-decoration:underline}
+.hint{margin:16px 0 0;color:var(--muted);font-size:14px}
+</style></head>
+<body><main class="${ok ? 'ok' : 'err'}">
+<p class="app">${bookingsEsc(sbAppNameAndVersion)}</p>
+<h1><span class="mark" aria-hidden="true">${ok ? '&#10003;' : '!'}</span>${bookingsEsc(headline)}</h1>
+<p>${detailHtml}</p>
+<p>${nextHtml}</p>
+${backHtml}
+</main></body></html>"""
     return render(contentType: 'text/html', data: html, status: 200)
+}
+
+// The app's page on the hub, by local IP; null when it can't be built
+String sbAppPageUrl() {
+    try {
+        String ip = location?.hub?.localIP?.toString()
+        String id = app?.id?.toString()
+        if (ip ==~ /\d{1,3}(\.\d{1,3}){3}/ && id ==~ /\d+/) return "http://${ip}/installedapp/configure/${id}"
+    } catch (Exception ignored) { }
+    return null
 }
