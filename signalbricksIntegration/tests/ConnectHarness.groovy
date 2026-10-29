@@ -102,7 +102,7 @@ def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.3', app.sbAppVersion == '1.4.3')
+check('version is 1.4.4', app.sbAppVersion == '1.4.4')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -137,7 +137,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.3' && q.location == 'Ross Farm House')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.4' && q.location == 'Ross Farm House')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -160,12 +160,12 @@ secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.3', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.4', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.3')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.4')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
@@ -184,11 +184,13 @@ check('legacy sbId: cleared by Done (updated)', app.state.sbId == null && app.at
 app.state.sbId = 'sb-legacy-fake'; app.atomicState.sbId = 'sb-legacy-fake'
 app.appButtonHandler('btnReset')
 check('legacy sbId: cleared by Reset State', app.state.sbId == null && app.atomicState.sbId == null)
-check('page: Reconnect and Disconnect when connected', app.hrefs.any { it.name == 'hrefSbReconnect' } && app.inputs.btnSbDisconnect)
+mainPage()
+check('page: Reconnect button (no link until clicked, #46) and Disconnect when connected', app.inputs.btnSbReconnect && !app.hrefs.any { it.url?.contains('access_token') } && app.inputs.btnSbDisconnect)
 check('page: no access token or credential shown when connected', !page.contains(app.state.accessToken) && !page.contains(CREDENTIAL))
 
 // --- Reconnect: new credential, token rotated again, registered again ---
 String beforeReconnect = app.state.accessToken
+app.appButtonHandler('btnSbReconnect')
 mainPage()
 String reconnectUrl = app.hrefs.find { it.name == 'hrefSbReconnect' }.url
 check('reconnect: a fresh verifier', app.state.sbPkceVerifier && app.state.sbPkceVerifier != verifier)
@@ -391,7 +393,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.3'
+app.state.sbRegisteredVersion = '1.4.4'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -403,7 +405,7 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.3' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.4' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text

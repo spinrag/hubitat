@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.3' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.4' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -83,8 +83,16 @@ preferences {
                 else {
                     sbConnectionStatus().each { paragraph it }
                     if (state.sbCredential) {
-                        href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbConnectUrl(),
-                            description: 'Sign in again; replaces this app\'s access token and registers the new one')
+                        // The sign-in link carries the access token SignalBricks holds, so it
+                        // exists only for a few minutes after a click (#46)
+                        String until = sbConnectLinkUntil()
+                        if (until) {
+                            href(name: 'hrefSbReconnect', title: 'Continue to SignalBricks', style: 'external', url: sbConnectUrl(),
+                                description: "Sign in again. This link works until ${until} (hub time); after that the app replaces its access token and registers the new one")
+                        } else {
+                            input(name: 'btnSbReconnect', type: 'button', title: 'Reconnect to SignalBricks')
+                            paragraph '<small>Reconnect makes a sign-in link that works for 10 minutes. Finishing it, or letting it expire, replaces this app\'s access token and registers the new one with SignalBricks. Door codes keep syncing.</small>'
+                        }
                         input(name: 'btnSbDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                         paragraph '<small>Disconnect tells SignalBricks to delete its copy of the access token, then replaces the token here, so the dispatcher can no longer reach this app.</small>'
                     } else {
@@ -315,8 +323,14 @@ void appButtonHandler(String btnName) {
         case 'btnSbDisconnect':
             sbDisconnect()
             break
+        // A short-lived Reconnect link (#46)
+        case 'btnSbReconnect':
+            sbIssueConnectLink()
+            break
         // Create/refresh access token (this will break the connection until the user reconnects)
         case 'btbAccessToken':
+            // Any open Reconnect link carried the old token, so it is dead now
+            sbConnectLinkClear()
             state.accessToken = createAccessToken()
             // SignalBricks needs the new token, or the dispatcher can't reach the app (#34)
             if (state.sbCredential) sbRegister()
@@ -342,6 +356,7 @@ void appButtonHandler(String btnName) {
             clearLegacySbId()
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
+            sbConnectLinkRearm()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
@@ -538,8 +553,9 @@ void scheduleEvents(Map bookings) {
     // timer: put back only what the cadence and the running refresh need (#24)
     codeRefreshRearm()
     scheduleCodeRefresh()
-    // ...and a pending SignalBricks registration retry (#34)
+    // ...and a pending SignalBricks registration retry (#34), and an open Reconnect link's expiry (#46)
     sbRegisterRetryRearm()
+    sbConnectLinkRearm()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -1866,6 +1882,8 @@ def oauthCallback() {
     String verifier = state.sbPkceVerifier
     // Single use: the next connect attempt gets a fresh verifier
     state.remove('sbPkceVerifier')
+    // The link was used: its expiry has nothing left to do (#46)
+    sbConnectLinkClear()
     // The access token travelled in the authorize URL's state, so copies can sit in proxy
     // logs: replace it whatever happens next. SignalBricks gets the new one below.
     state.accessToken = createAccessToken()
@@ -2103,6 +2121,8 @@ void sbDisconnect() {
         }
     }
     sbForgetConnection()
+    // The token is replaced below, so an open Reconnect link is dead already
+    sbConnectLinkClear()
     state.remove('sbLastError')
     if (revokeFailed) {
         state.sbLastError = 'Could not reach SignalBricks to disconnect. The app is disconnected here; also click Disconnect on this hub\'s SignalBricks hub page'
@@ -2117,6 +2137,63 @@ void sbForgetConnection() {
     ['sbCredential', 'sbConnected', 'sbOrgName', 'sbHubName', 'sbConnectedAt', 'sbRegisteredVersion', 'sbRegisterAttemptAt', 'sbPkceVerifier'].each {
         state.remove(it)
     }
+}
+
+// --- Reconnect link (#46) ---
+// Hubitat cloud only forwards the OAuth callback when the authorize URL's `state` carries
+// the app's current access token, and while connected that is the token the dispatcher
+// uses to send door codes. So Reconnect is a button: a click opens a link for
+// sbConnectLinkSeconds. The callback (success or failure) replaces the token and registers
+// the new one; if no callback arrives in time, sbConnectLinkExpire does the same with the
+// credential the app already holds. Either way the token in the link stops working, and
+// nothing else changes: bookings, slot assignments and pending code writes are untouched.
+// The link state is in atomicState with its expiry time, so an app-wide unschedule()
+// (scheduleEvents on every booking sync, Reset State) can put the timer back.
+Integer getSbConnectLinkSeconds() { 600 }
+
+void sbIssueConnectLink() {
+    if (!state.sbCredential || !state.accessToken) return
+    long at = now()
+    atomicState.sbConnectLink = [issuedAt: at, expiresAt: at + sbConnectLinkSeconds * 1000L]
+    runIn(sbConnectLinkSeconds, 'sbConnectLinkExpire', [overwrite: true, data: [issuedAt: at]])
+    log.info "${sbAppNameAndVersion}: Reconnect link opened for ${(int) (sbConnectLinkSeconds / 60)} minutes"
+}
+
+// The open link's expiry as hub time (HH:mm:ss), or null when no link is open. A link
+// past its expiry whose timer was lost is expired here.
+String sbConnectLinkUntil() {
+    if (state == null || atomicState == null) return null
+    Map l = atomicState.sbConnectLink
+    if (!l) return null
+    if (now() >= (l.expiresAt as long)) {
+        sbConnectLinkExpire([issuedAt: l.issuedAt])
+        return null
+    }
+    return new Date(l.expiresAt as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
+}
+
+void sbConnectLinkRearm() {
+    Map l = atomicState?.sbConnectLink
+    if (!l) return
+    long left = (long) (((l.expiresAt as long) - now()) / 1000)
+    runIn(Math.max(left, 1L), 'sbConnectLinkExpire', [overwrite: true, data: [issuedAt: l.issuedAt]])
+}
+
+void sbConnectLinkClear() {
+    atomicState.sbConnectLink = null
+    unschedule('sbConnectLinkExpire')
+}
+
+// No callback in time: the link's token must stop working. Replace it and register the
+// new one, as the callback would. A link already used, or replaced by a newer one, is left.
+void sbConnectLinkExpire(Map data) {
+    Map l = atomicState.sbConnectLink
+    if (!l || data?.issuedAt == null || (data.issuedAt as long) != (l.issuedAt as long)) return
+    atomicState.sbConnectLink = null
+    state.remove('sbPkceVerifier')
+    state.accessToken = createAccessToken()
+    log.info "${sbAppNameAndVersion}: Reconnect link expired unused; access token replaced${state.sbCredential ? ', registering it with SignalBricks' : ''}"
+    if (state.sbCredential) sbRegister()
 }
 
 Integer sbHttpStatus(Exception e) {

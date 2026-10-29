@@ -78,7 +78,7 @@ List secrets = []
 String INGEST_TOKEN = 'sbit_fakeingesttokenfakeingesttoken00'
 secrets << INGEST_TOKEN
 
-check('version is 1.5.1', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.1')
+check('version is 1.5.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.2')
 
 def callback = { Map p ->
     String before = app.state.accessToken
@@ -135,7 +135,7 @@ headlines.each { k, h ->
     String html = pages[k]
     String status = k == 'connected' ? 'ok' : 'err'
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Telemetry: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
-    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.5.1</p>'))
+    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.5.2</p>'))
     check("page ${k}: inline CSS only, light and dark, wraps long text", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && html.contains('overflow-wrap:anywhere') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
     check("page ${k}: back link to the app on the hub, with guidance", html.contains('<a class="btn" href="http://192.168.1.10/installedapp/configure/42">Back to the app</a>') && html.contains('Apps</b> &rarr; <b>SignalBricks Telemetry'))
     check("page ${k}: no-referrer, so the back link doesn't send the callback URL", html.contains('<meta name="referrer" content="no-referrer">'))
