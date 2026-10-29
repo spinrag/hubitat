@@ -31,7 +31,7 @@ Version 1.1.0 adds optional **lock code management** (off by default): SignalBri
 2. Select the locks and sensors you want to report, then click **Done** and reopen the app.
 3. Click **Connect to SignalBricks**. Sign in, then choose the **organization**, **property**, and **hub**. If this hub was connected before, it is preselected. You can also create a new hub entry. If the organization has no properties yet, you can create one on the same page.
    - If you work for a management company, choose the **property owner's organization**. Hubs belong to the owner, not the management company.
-4. After you approve, Hubitat sends you back to the app. A confirmation page appears, and the app shows **Status: Connected**.
+4. After you approve, Hubitat shows a confirmation page from the hub. Since 1.5.1 it is a card with the outcome: *Connected*, *Not connected*, *Connect link expired* or *Connection failed*, with what to do next. Its **Back to the app** link opens the app by the hub's local IP address, so it works on the hub's network; elsewhere, go back to the hub window you connected from. The app then shows **Status: Connected**. If the connect failed, the app's **Last error** line shows the reason.
 
 **Reconnect** issues a new token and revokes the previous one. **Disconnect** stops sending right away. To revoke the token on the SignalBricks side as well, remove it under **Tokens** in the portal.
 
@@ -302,7 +302,7 @@ Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots`
 After every Connect (once the access token has been rotated), on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.5.0", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true, "capabilities": ["relocate", "registered_slots", "full_control"]}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.5.1", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true, "capabilities": ["relocate", "registered_slots", "full_control"]}
 ```
 
 Since 1.4.0 `capabilities` lists the optional lock management features this version supports (`relocate`; since 1.5.0 also `registered_slots` and `full_control`), so SignalBricks only offers them on hubs that have them. Older versions don't send it.
@@ -323,7 +323,7 @@ Some newer lock drivers can store `lockCodes` encrypted (a driver preference suc
 
 ## Development
 
-`tests/LockManagementHarness.groovy` exercises the lock-management handlers against a stubbed Hubitat sandbox, with fake locks and codes, `tests/RelocateHarness.groovy` the [relocate](#relocate) endpoint, and `tests/FullControlHarness.groovy` [registered slots and full lock control](#registered-slots-and-full-lock-control), including booking codes on every new path. They are not loaded by Hubitat or HPM. Run each from the repository root with Docker:
+`tests/LockManagementHarness.groovy` exercises the lock-management handlers against a stubbed Hubitat sandbox, with fake locks and codes, `tests/RelocateHarness.groovy` the [relocate](#relocate) endpoint, `tests/FullControlHarness.groovy` [registered slots and full lock control](#registered-slots-and-full-lock-control), including booking codes on every new path, and `tests/ConnectHarness.groovy` the Connect confirmation page for each outcome (headline and marker, inline CSS only, no-referrer, the back link, escaped text, no token, code or request parameter). They are not loaded by Hubitat or HPM. Run each from the repository root with Docker:
 
 ```bash
 docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
@@ -332,6 +332,8 @@ docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-
   groovy /w/tests/RelocateHarness.groovy /w/app.groovy
 docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
   groovy /w/tests/FullControlHarness.groovy /w/app.groovy
+docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
+  groovy /w/tests/ConnectHarness.groovy /w/app.groovy
 ```
 
 Each prints one `PASS`/`FAIL` line per case and exits non-zero on any failure. It checks behaviour in the stub only, not on a real hub. Pass `/w/beta/app.groovy` instead to test the [beta copy](#beta-channel); CI runs both.

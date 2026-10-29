@@ -80,7 +80,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.5.0'
+@Field static final String APP_VERSION = '1.5.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -236,7 +236,7 @@ Map mainPage() {
                     paragraph "<small>Daily update check-in at ${checkInTime()} (hub time).</small>"
                 }
                 if (state.lastError) {
-                    paragraph "<b>Last error:</b> ${state.lastError}"
+                    paragraph "<b>Last error:</b> ${escapeHtml(state.lastError)}"
                 }
                 if (state.lockMgmtReconnectRequired) {
                     paragraph "<b>Lock code management:</b> ${RECONNECT_MESSAGE}."
@@ -254,7 +254,7 @@ Map mainPage() {
             } else {
                 paragraph '<b>Status:</b> Not connected'
                 if (state.lastError) {
-                    paragraph "<b>Last error:</b> ${state.lastError}"
+                    paragraph "<b>Last error:</b> ${escapeHtml(state.lastError)}"
                 }
                 // Not connected: SignalBricks holds no valid token for this app
                 // (Disconnect rotated it), so the token in this URL controls nothing.
@@ -604,11 +604,14 @@ Map handleOauthCallback() {
     if (params.error || !code) {
         String reason = params.error ?: 'no authorization code returned'
         log.warn "SignalBricks connect cancelled: ${reason}"
-        return renderPage('Not connected', "SignalBricks did not authorize this hub (${escapeHtml(reason)}). You can close this window and try again from the app.")
+        // The raw error goes to the app page only; the callback page never shows a request param.
+        state.lastError = "SignalBricks did not authorize this hub (${reason})"
+        return renderPage(false, 'Not connected',
+            params.error == 'access_denied' ? 'Sign-in was cancelled, or SignalBricks denied access.' : 'SignalBricks did not authorize this hub.')
     }
     if (!verifier) {
         state.lastError = 'Connect session expired; start again from the app'
-        return renderPage('Not connected', 'This connect link is no longer valid. Close this window and click Connect to SignalBricks again in the app.')
+        return renderPage(false, 'Connect link expired', 'This connect link is no longer valid.')
     }
 
     Map tokenParams = [
@@ -650,17 +653,58 @@ Map handleOauthCallback() {
         log.info 'Connected to SignalBricks'
         subscribeToEvents()
         scheduleDailyCheckIn()
-        return renderPage('Connected', 'This hub is now connected to SignalBricks. You can close this window and return to the app.')
+        return renderPage(true, 'Connected', 'This hub is now connected to SignalBricks and sends its telemetry there.',
+            'Reopen the app: it shows <b>Status: Connected</b>. You can close this window.')
     }
-    return renderPage('Not connected', "Could not complete the connection (${escapeHtml(state.lastError ?: 'unknown error')}). Close this window and try again from the app.")
+    return renderPage(false, 'Connection failed', "Could not complete the connection: ${escapeHtml(state.lastError ?: 'unknown error')}.")
 }
 
-Map renderPage(String title, String message) {
-    String html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SignalBricks Telemetry</title></head>
-<body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
-<h2>SignalBricks Telemetry: ${title}</h2><p>${message}</p></body></html>"""
+// The page oauthCallback returns through Hubitat cloud (#44), styled like SignalBricks
+// Integration's (#40): one self-contained response, inline CSS only. detailHtml and
+// nextHtml must be escaped by the caller.
+Map renderPage(boolean ok, String headline, String detailHtml,
+        String nextHtml = 'Close this window, open the app and connect again from its <b>Connection</b> section.') {
+    String title = escapeHtml("${APP_NAME}: ${headline}")
+    String back = appPageUrl()
+    String backHtml = back
+        ? """<a class="btn" href="${escapeHtml(back)}">Back to the app</a>
+<p class="hint">The link works on the hub's local network. Elsewhere, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${escapeHtml(APP_NAME)}</b> on the hub.</p>"""
+        : """<p class="hint">To get back to the app, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${escapeHtml(APP_NAME)}</b> on the hub.</p>"""
+    String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>${title}</title>
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;--ok:#15803d;--err:#b91c1c;--on-mark:#fff;--link:#1d4ed8}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0f14;--card:#161b22;--text:#e6edf3;--muted:#9da7b3;--border:#30363d;--ok:#3fb950;--err:#f85149;--on-mark:#0b0f14;--link:#58a6ff}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{width:100%;max-width:28rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;overflow-wrap:anywhere}
+.app{margin:0 0 16px;color:var(--muted);font-size:14px}
+h1{display:flex;align-items:center;gap:12px;margin:0 0 12px;font-size:22px;line-height:1.3}
+.mark{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;color:var(--on-mark);font-size:18px;font-weight:700}
+.ok .mark{background:var(--ok)}.err .mark{background:var(--err)}
+p{margin:0 0 12px}
+.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;color:var(--link);font-weight:600;text-decoration:none}
+.btn:hover,.btn:focus{text-decoration:underline}
+.hint{margin:16px 0 0;color:var(--muted);font-size:14px}
+</style></head>
+<body><main class="${ok ? 'ok' : 'err'}">
+<p class="app">${escapeHtml(appNameAndVersion())}</p>
+<h1><span class="mark" aria-hidden="true">${ok ? '&#10003;' : '!'}</span>${escapeHtml(headline)}</h1>
+<p>${detailHtml}</p>
+<p>${nextHtml}</p>
+${backHtml}
+</main></body></html>"""
     return render(contentType: 'text/html', data: html, status: 200)
+}
+
+// The app's page on the hub, by local IP; null when it can't be built
+String appPageUrl() {
+    try {
+        String ip = location?.hub?.localIP?.toString()
+        String id = app?.id?.toString()
+        if (ip ==~ /\d{1,3}(\.\d{1,3}){3}/ && id ==~ /\d+/) return "http://${ip}/installedapp/configure/${id}"
+    } catch (Exception ignored) { }
+    return null
 }
 
 // --- Lock code management (#472) ---
