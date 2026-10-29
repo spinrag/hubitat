@@ -560,12 +560,12 @@ void scheduleEvents(Map bookings) {
                 // Only schedule check-in if its in the future
                 if (checkIn.after(now)) {
                     if (!schedules.contains(checkIn)) {
-                        log.debug "scheduleEvents: schedule reconcileDoorCodes for ${booking}"
+                        log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
                         runOnce(checkIn, 'reconcileDoorCodes', [overwrite: false])
                         schedules.add(checkIn)
                     }
                 } else if (!schedules.contains(checkOut)) {
-                    log.debug "scheduleEvents: schedule reconcileDoorCodes for ${booking}"
+                    log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
                     runOnce(checkOut, 'reconcileDoorCodes', [overwrite: false])
                     schedules.add(checkOut)
                 }
@@ -827,7 +827,7 @@ void reconcileDoorCodes(Map bookings) {
             }
             .collectEntries { key, booking -> [(booking.id): booking] }
 
-        log.trace "reconcileDoorCodes: current lock bookings ${currentLockBookings}"
+        log.trace "reconcileDoorCodes: current lock bookings ${helperLogBookings(currentLockBookings)}"
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
         def lockCodesRaw = lock.currentValue('lockCodes', true)
@@ -839,8 +839,7 @@ void reconcileDoorCodes(Map bookings) {
 
         Map lockCodes = parseJson(lockCodesRaw)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
-        log.trace "reconcileDoorCodes: lock codes ${lockCodes}"
-        log.trace "reconcileDoorCodes: sb codes ${sbCodes}"
+        log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
 
         // Remove all codes that are not in the current bookings
         sbCodes.each { bookingId, lockCode ->
@@ -884,7 +883,7 @@ void reconcileDoorCodes(Map bookings) {
                     index++
                     int codePosition = nextPosition
 
-                    log.debug "reconcileDoorCodes: trySetCode ${booking}"
+                    log.debug "reconcileDoorCodes: trySetCode ${helperLogBooking(booking)}"
 
                     // Create the code
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
@@ -901,7 +900,7 @@ void reconcileDoorCodes(Map bookings) {
                     }
 
                     // Re-set the code
-                    log.debug "reconcileDoorCodes: re-running trySetCode ${codePosition} ${booking}"
+                    log.debug "reconcileDoorCodes: re-running trySetCode ${codePosition} ${helperLogBooking(booking)}"
 
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
                 }
@@ -939,7 +938,7 @@ void reconcileDoorCodes(Map bookings) {
 int getSbMaxRetryDelaySec() { 600 }
 
 void trySetCode(Map data) {
-    log.debug "trySetCode (${data})"
+    log.debug "trySetCode: lock ${data.lockId} pos ${data.codePosition} ${data.codeName} (attempt ${(data.attempt ?: 0) + 1})"
 
     def lock = locks.find { lock -> lock.id == data.lockId }
 
@@ -984,7 +983,7 @@ void trySetCode(Map data) {
 // already flipped confirmed=true, no-op. Otherwise, re-issue trySetCode (which
 // increments the attempt counter and reschedules another verify).
 void verifySetCode(Map data) {
-    log.debug "verifySetCode (${data})"
+    log.debug "verifySetCode: lock ${data.lockId} pos ${data.codePosition} ${data.codeName}"
 
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
@@ -1007,7 +1006,7 @@ void verifySetCode(Map data) {
 }
 
 void tryDeleteCode(Map data) {
-    log.debug "tryDeleteCode (${data})"
+    log.debug "tryDeleteCode: lock ${data.lockId} pos ${data.codePosition}"
 
     def lock = locks.find { lock -> lock.id == data.lockId }
 
@@ -1148,7 +1147,7 @@ String getSbConnectUrl() {
 
 // Send API request to SignalBricks FastApi application
 void sbHttpPostJson(String uri, Map body, Closure closure) {
-    log.debug "sbHttpPostJson: $uri, $body"
+    log.debug "sbHttpPostJson: $uri"
     log.debug "sbBaseFastUrl: $sbBaseFastUrl"
 
     Map params = [
@@ -1286,7 +1285,7 @@ Map apiGetDevices() {
 
 // Get detailed per-device info
 Map apiGetDevice() {
-    log.debug "apiGetDevice: $params"
+    log.debug "apiGetDevice: ${params?.deviceId}"
 
     try {
     def deviceId = params.deviceId
@@ -1320,7 +1319,6 @@ Map apiGetDevice() {
                                 if (key.toInteger() < minCodePosition) {
                                     code.code = '<redacted>'
                                 }
-                                log.debug("Code: ${key} ${code}")
                             }
                         }
                     } else {
@@ -1357,7 +1355,7 @@ Map apiGetDevice() {
 // Execute a command on a device
 // Only allows a subset of commands
 def apiExecuteCommand() {
-    log.debug "apiExecuteCommand: $params ${request.JSON}"
+    log.debug "apiExecuteCommand: ${params?.command} on device ${params?.deviceId}"
 
     try {
         def deviceId = params.deviceId
@@ -1405,7 +1403,7 @@ def apiExecuteCommand() {
 // Sync all bookings (replaces state.bookings), schedule tasks, and reconcile door codes
 Map apiSync() {
     try {
-        log.debug "apiSync ${request.JSON}"
+        log.debug "apiSync: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
         atomicState.bookings = helperGetBookings(request.JSON)
         atomicState.lastSync = [at: now(), source: 'PUT /sync']
@@ -1433,7 +1431,7 @@ Map apiSync() {
 
 Map apiSyncPatch() {
     try {
-        log.debug "apiSyncPatch ${request.JSON}"
+        log.debug "apiSyncPatch: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
         def combined = atomicState.bookings + request.JSON
 
@@ -1607,6 +1605,15 @@ String helperGetCodeName(Map booking) {
     return prefix + orbId + '-' + guest
 }
 
+// Log text for bookings: id and guest only, never a code (#36)
+String helperLogBooking(def b) {
+    return b instanceof Map ? "ORB${b.id} ${b.guest ?: ''}".trim() : ''
+}
+
+String helperLogBookings(def bookings) {
+    return bookings instanceof Map ? bookings.values().collect { helperLogBooking(it) }.join(', ') : ''
+}
+
 // Format booking (ensure keyed by id, dates are objects), and only return future bookings
 Map helperGetBookings(Map bookings) {
     log.debug 'helperGetBookings'
@@ -1614,7 +1621,7 @@ Map helperGetBookings(Map bookings) {
     Date now = new Date()
 
     return bookings.collect { key, booking ->
-        log.trace "helperGetBookings state.bookings.collect ${key} ${booking}"
+        log.trace "helperGetBookings state.bookings.collect ${key} ${helperLogBooking(booking)}"
         booking.checkIn = helperToDate(booking.checkIn)
         booking.checkOut = helperToDate(booking.checkOut)
         return booking
@@ -1623,18 +1630,18 @@ Map helperGetBookings(Map bookings) {
         return booking.checkIn >= now || booking.checkOut >= now
     }
     .groupBy { booking ->
-        log.trace "helperGetBookings state.bookings.groupBy ${booking}"
+        log.trace "helperGetBookings state.bookings.groupBy ${helperLogBooking(booking)}"
         return booking.id
     }
     .collectEntries { k, group ->
-        log.trace "helperGetBookings state.bookings.collectEntries ${k} ${group}"
+        log.trace "helperGetBookings state.bookings.collectEntries ${k} (${group.size()} lock entries)"
         return [ k, group.inject(group[0] + [lockId: []]) { acc, v -> acc.lockId += v.lockId; acc } ]
     }
 }
 
 // Check for duplicate code
 boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) {
-    log.debug "helperHasDuplicateCode ${lockId} ${booking.id} ${booking.code}"
+    log.debug "helperHasDuplicateCode ${lockId} ${helperLogBooking(booking)}"
 
     def lock = locks.find { lock -> lock.id == lockId }
 
@@ -1668,7 +1675,7 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
                 if (bookings && bookings.containsKey(bookingId)) {
                     // Only warn if the bookings overlap check-in to check-out
                     Map otherBooking = bookings[bookingId]
-                    log.debug "helperHasDuplicateCode: checking active booking ${otherBooking}"
+                    log.debug "helperHasDuplicateCode: checking active booking ${helperLogBooking(otherBooking)}"
                     // Other booking already active - only need check-out after check-in
                     return otherBooking.checkOut > booking.checkIn
                 }
@@ -1709,7 +1716,7 @@ Map helperFindCurrentBookings(Map bookings) {
 
     return bookings.findAll { id, booking ->
         if (booking.checkIn <= now && booking.checkOut >= now) {
-            log.trace "helperFindCurrentBooking ${booking}"
+            log.trace "helperFindCurrentBooking ${helperLogBooking(booking)}"
             return true
         }
 
