@@ -91,7 +91,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.3', app.sbAppVersion == '1.4.3')
+check('version is 1.4.4', app.sbAppVersion == '1.4.4')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -190,7 +190,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.3'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.4'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')

@@ -68,6 +68,11 @@
  * mapping, which exchanges it for an ingestion token. The app is a public
  * OAuth client and uses PKCE (S256); there is no client secret.
  *
+ * Reconnect (#46) is a button that opens the connect link for 10 minutes, so
+ * it is available while lock code management is on: the callback, or the
+ * link's expiry, replaces the access token the link carried and registers the
+ * new one. Only the token changes.
+ *
  * Runs alongside the SignalBricks Integration (lock-code) app; the two are
  * independent.
  *
@@ -80,7 +85,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.5.1'
+@Field static final String APP_VERSION = '1.5.2'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -122,6 +127,11 @@ import javax.crypto.spec.SecretKeySpec
 // An HPM update replaces the code without calling updated(), so the app
 // re-registers itself once the version changes, at most this often (#539).
 @Field static final long REREGISTER_INTERVAL_MS = 30L * 60 * 1000
+// Reconnect link (#46): a click on Reconnect opens a sign-in link for this long.
+@Field static final int CONNECT_LINK_SECONDS = 600
+// Automatic retries of a registration that failed for a reason that may pass
+// (timeout, rate limit, SignalBricks unavailable): after about 30 s, 2 min, 5 min.
+@Field static final List<Integer> REGISTER_RETRY_SECONDS = [30, 120, 300]
 // Daily check-in (#13): runs that check once a day, so a quiet hub reports a
 // new version without waiting for an event. Each hub picks its own random
 // time, outside 02:00-03:59 (hub maintenance and backups).
@@ -238,16 +248,21 @@ Map mainPage() {
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${escapeHtml(state.lastError)}"
                 }
+                String retry = registerRetryStatus()
+                if (retry) paragraph retry
                 if (state.lockMgmtReconnectRequired) {
                     paragraph "<b>Lock code management:</b> ${RECONNECT_MESSAGE}."
                 }
-                if (lockManagementEnabled) {
-                    // The connect URL carries this app's access token in the
-                    // OAuth state, and while lock management is on that token
-                    // is the one SignalBricks holds for lock control.
-                    paragraph '<small>To reconnect, first turn off lock code management below (this rotates the access token), reconnect, then turn it back on.</small>'
+                // The connect URL carries this app's access token in the OAuth
+                // state, and while lock management is on that token is the one
+                // SignalBricks holds for lock control: so the link exists only
+                // for a few minutes after a click (#46).
+                String until = connectLinkUntil()
+                if (until) {
+                    href(name: 'hrefReconnect', title: 'Continue to SignalBricks', description: "Sign in again. This link works until ${until} (hub time); after that the app replaces its access token and registers the new one", style: 'external', url: connectUrl())
                 } else {
-                    href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', description: 'Issue a new token (replaces the current one)', style: 'external', url: connectUrl())
+                    input(name: 'btnReconnect', type: 'button', title: 'Reconnect to SignalBricks')
+                    paragraph '<small>Reconnect makes a sign-in link that works for 10 minutes and issues a new ingestion token. Finishing it, or letting it expire, replaces this app\'s access token and registers the new one. Lock code management stays on, with its slot rules, approvals and pending code changes.</small>'
                 }
                 input(name: 'btnDisconnect', type: 'button', title: 'Disconnect')
                 paragraph '<small>Disconnect stops sending immediately. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
@@ -281,7 +296,7 @@ Map mainPage() {
                     paragraph '<b>Connect to SignalBricks first.</b> Lock code management registers with SignalBricks after Connect.'
                 } else {
                     if (state.lockMgmtReconnectRequired) {
-                        paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (turn lock code management off, reconnect above, then turn it back on)."
+                        paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks above)."
                     } else {
                         paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
                     }
@@ -372,6 +387,9 @@ void initialize() {
     unschedule()
     subscribeToEvents()
     scheduleDailyCheckIn()
+    // unschedule() also removed these timers; put them back for the time left
+    connectLinkRearm()
+    registerRetryRearm()
     if (debugLogging) {
         runIn(1800, 'logsOff')
     }
@@ -407,6 +425,8 @@ void appButtonHandler(String btn) {
         // invalidate the access token it may hold.
         registerWithPlatform(false)
         createAccessToken()
+        clearConnectLink()
+        clearRegisterRetry()
         abandonPendingCodeChanges('disconnected')
         state.remove('lockConfig')
         state.remove('fingerprintKey')
@@ -424,8 +444,12 @@ void appButtonHandler(String btn) {
         state.remove('reregisterAttemptAt')
         unschedule('dailyCheckIn')
         atomicState.remove('checkInSecond')
+    } else if (btn == 'btnReconnect') {
+        issueConnectLink()
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
+        // Any open Reconnect link carried the old token, so it is dead now
+        clearConnectLink()
         createAccessToken()
         registerWithPlatform()
     }
@@ -582,6 +606,8 @@ String connectUrl() {
 
 // Never log `params` here: it carries the authorization code and this app's access_token.
 def oauthCallback() {
+    // The link was used: its expiry has nothing left to do (#46)
+    clearConnectLink()
     Map page = handleOauthCallback()
     // The access token travelled in the authorize URL's `state`, so copies can
     // sit in proxy/CDN access logs. Replace it once the callback has run
@@ -589,11 +615,64 @@ def oauthCallback() {
     // the same behaviour signalbricksIntegration's "Refresh Access Token"
     // button relies on. The only other inbound calls are the lock-management
     // endpoints, which use the new token: it is registered with SignalBricks
-    // below and never appears in a URL (Reconnect is hidden while lock
-    // management is on, and Connect only shows when no token is registered).
+    // below and never appears in a URL. Only the token changes: the slot
+    // rules, fingerprint key, approvals and pending code changes stay.
     createAccessToken()
     registerWithPlatform()
     return page
+}
+
+// --- Reconnect link (#46) ---
+// Reconnect is a button: a click opens the sign-in link for CONNECT_LINK_SECONDS.
+// The callback (success or failure) replaces the access token and registers
+// the new one; if no callback arrives in time, expireConnectLink does the same
+// with the ingestion token the app already holds. Either way the token in the
+// link stops working and lock code management carries on with the new one.
+// Kept in atomicState with its expiry time, so initialize()'s unschedule() can
+// put the timer back.
+
+void issueConnectLink() {
+    if (!state.sbToken || !ensureAccessToken()) return
+    long at = now()
+    atomicState.connectLink = [issuedAt: at, expiresAt: at + CONNECT_LINK_SECONDS * 1000L]
+    runIn(CONNECT_LINK_SECONDS, 'expireConnectLink', [overwrite: true, data: [issuedAt: at]])
+    log.info "SignalBricks Telemetry: Reconnect link opened for ${CONNECT_LINK_SECONDS.intdiv(60)} minutes"
+}
+
+// The open link's expiry as hub time (HH:mm:ss), or null when no link is open.
+// A link past its expiry whose timer was lost is expired here.
+String connectLinkUntil() {
+    Map l = atomicState.connectLink
+    if (!l) return null
+    if (now() >= (l.expiresAt as long)) {
+        expireConnectLink([issuedAt: l.issuedAt])
+        return null
+    }
+    return new Date(l.expiresAt as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
+}
+
+void connectLinkRearm() {
+    Map l = atomicState.connectLink
+    if (!l) return
+    long left = (long) (((l.expiresAt as long) - now()) / 1000)
+    runIn(Math.max(left, 1L), 'expireConnectLink', [overwrite: true, data: [issuedAt: l.issuedAt]])
+}
+
+void clearConnectLink() {
+    atomicState.remove('connectLink')
+    unschedule('expireConnectLink')
+}
+
+// No callback in time: replace the token in the link and register the new one,
+// as the callback would. A link already used, or replaced by a newer one, is left.
+void expireConnectLink(Map data) {
+    Map l = atomicState.connectLink
+    if (!l || data?.issuedAt == null || (data.issuedAt as long) != (l.issuedAt as long)) return
+    atomicState.remove('connectLink')
+    state.remove('pkceVerifier')
+    createAccessToken()
+    log.info 'SignalBricks Telemetry: Reconnect link expired unused; access token replaced'
+    registerWithPlatform()
 }
 
 Map handleOauthCallback() {
@@ -732,10 +811,13 @@ Boolean lockMgmtPreviouslyRegistered() {
 // lock management is on; with it off, the platform drops what it stored. A
 // disable is sent only if an earlier registration may still be stored (#522).
 // SECURITY: the body carries the app access token; never log it.
-void registerWithPlatform(Boolean enabledOverride = null) {
-    if (!state.sbToken || !isHttps(state.ingestUrl)) return
+// Returns whether a registration was sent. A retry (#46) keeps its attempt count;
+// any other registration starts a fresh retry sequence.
+Boolean registerWithPlatform(Boolean enabledOverride = null, Boolean retry = false) {
+    if (!retry) clearRegisterRetry()
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return false
     Boolean enabled = enabledOverride != null ? enabledOverride : lockManagementEnabled == true
-    if (!enabled && !lockMgmtPreviouslyRegistered()) return
+    if (!enabled && !lockMgmtPreviouslyRegistered()) return false
     if (enabled && !state.accessToken) ensureAccessToken()
     Map body = [
         cloudEndpointBase: getFullApiServerUrl(),
@@ -756,6 +838,62 @@ void registerWithPlatform(Boolean enabledOverride = null) {
         timeout: 15,
     ]
     asynchttpPost('registerCallback', params, [enabled: enabled])
+    return true
+}
+
+// --- Registration retries (#46) ---
+// A failed registration may leave SignalBricks with a token the app no longer
+// accepts (after a Reconnect or a rotation), so failures that may pass are
+// retried: timeout (408, how Hubitat reports an async timeout), rate limited
+// (429), SignalBricks unavailable (5xx) or no answer. A retry re-sends the
+// current settings. Never falls back to the old token: it is gone.
+Boolean registerRetryable(Integer status) {
+    return !status || status in [408, 429] || status >= 500
+}
+
+void scheduleRegisterRetry() {
+    int attempt = ((atomicState.registerRetry?.attempt ?: 0) as int) + 1
+    if (attempt > REGISTER_RETRY_SECONDS.size()) {
+        atomicState.registerRetry = [attempt: attempt - 1, exhausted: true]
+        unschedule('registerRetryRun')
+        return
+    }
+    int delay = REGISTER_RETRY_SECONDS[attempt - 1]
+    atomicState.registerRetry = [attempt: attempt, at: now() + delay * 1000L]
+    runIn(delay, 'registerRetryRun', [overwrite: true])
+}
+
+// unschedule() removed a pending retry's timer; put it back for the time left
+void registerRetryRearm() {
+    Map r = atomicState.registerRetry
+    // An in-flight retry is answered by registerCallback, which schedules the next one
+    if (!r || r.exhausted || r.inFlight) return
+    long left = (long) (((r.at as long) - now()) / 1000)
+    runIn(Math.max(left, 5L), 'registerRetryRun', [overwrite: true])
+}
+
+void registerRetryRun() {
+    Map r = atomicState.registerRetry
+    if (!r || r.exhausted || r.inFlight) return
+    atomicState.registerRetry = [attempt: r.attempt, inFlight: true]
+    // Nothing to send any more (disconnected, or lock management off and never registered)
+    if (!registerWithPlatform(null, true)) clearRegisterRetry()
+}
+
+void clearRegisterRetry() {
+    atomicState.remove('registerRetry')
+    unschedule('registerRetryRun')
+}
+
+// The retry line for the app page, or null
+String registerRetryStatus() {
+    Map r = atomicState.registerRetry
+    if (!r) return null
+    int total = REGISTER_RETRY_SECONDS.size()
+    if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
+    if (r.inFlight) return "<b>Registration retries:</b> retry ${r.attempt} of ${total} in progress"
+    String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
+    return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
 }
 
 // Hubitat platform version, sent with events and registration for the
@@ -829,6 +967,7 @@ void registerCallback(resp, Map data) {
     // signalbricks/platform#505). Only a reconnect fixes that, so say so and
     // don't retry; a disable answered this way changed nothing on the platform.
     if ((failed && status == 403 && reply.code == 'TOKEN_NOT_BOUND_TO_APP') || (!failed && reply.reconnect_required == true)) {
+        clearRegisterRetry()
         if (!state.lockMgmtReconnectRequired) log.warn "SignalBricks Telemetry: ${RECONNECT_MESSAGE}"
         state.lockMgmtReconnectRequired = true
         state.remove('lockMgmtRegisterError')
@@ -839,8 +978,11 @@ void registerCallback(resp, Map data) {
         String msg = status == 401 ? 'SignalBricks rejected the token. Reconnect to SignalBricks.' : "HTTP ${status}"
         log.warn "SignalBricks Telemetry: lock management registration failed: ${msg}"
         state.lockMgmtRegisterError = "${new Date().format('yyyy-MM-dd HH:mm')} ${msg}"
+        if (state.sbToken && registerRetryable(status)) scheduleRegisterRetry()
+        else clearRegisterRetry()
         return
     }
+    clearRegisterRetry()
     state.remove('lockMgmtRegisterError')
     state.remove('lockMgmtReconnectRequired')
     state.registeredVersion = APP_VERSION
