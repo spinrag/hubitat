@@ -458,7 +458,7 @@ app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.posts.clear()
 app.registerWithPlatform()
 def reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
-check('register: capabilities [relocate], version 1.4.0', reg.capabilities == ['relocate'] && reg.version == '1.4.0' && reg.lockManagement == true)
+check('register: capabilities [relocate], version 1.4.1', reg.capabilities == ['relocate'] && reg.version == '1.4.1' && reg.lockManagement == true)
 app.posts.clear()
 app.lockManagementEnabled = false
 app.state.lockMgmtRegistered = true

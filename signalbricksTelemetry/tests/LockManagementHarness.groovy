@@ -79,13 +79,19 @@ class FakeLock {
     Boolean applyCommands = false
     int dropCommands = 0
     Boolean throwOnSet = false
+    // A driver that throws on delete with the slot's code in its message
+    Boolean throwOnDelete = false
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
     void setCode(Integer slot, String code, String name) {
         calls << ['setCode', slot, name]
         if (throwOnSet) throw new IllegalStateException("setCode(${slot}, ${code}, ${name}) failed")
         apply { it[slot.toString()] = [name: name, code: code] }
     }
-    void deleteCode(Integer slot) { calls << ['deleteCode', slot]; apply { it.remove(slot.toString()) } }
+    void deleteCode(Integer slot) {
+        calls << ['deleteCode', slot]
+        if (throwOnDelete) throw new IllegalStateException("deleteCode(${slot}) failed for code ${(new JsonSlurper().parseText(attrs.lockCodes) as Map)[slot.toString()]?.code}")
+        apply { it.remove(slot.toString()) }
+    }
     void apply(Closure c) {
         if (!applyCommands) return
         if (dropCommands > 0) { dropCommands--; return }
@@ -731,6 +737,79 @@ check('exception logged by class name only', app.logged.any { it.toString().cont
 check('other due change also handled and job rescheduled', results().any { it.d.slot == 21 && it.d.reason == 'send_error' } || (pendingFor(21) != null && verifyJobs().size() == 1))
 app.state.remove('pendingCodeChanges'); app.scheduled.clear()
 
+// The first send throws (#33): 502 send_error, nothing held, the call given
+// back to its rate limit, and the code in no log line, response or event
+lock3.dropCommands = 99
+def leaked = { String c, int postMark ->
+    app.logged.any { it.toString().contains(c) || it.toString().contains('Code(') } ||
+        responses.any { it?.data?.toString()?.contains(c) } || app.posts.drop(postMark).any { it.params.body?.contains(c) }
+}
+String SR = 'dddddddd-0000-4000-8000-000000000004'
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 22, code: '91922220', name: 'SBM: Before throw', requestId: SR]]
+call('apiSetCode')
+int resMark = results().size()
+int postMark = app.posts.size()
+app.logged.clear()
+app.state.writeTimes = [app.now()]
+lock3.throwOnSet = true
+app.request = [JSON: [slot: 22, code: '91922222', name: 'SBM: Throw first']]
+def firstSet = call('apiSetCode')
+lock3.throwOnSet = false
+check('set: first send throws -> 502 send_error', firstSet.status == 502 && body(firstSet).error == 'send_error')
+check('set: first send throws -> write refunded, earlier change kept and not superseded',
+    app.state.writeTimes.size() == 1 && pendingFor(22)?.requestId == SR && pendingFor(22).code == '91922220' && results().size() == resMark)
+check('set: first send throws -> logged by class name only', app.logged.any { it.toString().contains('IllegalStateException') } && !leaked('91922222', postMark))
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+check('set: first send throws on an empty slot -> nothing pending, no job', { lock3.throwOnSet = true; def r = call('apiSetCode'); lock3.throwOnSet = false; r.status == 502 }() && pendingFor(22) == null && !verifyJobs())
+
+putSlot(25, 'SBM: Delete me', '91925555')
+postMark = app.posts.size()
+app.logged.clear()
+app.state.writeTimes = [app.now()]
+lock3.throwOnDelete = true
+app.params = [lockId: '9', slot: '25']
+app.request = [:]
+def firstDel = call('apiDeleteCode')
+lock3.throwOnDelete = false
+check('delete: first send throws -> 502 send_error, nothing pending, write refunded',
+    firstDel.status == 502 && body(firstDel).error == 'send_error' && pendingFor(25) == null && !verifyJobs() && app.state.writeTimes.size() == 1)
+check('delete: first send throws -> logged by class name only', app.logged.any { it.toString().contains('IllegalStateException') } && !leaked('91925555', postMark))
+putSlot(25, null, null)
+
+// Retry: a failed change held for retry, then an in-flight one
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 22, code: '91922223', name: 'SBM: Retry throw']]
+call('apiSetCode')
+while (tick()) {}
+check('slot 22 failed and kept for retry', pendingFor(22)?.status == 'failed')
+resMark = results().size()
+postMark = app.posts.size()
+app.logged.clear()
+app.state.retryTimes = [app.now()]
+lock3.throwOnSet = true
+app.params = [lockId: '9', slot: '22']
+def firstRetry = call('apiRetryCode')
+lock3.throwOnSet = false
+check('retry: send throws -> 502 send_error, retry refunded', firstRetry.status == 502 && body(firstRetry).error == 'send_error' && app.state.retryTimes.size() == 1)
+check('retry: send throws -> change (and code) dropped, no job, failure not re-reported', pendingFor(22) == null && !verifyJobs() && results().size() == resMark)
+check('retry: send throws -> logged by class name only', app.logged.any { it.toString().contains('IllegalStateException') } && !leaked('91922223', postMark))
+app.params = [lockId: '9']
+app.request = [JSON: [slot: 22, code: '91922224', name: 'SBM: Retry in flight']]
+call('apiSetCode')
+postMark = app.posts.size()
+app.logged.clear()
+lock3.throwOnSet = true
+app.params = [lockId: '9', slot: '22']
+def flightRetry = call('apiRetryCode')
+lock3.throwOnSet = false
+def flightResult = results()[-1]
+check('retry in flight: send throws -> 502, reported failed send_error, dropped',
+    flightRetry.status == 502 && flightResult.value == 'failed' && flightResult.d.reason == 'send_error' && flightResult.d.slot == 22 && pendingFor(22) == null && !verifyJobs())
+check('retry in flight: code in no log line, response or event', !leaked('91922224', postMark))
+app.state.remove('pendingCodeChanges'); app.scheduled.clear()
+app.state.writeTimes = []; app.state.retryTimes = []
+
 // Both the check and its cleanup throw: the change is still dropped, nothing rethrown
 lock3.dropCommands = 99
 app.request = [JSON: [slot: 19, code: '91919192', name: 'SBM: Twice']]
@@ -1102,7 +1181,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.4.0'
+String VERSION = '1.4.1'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
