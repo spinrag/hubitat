@@ -245,6 +245,12 @@ String bookingsNotOnLock(String status) {
     return 'not on lock' + (status == 'upcoming' ? ' (added at check-in)' : status == 'past' ? ' (removed after checkout)' : '')
 }
 
+// Last 2 digits only, as plain text for API error messages
+String helperMaskCode(def code) {
+    String s = code == null ? '' : code.toString()
+    return s.length() >= 4 ? '\u2022\u2022\u2022\u2022' + s[-2..-1] : '\u2022\u2022\u2022\u2022'
+}
+
 // Last 2 digits only; the full code is never rendered
 String bookingsMask(def code) {
     String s = code == null ? '' : code.toString()
@@ -1514,7 +1520,8 @@ Map apiSyncBookingByLock() {
         }
 
         if (helperHasDuplicateCode(params.lockId, atomicState.bookings[key], atomicState.bookings)) {
-            return sbHttpResponseJson([ error: "Duplicate code: '${booking.code}'."], 409)
+            // The dispatcher may log error bodies: last 2 digits only (#36)
+            return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
         }
 
         return sbHttpResponseJson(atomicState.bookings[key])

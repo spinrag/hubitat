@@ -89,11 +89,13 @@ List secrets = CODES + [TOKEN, LEGACY_TOKEN]
 
 app.state.accessToken = TOKEN
 app.settings = [locks: ['1'] as String[]]
-// Slot 10 is below the minimum (another app's code), 51 an orphan of this app, 52 booking 88 with an old code
+// Slot 10 is below the minimum (another app's code), 51 an orphan of this app, 52 booking 88 with an old code,
+// 54 booking 66's code (so booking 55 with the same code is a duplicate)
 def front = new FakeLock(id: '1', name: 'A', label: 'Front', displayName: 'Front', attrs: [maxCodes: 60, lockCodes: JsonOutput.toJson([
     '10': [name: 'SBA: Owner', code: CODES[5]],
     '51': [name: 'GT:ORB99-Old', code: CODES[6]],
     '52': [name: 'GT:ORB88-Ann', code: CODES[7]],
+    '54': [name: 'GT:ORB66-Dee', code: CODES[2]],
 ])])
 app.locks = [front]
 long h = 3600_000L
@@ -125,11 +127,15 @@ step('PUT /sync/<id>/<lock>') {
     app.request = [JSON: [id: '66', guest: 'Dee', code: CODES[2], checkIn: t - h, checkOut: t + h]]
     app.apiSyncBookingByLock()
 }
+Map dup = null
 step('PUT /sync/<id>/<lock> with a duplicate code') {
     app.params = [bookingId: '55', lockId: '1', access_token: TOKEN]
     app.request = [JSON: [id: '55', guest: 'Eve', code: CODES[2], checkIn: t - h, checkOut: t + h]]
-    app.apiSyncBookingByLock()
+    dup = app.apiSyncBookingByLock()
 }
+check('PUT /sync/<id>/<lock> duplicate: 409 with the code masked to its last 2 digits',
+    dup?.status == 409 && new JsonSlurper().parseText(dup.data).error == "Duplicate code: '\u2022\u2022\u2022\u202266'." && !dup.data.contains(CODES[2]))
+check('helperMaskCode: short or missing code shows no digits', app.helperMaskCode('12') == '\u2022' * 4 && app.helperMaskCode(null) == '\u2022' * 4)
 step('POST /sync/<id>') {
     app.params = [bookingId: '44', access_token: TOKEN]
     app.request = [JSON: [id: '44', guest: 'Fay', code: CODES[3], lockId: '1', checkIn: t - h, checkOut: t + h]]
