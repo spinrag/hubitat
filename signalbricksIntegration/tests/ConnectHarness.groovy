@@ -3,7 +3,8 @@
 // exchange, access token replaced, registration), reconnect, disconnect (revoke), a
 // portal-side disconnect, re-registering after an update, the app page in each state
 // (one Status line, no legacy registration block, header-style section titles on the
-// main and debug pages) and while the hub saves the code, and that no secret is ever logged.
+// main and debug pages) and while the hub saves the code, the callback page for each outcome
+// (#40), and that no secret is ever logged.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -37,7 +38,7 @@ abstract class HubitatStub extends Script {
     // Responses for the next httpPost calls, by path suffix: status or a Map body (200)
     Map replies = [:]
     def app = [id: 42]
-    def location = [name: 'Ross Farm House', hub: [name: 'Main Hub'], timeZone: TimeZone.getTimeZone('UTC')]
+    def location = [name: 'Ross Farm House', hub: [name: 'Main Hub', localIP: '192.168.1.10'], timeZone: TimeZone.getTimeZone('UTC')]
     void definition(Map m) {}
     void mappings(Closure c) {}
     void preferences(Closure c) { pages = c }
@@ -101,7 +102,7 @@ def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.2', app.sbAppVersion == '1.4.2')
+check('version is 1.4.3', app.sbAppVersion == '1.4.3')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -136,7 +137,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.2' && q.location == 'Ross Farm House')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.3' && q.location == 'Ross Farm House')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -151,19 +152,20 @@ app.params = [code: 'fake-auth-code-1', access_token: firstToken]
 def result = app.oauthCallback()
 def tokenCall = app.http.find { it.uri.endsWith('/token') }
 def registerCall = app.http.find { it.uri.endsWith('/register') }
-check('callback: renders Connecting (registration runs in the background)', result.data.contains('Connecting') && !result.data.contains('Not connected'))
+check('callback: renders Hub authorized (registration runs in the background)', result.data.contains('Hub authorized') && !result.data.contains('Not connected'))
+Map callbackPages = [authorized: result.data]
 check('callback: token exchange with the code and the verifier over https', tokenCall.uri.startsWith('https://') && body(tokenCall) == [grant_type: 'authorization_code', code: 'fake-auth-code-1', redirect_uri: 'https://cloud.hubitat.com/oauth/stateredirect', client_id: 'signalbricks-hubitat-integration', code_verifier: verifier])
 check('callback: the access token from the URL is replaced', app.state.accessToken != firstToken)
 secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.2', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.3', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.2')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.3')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
@@ -208,7 +210,8 @@ app.replies['/oauth/hubitat-integration/token'] = 500
 app.state.sbPkceVerifier = 'f' * 96
 app.params = [code: 'fake-auth-code-3']
 result = app.oauthCallback()
-check('failed exchange: Not connected page with the HTTP status', result.data.contains('Not connected') && result.data.contains('HTTP 500'))
+check('failed exchange: Connection failed page with the HTTP status', result.data.contains('Connection failed') && result.data.contains('HTTP 500'))
+callbackPages.failed = result.data
 check('failed exchange: the replaced token is registered with the credential held before',
     app.http.find { it.uri.endsWith('/register') }?.headers?.Authorization == "Bearer ${CREDENTIAL_2}".toString())
 secrets << app.state.accessToken
@@ -228,10 +231,55 @@ String beforeDeny = app.state.accessToken
 app.http.clear()
 app.params = [error: 'access_denied']
 result = app.oauthCallback()
-check('denied: Not connected, no HTTP call, token still replaced', result.data.contains('access_denied') && app.http.isEmpty() && app.state.accessToken != beforeDeny)
+check('denied: Not connected, no HTTP call, token still replaced', result.data.contains('Sign-in was cancelled') && app.http.isEmpty() && app.state.accessToken != beforeDeny)
+check('denied: the error param itself is not rendered', !result.data.contains('access_denied'))
+callbackPages.denied = result.data
+app.params = [:]
+result = app.oauthCallback()
+check('missing code: Not connected', result.data.contains('Not connected') && result.data.contains('did not authorize'))
+callbackPages.missing = result.data
 app.params = [code: 'fake-auth-code-5']
 result = app.oauthCallback()
-check('expired: no verifier, no HTTP call', result.data.contains('no longer valid') && app.http.isEmpty())
+check('expired: no verifier, no HTTP call', result.data.contains('Connect link expired') && result.data.contains('no longer valid') && app.http.isEmpty())
+callbackPages.expired = result.data
+secrets << app.state.accessToken
+
+// --- The callback page (#40): one self-contained page per outcome ---
+Map headlines = [authorized: 'Hub authorized', failed: 'Connection failed', denied: 'Not connected', missing: 'Not connected', expired: 'Connect link expired']
+headlines.each { k, h ->
+    String html = callbackPages[k]
+    String status = k == 'authorized' ? 'ok' : 'err'
+    check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Integration: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
+    check("page ${k}: inline CSS only, light and dark", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
+    check("page ${k}: back link to the app on the hub, with guidance", html.contains('<a class="btn" href="http://192.168.1.10/installedapp/configure/42">Back to the app</a>') && html.contains('Apps</b> &rarr; <b>SignalBricks Integration'))
+    check("page ${k}: no-referrer, so the back link doesn't send the callback URL", html.contains('<meta name="referrer" content="no-referrer">'))
+    check("page ${k}: no token, code or verifier", !secrets.any { it && html.contains(it) } && !html.contains('access_token') && !html.contains('fake-auth-code') && !html.contains('fake-app-token'))
+}
+check('page authorized: says Connected on reopen', callbackPages.authorized.contains('<b>Connected</b>') && callbackPages.authorized.contains('finishing registration'))
+['failed', 'denied', 'missing', 'expired'].each { check("page ${it}: says what to do next", callbackPages[it].contains('connect again')) }
+
+// Dynamic text is escaped, request params are never rendered
+app.metaClass.sbExchangeCode = { String c, String v -> delegate.state.sbLastError = '<script>alert(1)</script> & "x"' }
+app.state.sbPkceVerifier = 'c' * 96
+app.params = [code: '<script>fake-code</script>', access_token: '<script>fake-token</script>', error: null]
+result = app.oauthCallback()
+check('escape: the error text is escaped', result.data.contains('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;') && !result.data.contains('<script'))
+check('escape: no request param on the page', !result.data.contains('fake-code') && !result.data.contains('fake-token'))
+app.params = [error: '<script>alert(2)</script>']
+result = app.oauthCallback()
+check('escape: the error param is not rendered', !result.data.contains('alert(2)') && !result.data.contains('<script'))
+app.metaClass = null
+app.state.remove('sbLastError')
+
+// No reliable local address: guidance instead of the link
+String goodIp = app.location.hub.localIP
+app.location.hub.localIP = '"><script>x</script>'
+app.params = [:]
+result = app.oauthCallback()
+check('no local IP: no link, guidance on where to find the app', !result.data.contains('Back to the app</a>') && result.data.contains('Apps</b> &rarr; <b>SignalBricks Integration') && !result.data.contains('<script'))
+app.location.hub.remove('localIP')
+check('no local IP at all: still renders', !app.oauthCallback().data.contains('installedapp'))
+app.location.hub.localIP = goodIp
 secrets << app.state.accessToken
 
 // --- Disconnect: revoke, forget, replace the token ---
@@ -343,7 +391,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.2'
+app.state.sbRegisteredVersion = '1.4.3'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -355,7 +403,7 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.2' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.3' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text
