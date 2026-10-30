@@ -171,7 +171,7 @@ Already-connected hubs need only an app update:
 
 New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 5.
 
-To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**. The app rotates its access token (so the token SignalBricks held stops working), clears the slot rules, fingerprint key, approvals and full-control locks, and tells SignalBricks lock management is off. Since 1.6.2 the hub clears them first, so they are gone even when SignalBricks can't be reached. **Disconnect** does the same.
+To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**. The app rotates its access token (so the token SignalBricks held stops working), clears the slot rules, fingerprint key, approvals and full-control locks, and tells SignalBricks lock management is off. Since 1.6.2 the hub clears them, and rotates the token, even when SignalBricks can't be reached; settings like these left over while lock code management is off are cleared when you open the app or click **Done**. **Disconnect** does the same.
 
 You don't need to turn lock code management off to reconnect to the same organization and hub: see [Reconnect](#reconnect). To move the hub to another property or organization, turn it off first. (Before 1.5.2, Reconnect was hidden while lock code management was on.)
 

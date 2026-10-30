@@ -404,7 +404,17 @@ Boolean syncLockManagementEnabled() {
         createAccessToken()
         return false
     }
-    if (!wasEnabled || enabled) return false
+    if (!wasEnabled || enabled) {
+        // Off, but lock state left from before (e.g. an older version's failed
+        // wipe): drop it, so the sign-in link doesn't send lock_state for a hub
+        // that manages no locks, and a later enable can't revive another
+        // organization's slot rules (platform#699).
+        if (!enabled && holdsLockState()) {
+            log.info 'SignalBricks Telemetry: leftover lock code management state cleared (lock code management is off)'
+            wipeLockState()
+        }
+        return false
+    }
     log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
     clearConnectLink()
     // Reporting the abandoned changes may reach SignalBricks; the wipe below
@@ -478,14 +488,25 @@ void appButtonHandler(String btn) {
     if (btn == 'btnDisconnect') {
         log.info 'Disconnected from SignalBricks'
         // Tell the platform lock management is off (best effort), then
-        // invalidate the access token it may hold.
-        registerWithPlatform(false)
+        // invalidate the access token it may hold. Neither SignalBricks call may
+        // stop the token rotation or the local wipe below (platform#699).
+        try {
+            registerWithPlatform(false)
+        } catch (Exception e) {
+            // Only the class name: the request body carries the access token.
+            log.warn "SignalBricks Telemetry: registering the disconnect failed (${e.class.simpleName})"
+        }
         createAccessToken()
         clearConnectLink()
         clearRegisterRetry()
         clearReportRetry()
         unschedule('sendAppInfoReport')
-        abandonPendingCodeChanges('disconnected')
+        try {
+            abandonPendingCodeChanges('disconnected')
+        } catch (Exception e) {
+            savePendingCodeChanges([:])
+            log.warn "SignalBricks Telemetry: reporting abandoned code changes failed (${e.class.simpleName})"
+        }
         wipeLockState()
         state.remove('sbToken')
         state.remove('ingestUrl')

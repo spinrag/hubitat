@@ -410,6 +410,28 @@ app.syncLockManagementEnabled()
 track()
 app.removedSettings.clear()
 
+// --- platform#699 K2: management off with lock state left over: wiped, no lock_state ---
+app.lockManagementEnabled = false
+app.syncLockManagementEnabled()
+track()
+app.state.lockConfig = held.lockConfig
+app.fullControlLocks = held.full
+check('leftover: setup holds lock state with management off', app.holdsLockState() && app.state.lockMgmtLastEnabled == false)
+mainPage()
+check('leftover: rendering the app page wipes it, so the sign-in link has no lock_state', !app.holdsLockState() && !lockStateParam(app.connectUrl()))
+app.state.fingerprintKey = held.fingerprintKey
+app.approvedAdoptedSlots = held.approved
+app.updated()
+track()
+check('leftover: Done wipes it too', !app.holdsLockState())
+app.lockManagementEnabled = true
+app.syncLockManagementEnabled()
+track()
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+mainPage()
+check('management on: lock state kept and reported', app.holdsLockState() && lockStateParam(app.connectUrl()))
+app.removedSettings.clear()
+
 // --- Lock management off: Reconnect still works; nothing to register ---
 app.lockManagementEnabled = false
 app.state.lockMgmtLastEnabled = false
@@ -437,9 +459,24 @@ track()
 app.removedSettings.clear()
 
 // --- Disconnect with a link open: link closed and no retry left ---
+// platform#699 K1: with SignalBricks unreachable (every post throws), Disconnect still
+// rotates the token and wipes the lock state
 app.apiReconnect()
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+app.state.pendingCodeChanges = ['7:2': [status: 'pending', lockId: '7', slot: 2, action: 'set', attempts: 1, name: 'SBA: Cleaner', createdAt: app.clock,
+    requestId: '00000000-0000-4000-8000-000000000001']]
+String beforeDisconnect = app.state.accessToken
+app.state.lockMgmtRegistered = true
+app.throwOnPost = true
+int logMark = app.logged.size()
 app.appButtonHandler('btnDisconnect')
+app.throwOnPost = false
 track()
+check('disconnect, SignalBricks unreachable: token rotated, disconnected', app.state.accessToken != beforeDisconnect && app.state.sbToken == null)
+check('disconnect, SignalBricks unreachable: lock state and pending changes wiped', !app.holdsLockState() && (app.state.pendingCodeChanges ?: [:]).isEmpty())
+List disconnectLogs = app.logged.drop(logMark)
+check('disconnect, SignalBricks unreachable: failures logged by class only', disconnectLogs.any { it.contains('registering the disconnect failed (IllegalStateException)') } &&
+    disconnectLogs.any { it.contains('reporting abandoned code changes failed (IllegalStateException)') } && !app.logged.any { it.contains('13572468') })
 check('disconnect: link closed, no expiry or retry left', app.state.connectLink == null && !expiryJob() && !retryJob())
 def notConnected = app.apiReconnect()
 check('not connected: /reconnect says so and opens no window', notConnected.data.contains('Not connected') && !notConnected.data.contains('http-equiv') && app.state.connectLink == null && !expiryJob())
