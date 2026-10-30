@@ -1,6 +1,6 @@
 // One-click safe Reconnect (#46) for SignalBricks Telemetry with a stubbed Hubitat
-// sandbox: Reconnect is a button, shown while lock code management is on, and the
-// sign-in link (which carries the access token SignalBricks uses for lock control)
+// sandbox: Reconnect is one link to the app's own /reconnect, shown while lock code
+// management is on; viewing the page starts nothing, and the sign-in link (which carries the access token SignalBricks uses for lock control)
 // exists only for 10 minutes after a click. Checks click -> callback (success and
 // failure), click -> expiry (token replaced and registered with the ingestion token
 // already held), expiry racing the callback, the expiry surviving initialize()'s
@@ -111,6 +111,9 @@ def check = { String label, boolean ok -> println((ok ? 'PASS ' : 'FAIL ') + lab
 def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.inputs.clear(); app.mainPage()
     (app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description} ${it.url}" }).join('\n') }
 def link = { app.hrefs.find { it.name == 'hrefReconnect' } }
+// The page without link URLs: titles, descriptions, paragraphs
+def pageText = { mainPage(); (app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description}" }).join('\n') }
+def entryUrl = { "${app.getFullApiServerUrl()}/reconnect?access_token=${app.state.accessToken}".toString() }
 def registers = { app.posts.findAll { it.cb == 'registerCallback' } }
 def regBody = { Map p -> new JsonSlurper().parseText(p.params.body) }
 def expiryJob = { app.scheduled.find { it.handler == 'expireConnectLink' } }
@@ -158,25 +161,33 @@ def survived = { String when ->
 }
 def lastRegisterLockMgmt = { Map p -> def b = regBody(p); b.lockManagement == true && b.appAccessToken == app.state.accessToken && p.params.headers.Authorization == "Bearer ${app.state.sbToken}".toString() }
 
-// --- Before a click: Reconnect is a button, shown with lock management on ---
+// --- Before a click: one Reconnect link, shown with lock management on ---
 String page = mainPage()
-check('page: Reconnect button shown while lock code management is on', app.inputs.btnReconnect?.type == 'button' && !link())
+check('page: one Reconnect link, to the app\'s own /reconnect, shown while lock code management is on', link()?.title == 'Reconnect to SignalBricks' && link().style == 'external' &&
+    link().url == entryUrl() && !page.contains('/oauth/hubitat/authorize') && !app.inputs.btnReconnect)
+check('page: says what to do after a Hubitat error, and that an unused link can\'t be reused', link().description.contains('If you see a Hubitat error after signing in, click Reconnect again.') && page.contains("an unused link can't be reused"))
 check('page: no "turn lock code management off" instructions', !page.toLowerCase().contains('turn lock code management off') && !page.contains('first turn off'))
 check('page: says the link works for 10 minutes and lock management stays on', page.contains('works for 10 minutes') && page.contains('Lock code management stays on'))
-check('page: no access token anywhere before the click', !page.contains(app.state.accessToken) && !page.contains('access_token'))
+check('page: the token is only in the Reconnect URL, never in text', !pageText().contains(app.state.accessToken))
+5.times { mainPage() }
+check('page: viewing the page opens no window, schedules nothing and changes no token', app.state.connectLink == null && !expiryJob() && registers().isEmpty() && app.state.accessToken == tokens[0])
 survived('page render')
 
 // --- Click -> callback success ---
 String t0 = app.state.accessToken
-app.appButtonHandler('btnReconnect')
+def entry = app.apiReconnect()
+String fwd = entry.data
 Map l = app.state.connectLink
+check('click: /reconnect forwards to the SignalBricks sign-in with no script and no referrer', entry.status == 200 && entry.contentType == 'text/html' &&
+    fwd.contains('<meta name="referrer" content="no-referrer">') && fwd.contains('<meta http-equiv="refresh" content="0;url=https://app.signalbricks.co/oauth/hubitat/authorize?') &&
+    fwd.contains('>Continue to SignalBricks</a>') && !(fwd =~ /<script|src=/))
+check('click: the forward carries the current token in the sign-in state, HTML-escaped', fwd.contains(URLEncoder.encode("access_token=${t0}", 'UTF-8')) && !fwd.contains('&state=') && fwd.contains('&amp;state='))
 check('click: link opened for 10 minutes', l?.issuedAt == app.clock && l?.expiresAt == app.clock + 600_000L)
 check('click: expiry scheduled in 10 minutes with the link id', expiryJob()?.secs == 600 && expiryJob()?.data?.issuedAt == l.issuedAt)
 check('click: token not changed by the click', app.state.accessToken == t0 && registers().isEmpty())
 page = mainPage()
-check('click: page shows Continue to SignalBricks with the expiry time', link()?.title == 'Continue to SignalBricks' && link().style == 'external' && link().description.contains('until 08:10:00') && !app.inputs.btnReconnect)
-check('click: the token is only in the link URL', link().url.contains(URLEncoder.encode("access_token=${t0}", 'UTF-8')) &&
-    !(app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description}" }).join('\n').contains(t0))
+check('click: the app page shows until when the sign-in works', link()?.title == 'Reconnect to SignalBricks' && link().description.contains('works until 08:10:00'))
+check('click: the token is only in the Reconnect URL', link().url == entryUrl() && !pageText().contains(t0))
 app.tokenReply = [access_token: INGEST_2, ingest_url: 'https://ingest.example.invalid/v1/webhooks/hubitat']
 app.params = [code: 'fake-auth-code-1', access_token: t0]
 app.clock += 60_000
@@ -185,7 +196,7 @@ String t1 = track()
 check('callback: Connected', result.data.contains('Connected') && app.state.sbToken == INGEST_2)
 check('callback: link closed and its expiry cancelled', app.state.connectLink == null && !expiryJob())
 check('callback: token replaced and registered for lock management with the new ingestion token', t1 != t0 && registers().size() == 1 && lastRegisterLockMgmt(registers()[0]))
-check('callback: page shows the Reconnect button again, no token', mainPage().with { !it.contains(t0) && !it.contains(t1) && !it.contains('access_token') } && app.inputs.btnReconnect && !link())
+check('callback: page back to plain Reconnect with the new token\'s entry URL, no old token anywhere', mainPage().with { !it.contains(t0) } && !pageText().contains(t1) && link().url == entryUrl() && !link().description.contains('works until'))
 app.registerCallback(ok(true), [enabled: true])
 survived('callback success')
 // Expiry racing the callback: the job fires anyway (queued just before the callback cancelled it)
@@ -194,7 +205,7 @@ fireExpiry([issuedAt: l.issuedAt])
 check('race (callback first): the stale expiry does nothing', app.state.accessToken == t1 && registers().isEmpty())
 
 // --- Click -> callback failure (sign-in cancelled): still rotated and registered ---
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 app.posts.clear()
 app.params = [error: 'access_denied']
 result = app.oauthCallback()
@@ -206,7 +217,7 @@ app.registerCallback(ok(true), [enabled: true])
 survived('callback failure')
 
 // --- Click -> expiry: no callback within 10 minutes ---
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 l = app.state.connectLink
 mainPage()
 check('expiry: the link had a verifier', app.state.pkceVerifier != null)
@@ -217,7 +228,7 @@ String t3 = track()
 check('expiry: token replaced', t3 != t2)
 check('expiry: new token registered for lock management with the ingestion token held', registers().size() == 1 && lastRegisterLockMgmt(registers()[0]) && app.state.sbToken == INGEST_2)
 check('expiry: link closed, verifier dropped', app.state.connectLink == null && app.state.pkceVerifier == null)
-check('expiry: page shows the button again, no token', mainPage().with { !it.contains(t2) && !it.contains(t3) && !it.contains('access_token') } && app.inputs.btnReconnect && !link())
+check('expiry: page back to plain Reconnect, the old token nowhere', mainPage().with { !it.contains(t2) } && !pageText().contains(t3) && link().url == entryUrl() && !link().description.contains('works until'))
 check('expiry: logged without a token', app.logged.any { it.contains('Reconnect link expired unused; access token replaced') })
 app.registerCallback(ok(true), [enabled: true])
 survived('expiry')
@@ -232,7 +243,7 @@ app.registerCallback(ok(true), [enabled: true])
 survived('late callback')
 
 // A newer link: an older link's expiry must not close it
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 Map newer = app.state.connectLink
 app.posts.clear()
 fireExpiry([issuedAt: l.issuedAt])
@@ -254,11 +265,11 @@ app.posts.clear()
 page = mainPage()
 String t5 = track()
 check('lost timer: rendering the page expires the link and rotates the token', t5 != t4 && app.state.connectLink == null && registers().size() == 1 && lastRegisterLockMgmt(registers()[0]))
-check('lost timer: no link, no token on that page', !link() && !page.contains(t4) && !page.contains(t5))
+check('lost timer: the old token nowhere on that page', !page.contains(t4) && !pageText().contains(t5) && !link().description.contains('works until'))
 app.registerCallback(ok(true), [enabled: true])
 
 // --- Registration failure after an expiry: automatic retries, shown on the app page ---
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 app.posts.clear()
 app.clock += 600_000
 fireExpiry(expiryJob().data)
@@ -287,7 +298,28 @@ check('register failure: a timeout is retried, retry 3 after 5 min', retryJob()?
 app.scheduled.removeAll { it.handler == 'registerRetryRun' }
 app.registerRetryRun()
 app.registerCallback(new FakeResp(status: 502, body: ''), [enabled: true])
-check('register failure: after 3 retries it stops and says so', !retryJob() && mainPage().contains('all 3 automatic retries failed'))
+check('unattended: after the quick retries, every 30 minutes, shown on the page (#46)', retryJob()?.secs == 1800 && mainPage().contains('retry 4 at') && mainPage().contains('every 30 minutes for 24 hours'))
+app.clock += 600_000
+app.initialize()
+check('unattended: Done re-arms the 30-minute retry for the time left', retryJob()?.secs == 1200)
+app.posts.clear()
+app.clock += 1_200_000
+app.scheduled.removeAll { it.handler == 'registerRetryRun' }
+app.registerRetryRun()
+check('unattended: the 30-minute retry sends the current token', registers().size() == 1 && regBody(registers()[0]).appAccessToken == app.state.accessToken)
+app.registerCallback(new FakeResp(status: 503, body: ''), [enabled: true])
+check('unattended: retry 5 in another 30 minutes', retryJob()?.secs == 1800 && app.state.registerRetry?.attempt == 5)
+// Fast-forward the 24-hour window (moving the clock a day would also age out the pending code change)
+app.state.registerRetry.since = app.clock - 24L * 3600 * 1000 + 3_700_000L
+int slow = 0
+while (retryJob() && slow < 100) {
+    app.clock += 1_800_000L
+    app.scheduled.removeAll { it.handler == 'registerRetryRun' }
+    app.registerRetryRun()
+    app.registerCallback(new FakeResp(status: 503, body: ''), [enabled: true])
+    slow++
+}
+check('unattended: the 30-minute retries stop after 24 hours and say so', slow == 2 && mainPage().contains('automatic retries failed for 24 hours'))
 app.posts.clear()
 app.registerRetryRun()
 check('register failure: no registration once retries are exhausted', registers().isEmpty())
@@ -310,7 +342,7 @@ app.scheduled.removeAll { it.handler == 'registerRetryRun' }
 app.registerRetryRun()
 app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden","code":"TOKEN_NOT_BOUND_TO_APP"}'), [enabled: true])
 check('register failure: reconnect required is not retried', !retryJob() && !app.state.registerRetry && app.state.lockMgmtReconnectRequired == true)
-check('reconnect required: the page points at the Reconnect button', mainPage().contains('click Reconnect to SignalBricks above') && app.inputs.btnReconnect)
+check('reconnect required: the page points at Reconnect', mainPage().contains('click Reconnect to SignalBricks above') && link())
 app.state.remove('lockMgmtReconnectRequired')
 // A retry with nothing left to send (disconnected meanwhile) clears itself
 app.registerWithPlatform()
@@ -326,7 +358,7 @@ survived('retries')
 app.lockManagementEnabled = false
 app.state.lockMgmtLastEnabled = false
 app.state.lockMgmtRegistered = false
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 app.posts.clear()
 app.clock += 600_000
 fireExpiry(expiryJob().data)
@@ -336,13 +368,25 @@ app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 
+// --- Turning lock code management on or off rotates the token: an open window is closed ---
+app.apiReconnect()
+app.lockManagementEnabled = false
+app.syncLockManagementEnabled()
+check('lock management off: an open Reconnect window is closed (its token was rotated)', app.state.connectLink == null && !expiryJob())
+app.apiReconnect()
+app.lockManagementEnabled = true
+app.syncLockManagementEnabled()
+check('lock management on: an open Reconnect window is closed too', app.state.connectLink == null && !expiryJob())
+track()
+app.removedSettings.clear()
+
 // --- Disconnect with a link open: link closed and no retry left ---
-app.appButtonHandler('btnReconnect')
+app.apiReconnect()
 app.appButtonHandler('btnDisconnect')
 track()
 check('disconnect: link closed, no expiry or retry left', app.state.connectLink == null && !expiryJob() && !retryJob())
-app.appButtonHandler('btnReconnect')
-check('not connected: the button opens no link', app.state.connectLink == null && !expiryJob())
+def notConnected = app.apiReconnect()
+check('not connected: /reconnect says so and opens no window', notConnected.data.contains('Not connected') && !notConnected.data.contains('http-equiv') && app.state.connectLink == null && !expiryJob())
 
 // --- Never a token in the logs ---
 String logs = app.logged.join('\n')
