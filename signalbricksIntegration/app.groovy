@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.7' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.8' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -2246,6 +2246,10 @@ Integer getSbConnectLinkSeconds() { 600 }
 
 void sbIssueConnectLink() {
     if (!state.sbCredential || !state.accessToken) return
+    // Opening /reconnect again (a restored tab, a link scanner) doesn't extend an open
+    // window: it keeps its first click's expiry (signalbricks/platform#699).
+    Map open = atomicState.sbConnectLink
+    if (open && now() < (open.expiresAt as long)) return
     long at = now()
     atomicState.sbConnectLink = [issuedAt: at, expiresAt: at + sbConnectLinkSeconds * 1000L]
     runIn(sbConnectLinkSeconds, 'sbConnectLinkExpire', [overwrite: true, data: [issuedAt: at]])

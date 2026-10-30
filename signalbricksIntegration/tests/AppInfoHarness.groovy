@@ -128,7 +128,7 @@ app.settings = [locks: ['57'] as String[]]
 Date now = new Date(app.clock)
 Map bookings = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.7', app.sbAppVersion == '1.4.7')
+check('version is 1.4.8', app.sbAppVersion == '1.4.8')
 
 // --- Install ---
 app.installed()
@@ -137,7 +137,7 @@ Map ev = app.locationEvents[0]
 check('install: event name signalbricksAppInfo, isStateChange true', ev.name == 'signalbricksAppInfo' && ev.isStateChange == true && ev.value instanceof String)
 Map info = lastInfo()
 check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'])
-check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.7')
+check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.8')
 check('payload: minCodePosition a number, prefix the setting', info.minCodePosition == 50 && info.minCodePosition instanceof Integer && info.codeNamePrefix == 'GT:')
 check('payload: no manageDoorCodes (OwnerRez fork only)', !info.containsKey('manageDoorCodes'))
 check('payload: under 255 characters', ev.value.length() < 255)
@@ -167,7 +167,7 @@ app.atomicState.bookings = bookings
 app.state.accessToken = 'tok-fake-access-0001'
 app.locationEvents.clear()
 app.updated()
-check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.7')
+check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.8')
 check('Done: daily job kept, same time', jobs().size() == 1 && job().cron == cron)
 app.minCodePosition = 60
 app.locationEvents.clear()
@@ -221,7 +221,7 @@ check('random time: still a single job', jobs().size() == 1)
 app.state.appInfoVersion = '1.4.5'
 app.locationEvents.clear()
 app.scheduleEvents([:])
-check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.7')
+check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.8')
 app.scheduleEvents([:])
 check('HPM update: not again on the next re-arm', app.locationEvents.size() == 1)
 
