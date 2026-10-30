@@ -43,6 +43,11 @@ Hubitat cloud only routes the sign-in result back to the app when the link carri
 
 - When you finish, or cancel, the sign-in, the app replaces its access token and registers the new one with SignalBricks.
 - If no sign-in result arrives within 10 minutes, the app does the same with the ingestion token it already has. The link stops working, and finishing that old sign-in later ends on a Hubitat error page; click **Reconnect** again.
+- Since 1.6.2, opening the Reconnect link again while the window is open (a second click, a restored browser tab) keeps that window: it still ends 10 minutes after the first click (signalbricks/platform#699).
+
+**Moving the hub elsewhere while it holds lock state.** Since 1.6.2 the sign-in link tells SignalBricks when the app holds lock code management state (slot rules, a fingerprint key, approved slots or full-control locks), and SignalBricks then only lets it reconnect to the organization and hub it manages locks for. This also holds when that hub was deleted in SignalBricks, or its Telemetry token was revoked under **Tokens**: SignalBricks then answers *Turn lock code management off on the hub first, then connect it to the new place.* Do exactly that: switch off **Enable lock code management** (it clears that state on the hub at once, even when SignalBricks can't be reached), then Reconnect. This needs SignalBricks with signalbricks/platform#699; earlier SignalBricks versions ignore it.
+
+**The Reconnect link carries the app's access token.** Hubitat app endpoints only answer requests that carry the access token, so the Reconnect link on the app page (to the app's own `/reconnect`) includes it. Anyone who can open the app page can already see that token under the app's **App Status** (gear icon), so the link shows them nothing new, and it never leaves the hub until you click it. Don't share the app page's links, or screenshots or saved copies of the page, with anyone you wouldn't give the hub's admin login to.
 
 Only the token changes. Lock code management stays on, and the slot rules, fingerprint key, approvals, full lock control and code changes in progress are kept; SignalBricks can't reach the hub only for the moment between the swap and the registration. If that registration fails for a reason that may pass (a timeout, rate limiting, SignalBricks unavailable), the app retries after about 30 seconds, 2 minutes and 5 minutes, then every 30 minutes for 24 hours, and the **Connection** section shows *Registration retries: …*. It never goes back to the old token.
 
@@ -166,9 +171,9 @@ Already-connected hubs need only an app update:
 
 New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 5.
 
-To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**. The app rotates its access token (so the token SignalBricks held stops working), clears the slot rules and approvals, and tells SignalBricks lock management is off. **Disconnect** does the same.
+To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**. The app rotates its access token (so the token SignalBricks held stops working), clears the slot rules, fingerprint key, approvals and full-control locks, and tells SignalBricks lock management is off. Since 1.6.2 the hub clears them, and rotates the token, even when SignalBricks can't be reached; settings like these left over while lock code management is off are cleared when you open the app or click **Done**. **Disconnect** does the same.
 
-You don't need to turn lock code management off to reconnect: see [Reconnect](#reconnect). (Before 1.5.2, Reconnect was hidden while lock code management was on.)
+You don't need to turn lock code management off to reconnect to the same organization and hub: see [Reconnect](#reconnect). To move the hub to another property or organization, turn it off first. (Before 1.5.2, Reconnect was hidden while lock code management was on.)
 
 ### What the hub enforces
 

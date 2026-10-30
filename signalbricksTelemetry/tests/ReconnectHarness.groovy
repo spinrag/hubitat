@@ -65,7 +65,11 @@ abstract class HubitatStub extends Script {
     def parseJson(String s) { new JsonSlurper().parseText(s) }
     int tokenSeq = 0
     String createAccessToken() { tokenSeq++; state.accessToken = "fake-app-token-000${tokenSeq}"; state.accessToken }
-    void asynchttpPost(String cb, Map p, Map d) { posts << [cb: cb, params: p, data: d] }
+    Boolean throwOnPost = false
+    void asynchttpPost(String cb, Map p, Map d) {
+        if (throwOnPost) throw new IllegalStateException('post failed 13572468')
+        posts << [cb: cb, params: p, data: d]
+    }
     void httpPost(Map p, Closure c) {
         http << p
         def r = tokenReply
@@ -125,7 +129,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.6.1', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.1')
+check('version is 1.6.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.2')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -140,7 +144,7 @@ app.state.connectedAt = '2026-10-01 12:00'
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 app.state.lockMgmtRegisteredAt = '2026-10-01 12:00'
-app.state.registeredVersion = '1.6.1'
+app.state.registeredVersion = '1.6.2'
 String KEY = ((1..32).collect { it as byte } as byte[]).encodeBase64().toString()
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY, locks: ['7': [adopted: [40]]]]]
 check('setup: slot rules and fingerprint key accepted', app.apiSetLockConfig().status == 200 && app.state.fingerprintKey == KEY)
@@ -354,6 +358,80 @@ check('register failure: a retry with nothing to send clears itself', !app.state
 app.state.sbToken = sb
 survived('retries')
 
+// --- signalbricks/platform#699 H2: opening /reconnect again doesn't extend an open window ---
+app.apiReconnect()
+Map first = app.state.connectLink.clone()
+app.clock += 300_000
+String again = app.apiReconnect().data
+check('again within the window: same window and expiry', app.state.connectLink == first)
+check('again within the window: its timer keeps the first link id', expiryJob()?.data?.issuedAt == first.issuedAt)
+mainPage()
+check('again within the window: the page shows the first expiry', link().description.contains("works until ${new Date(first.expiresAt as long).format('HH:mm:ss', TimeZone.getTimeZone('UTC'))}"))
+check('again within the window: still forwards to the sign-in', again.contains('http-equiv="refresh"') && again.contains('/oauth/hubitat/authorize?'))
+app.clock += 300_000
+app.posts.clear()
+fireExpiry(expiryJob().data)
+track()
+check('again within the window: it still ends 10 minutes after the first click', app.state.connectLink == null && registers().size() == 1)
+app.registerCallback(ok(true), [enabled: true])
+app.apiReconnect()
+check('after the window ended: a click opens a new one', app.state.connectLink?.issuedAt == app.clock && app.state.connectLink != first)
+app.clearConnectLink()
+
+// --- signalbricks/platform#699 P1: the sign-in link reports held lock state ---
+def lockStateParam = { String url -> url.split('\\?', 2)[1].split('&').any { it == 'lock_state=1' } }
+check('lock state held: the sign-in link carries lock_state=1', lockStateParam(app.connectUrl()) && again.contains('&amp;lock_state=1&amp;'))
+Map held = [lockConfig: app.state.lockConfig, fingerprintKey: app.state.fingerprintKey, approved: app.approvedAdoptedSlots, full: app.fullControlLocks]
+def onlyHolding = { String which ->
+    app.state.lockConfig = which == 'lockConfig' ? held.lockConfig : null
+    app.state.fingerprintKey = which == 'fingerprintKey' ? held.fingerprintKey : null
+    app.approvedAdoptedSlots = which == 'approved' ? held.approved : null
+    app.fullControlLocks = which == 'full' ? held.full : null
+    lockStateParam(app.connectUrl())
+}
+check('lock state: any one of slot rules, fingerprint key, approvals or full control is enough', ['lockConfig', 'fingerprintKey', 'approved', 'full'].every { onlyHolding(it) })
+check('lock state: none held (lock management on but nothing received yet), no lock_state', !onlyHolding('none'))
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+// Turning lock code management off wipes it on the hub even when SignalBricks can't be reached
+app.throwOnPost = true
+app.logged.clear()
+app.lockManagementEnabled = false
+String offPage = mainPage()
+track()
+check('off with SignalBricks unreachable: the page still renders', offPage.contains('Enable lock code management'))
+check('off with SignalBricks unreachable: slot rules, fingerprint key, approvals and full control wiped', app.state.lockConfig == null && app.state.fingerprintKey == null &&
+    app.approvedAdoptedSlots == null && app.fullControlLocks == null && !app.holdsLockState() && (app.state.pendingCodeChanges ?: [:]).isEmpty())
+check('off with SignalBricks unreachable: the next sign-in link has no lock_state', !lockStateParam(app.connectUrl()))
+check('off with SignalBricks unreachable: failures logged by class only', app.logged.any { it.contains('registering lock code management off failed (IllegalStateException)') } &&
+    app.logged.any { it.contains('reporting abandoned code changes failed (IllegalStateException)') } && !app.logged.any { it.contains('13572468') })
+app.throwOnPost = false
+app.lockManagementEnabled = true
+app.syncLockManagementEnabled()
+track()
+app.removedSettings.clear()
+
+// --- platform#699 K2: management off with lock state left over: wiped, no lock_state ---
+app.lockManagementEnabled = false
+app.syncLockManagementEnabled()
+track()
+app.state.lockConfig = held.lockConfig
+app.fullControlLocks = held.full
+check('leftover: setup holds lock state with management off', app.holdsLockState() && app.state.lockMgmtLastEnabled == false)
+mainPage()
+check('leftover: rendering the app page wipes it, so the sign-in link has no lock_state', !app.holdsLockState() && !lockStateParam(app.connectUrl()))
+app.state.fingerprintKey = held.fingerprintKey
+app.approvedAdoptedSlots = held.approved
+app.updated()
+track()
+check('leftover: Done wipes it too', !app.holdsLockState())
+app.lockManagementEnabled = true
+app.syncLockManagementEnabled()
+track()
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+mainPage()
+check('management on: lock state kept and reported', app.holdsLockState() && lockStateParam(app.connectUrl()))
+app.removedSettings.clear()
+
 // --- Lock management off: Reconnect still works; nothing to register ---
 app.lockManagementEnabled = false
 app.state.lockMgmtLastEnabled = false
@@ -381,9 +459,24 @@ track()
 app.removedSettings.clear()
 
 // --- Disconnect with a link open: link closed and no retry left ---
+// platform#699 K1: with SignalBricks unreachable (every post throws), Disconnect still
+// rotates the token and wipes the lock state
 app.apiReconnect()
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+app.state.pendingCodeChanges = ['7:2': [status: 'pending', lockId: '7', slot: 2, action: 'set', attempts: 1, name: 'SBA: Cleaner', createdAt: app.clock,
+    requestId: '00000000-0000-4000-8000-000000000001']]
+String beforeDisconnect = app.state.accessToken
+app.state.lockMgmtRegistered = true
+app.throwOnPost = true
+int logMark = app.logged.size()
 app.appButtonHandler('btnDisconnect')
+app.throwOnPost = false
 track()
+check('disconnect, SignalBricks unreachable: token rotated, disconnected', app.state.accessToken != beforeDisconnect && app.state.sbToken == null)
+check('disconnect, SignalBricks unreachable: lock state and pending changes wiped', !app.holdsLockState() && (app.state.pendingCodeChanges ?: [:]).isEmpty())
+List disconnectLogs = app.logged.drop(logMark)
+check('disconnect, SignalBricks unreachable: failures logged by class only', disconnectLogs.any { it.contains('registering the disconnect failed (IllegalStateException)') } &&
+    disconnectLogs.any { it.contains('reporting abandoned code changes failed (IllegalStateException)') } && !app.logged.any { it.contains('13572468') })
 check('disconnect: link closed, no expiry or retry left', app.state.connectLink == null && !expiryJob() && !retryJob())
 def notConnected = app.apiReconnect()
 check('not connected: /reconnect says so and opens no window', notConnected.data.contains('Not connected') && !notConnected.data.contains('http-equiv') && app.state.connectLink == null && !expiryJob())

@@ -108,7 +108,7 @@ def CREDENTIAL_2 = CREDENTIAL.replace('00', '22')
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.4.7', app.sbAppVersion == '1.4.7')
+check('version is 1.4.8', app.sbAppVersion == '1.4.8')
 
 // --- A connected hub with bookings, slot assignments and a pending code write ---
 app.settings = [locks: ['1'] as String[], codeNamePrefix: 'GT:', minCodePosition: 50]
@@ -117,7 +117,7 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.state.sbOrgName = 'Test Org'
 app.state.sbHubName = 'Main'
-app.state.sbRegisteredVersion = '1.4.7'
+app.state.sbRegisteredVersion = '1.4.8'
 app.atomicState.bookings = ['101': [id: 101, guest: 'Fake Guest', code: '9876', lockId: '1', checkIn: '2030-01-01T16:00:00Z', checkOut: '2030-01-03T11:00:00Z']]
 app.atomicState.codeAssignments = ['1': ['101': 51]]
 app.atomicState.lastSync = [at: app.clock, source: 'PUT /sync']
@@ -283,6 +283,24 @@ app.sbRegisterRetryRun()
 check('unattended: the 30-minute retry sends the new token', registers().size() == 1 && body(registers()[0]).appAccessToken == t6)
 app.sbRegisterCallback([status: 200, data: '{}'], null)
 check('register failure: success after a retry clears it', !app.atomicState.sbRegisterRetry && !mainPage().contains('Registration retries'))
+
+// --- signalbricks/platform#699 H2: opening /reconnect again doesn't extend an open window ---
+app.apiReconnect()
+Map first = app.atomicState.sbConnectLink.clone()
+app.clock += 300_000
+String again = app.apiReconnect().data
+check('again within the window: same window and expiry', app.atomicState.sbConnectLink == first)
+check('again within the window: its timer keeps the first link id', expiryJob()?.data?.issuedAt == first.issuedAt)
+check('again within the window: still forwards to the sign-in', again.contains('http-equiv="refresh"') && again.contains('/oauth/hubitat-integration/authorize?'))
+app.clock += 300_000
+app.http.clear()
+fireExpiry(expiryJob().data)
+track()
+check('again within the window: it still ends 10 minutes after the first click', app.atomicState.sbConnectLink == null && registers().size() == 1)
+app.sbRegisterCallback([status: 200, data: '{}'], null)
+app.apiReconnect()
+check('after the window ended: a click opens a new one', app.atomicState.sbConnectLink?.issuedAt == app.clock && app.atomicState.sbConnectLink != first)
+app.sbConnectLinkClear()
 
 // --- Disconnect with a link open: link closed (the token is replaced) ---
 app.apiReconnect()

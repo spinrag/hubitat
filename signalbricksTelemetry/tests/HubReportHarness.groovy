@@ -57,8 +57,10 @@ abstract class HubitatStub extends Script {
     }
     void unschedule(String handler = null) { if (handler) scheduled.removeAll { it.handler == handler } else scheduled.clear() }
     Boolean throwOnLocationSubscribe = false
+    Boolean throwOnDeviceSubscribe = false
     void subscribe(Object... args) {
         if (throwOnLocationSubscribe && args[0].is(location)) throw new IllegalStateException('subscribe failed 24681357')
+        if (throwOnDeviceSubscribe && !args[0].is(location)) throw new IllegalStateException('subscribe failed 24681357')
         subscriptions << [target: args[0], attribute: args[1], handler: args[2]]
     }
     void unsubscribe() { subscriptions.clear() }
@@ -171,7 +173,7 @@ check('doc example app info validates', appInfoErrors.isEmpty())
 List bad = validateReport(docReport + [extra: 1, locks: [[deviceId: '1', battery: '85', lockCodes: '{}']]])
 check('validator rejects extra keys and string numbers', bad.size() == 3)
 
-check('version is 1.6.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.1')
+check('version is 1.6.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.2')
 
 // --- Fake hub: connected, two booking apps, locks with codes ---
 String INGEST = 'sbit_fakeingesttokenfakeingesttoken00'
@@ -262,7 +264,7 @@ check('daily: fork app field names match the doc', r.apps.find { it.appId == '41
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
-check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.6.1', maxManagedSlot: 25])
+check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.6.2', maxManagedSlot: 25])
 check('daily: hub firmware, uptime, time zone', r.hub == [firmwareVersion: '2.4.3.152', uptimeSec: 864000, timeZone: 'America/New_York'])
 check('daily: apps as collected, with lastSeenAt', r.apps.find { it.appId == '412' } == docReport.apps[0] && r.apps.find { it.appId == '388' } == docReport.apps[1].findAll { k, v -> k != 'version' } + [version: '1.4.6'])
 // The doc's example rebuilt from this fake hub: same apps, the same front door
@@ -293,10 +295,10 @@ app.posts.clear()
 3.times { app.clock += 24L * 3600 * 1000; app.dailyCheckIn() }
 check('daily: a report every day, version unchanged', reports().size() == 3 && reports().every { bodyOf(it).reason == 'daily' })
 check('daily: no registration on a telemetry-only hub', !app.posts.any { it.cb == 'registerCallback' })
-check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.6.1'] })
+check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.6.2'] })
 app.maxManagedSlot = '40'
 app.posts.clear(); app.dailyCheckIn()
-check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.6.1'] && validateReport(lastReport()).isEmpty())
+check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.6.2'] && validateReport(lastReport()).isEmpty())
 app.maxManagedSlot = '25'
 
 // lockCodes that parse to something other than an object: no count
@@ -307,7 +309,8 @@ def encArr = new FakeLock(id: '63', displayName: 'Enc array', typeName: 'Z', att
 def encStr = new FakeLock(id: '64', displayName: 'Enc string', typeName: 'Z', attrs: [lockCodes: 'ENC:' + '"x"'.bytes.encodeBase64().toString()])
 def savedLocks = app.locks
 app.locks = [arr, strL, encArr, encStr]
-app.posts.clear(); app.dailyCheckIn()
+app.posts.clear(); app.decrypted.clear(); app.dailyCheckIn()
+check("lockCodes '[1,2]' and '\"x\"' (plain JSON) never passed to decrypt()", app.decrypted.size() == 2 && app.decrypted.every { it.startsWith('ENC:') })
 Map arrL = lastReport().locks.find { it.deviceId == '61' }
 Map strLL = lastReport().locks.find { it.deviceId == '62' }
 check("lockCodes '[1,2]' and '\"x\"': no occupiedSlots", !arrL.containsKey('occupiedSlots') && !strLL.containsKey('occupiedSlots'))
@@ -375,7 +378,7 @@ app.dailyCheckIn()
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 400, body: ''), [reason: 'daily'])
 check('400: not retried', retryJob() == null)
-check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.6.1')
+check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.6.2')
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 503, body: ''), [reason: 'daily'])
 check('503: version not recorded (retried instead)', app.state.reportedVersion == '1.5.3')
@@ -387,7 +390,7 @@ app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 408, body: ''), [reason: 'daily'])
 check('408 (timeout): retried', retryJob()?.secs == 30)
 app.reportCallback(new FakeResp(status: 202, body: '{"received":true}'), [reason: 'daily'])
-check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.6.1' && app.state.lastReportError == null)
+check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.6.2' && app.state.lastReportError == null)
 check('page: last sent shown', app.reportStatus()?.contains('last sent'))
 app.throwOnPost = true
 app.sendHubReport('daily')
@@ -464,6 +467,22 @@ app.state.lockMgmtLastEnabled = true
 app.posts.clear()
 app.dailyCheckIn()
 check('subscribe failure: the daily check-in still re-registers and reports', app.posts.any { it.cb == 'registerCallback' } && reports().size() == 1)
+// hubitat#52: after an update, re-subscribing the device events fails (subscribe() throws)
+app.throwOnLocationSubscribe = false
+app.throwOnDeviceSubscribe = true
+app.state.appInfoSubscribed = '1.5.3'
+app.state.registeredVersion = '1.5.3'
+app.state.remove('reregisterAttemptAt')
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+check('device subscribe failure: the daily check-in still re-registers and reports', app.posts.any { it.cb == 'registerCallback' } && reports().size() == 1)
+check('device subscribe failure: not marked subscribed, so the next check-in tries again', app.state.appInfoSubscribed != app.APP_VERSION &&
+    app.logged.any { it.startsWith('SignalBricks Telemetry: re-subscribing failed (') })
+app.throwOnDeviceSubscribe = false
+app.posts.clear()
+app.dailyCheckIn()
+check('device subscribe failure: the next check-in subscribes the devices and announcements, then marks it', app.state.appInfoSubscribed == app.APP_VERSION &&
+    app.subscriptions.any { it.attribute == 'lock' } && app.subscriptions.any { it.attribute == 'signalbricksAppInfo' } && reports().size() == 1)
 app.lockManagementEnabled = false
 app.state.lockMgmtLastEnabled = false
 app.throwOnLocationSubscribe = false

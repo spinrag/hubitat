@@ -82,6 +82,15 @@
  * window and forwards to the sign-in, so it is available while lock code
  * management is on: the callback, or the window's expiry, replaces the access
  * token the link carried and registers the new one. Only the token changes.
+ * Opening /reconnect again while the window is open keeps that window: it
+ * never runs longer than 10 minutes from the first click.
+ *
+ * While the app holds lock code management state (slot rules, fingerprint
+ * key, approvals or full-control locks), the sign-in link says so
+ * (`lock_state=1`, signalbricks/platform#699), and SignalBricks only lets it
+ * reconnect to the organization and hub it manages locks for. Turning lock
+ * code management off wipes that state on the hub, whether or not
+ * SignalBricks can be reached, so the hub can always be moved after that.
  *
  * Runs alongside the SignalBricks Integration (lock-code) app; the two are
  * independent.
@@ -95,7 +104,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.1'
+@Field static final String APP_VERSION = '1.6.2'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -395,21 +404,40 @@ Boolean syncLockManagementEnabled() {
         createAccessToken()
         return false
     }
-    if (!wasEnabled || enabled) return false
+    if (!wasEnabled || enabled) {
+        // Off, but lock state left from before (e.g. an older version's failed
+        // wipe): drop it, so the sign-in link doesn't send lock_state for a hub
+        // that manages no locks, and a later enable can't revive another
+        // organization's slot rules (platform#699).
+        if (!enabled && holdsLockState()) {
+            log.info 'SignalBricks Telemetry: leftover lock code management state cleared (lock code management is off)'
+            wipeLockState()
+        }
+        return false
+    }
     log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
     clearConnectLink()
-    createAccessToken()
-    abandonPendingCodeChanges('lock_management_disabled')
-    state.remove('lockConfig')
-    state.remove('fingerprintKey')
+    // Reporting the abandoned changes may reach SignalBricks; the wipe below
+    // must happen even when it, or the registration, fails (platform#699).
+    try {
+        abandonPendingCodeChanges('lock_management_disabled')
+    } catch (Exception e) {
+        savePendingCodeChanges([:])
+        log.warn "SignalBricks Telemetry: reporting abandoned code changes failed (${e.class.simpleName})"
+    }
+    wipeLockState()
     state.remove('revealTimes')
     state.remove('retryTimes')
     state.remove('writeTimes')
     state.remove('fingerprintTimes')
     state.remove('fingerprintBatchTimes')
-    app.removeSetting('approvedAdoptedSlots')
-    app.removeSetting('fullControlLocks')
-    registerWithPlatform(false)
+    createAccessToken()
+    try {
+        registerWithPlatform(false)
+    } catch (Exception e) {
+        // Only the class name: the request body carries the access token.
+        log.warn "SignalBricks Telemetry: registering lock code management off failed (${e.class.simpleName})"
+    }
     return true
 }
 
@@ -460,18 +488,26 @@ void appButtonHandler(String btn) {
     if (btn == 'btnDisconnect') {
         log.info 'Disconnected from SignalBricks'
         // Tell the platform lock management is off (best effort), then
-        // invalidate the access token it may hold.
-        registerWithPlatform(false)
+        // invalidate the access token it may hold. Neither SignalBricks call may
+        // stop the token rotation or the local wipe below (platform#699).
+        try {
+            registerWithPlatform(false)
+        } catch (Exception e) {
+            // Only the class name: the request body carries the access token.
+            log.warn "SignalBricks Telemetry: registering the disconnect failed (${e.class.simpleName})"
+        }
         createAccessToken()
         clearConnectLink()
         clearRegisterRetry()
         clearReportRetry()
         unschedule('sendAppInfoReport')
-        abandonPendingCodeChanges('disconnected')
-        state.remove('lockConfig')
-        state.remove('fingerprintKey')
-        app.removeSetting('approvedAdoptedSlots')
-        app.removeSetting('fullControlLocks')
+        try {
+            abandonPendingCodeChanges('disconnected')
+        } catch (Exception e) {
+            savePendingCodeChanges([:])
+            log.warn "SignalBricks Telemetry: reporting abandoned code changes failed (${e.class.simpleName})"
+        }
+        wipeLockState()
         state.remove('sbToken')
         state.remove('ingestUrl')
         state.remove('connectedAt')
@@ -643,8 +679,25 @@ String connectUrl() {
         version: APP_VERSION,
         location: location?.name ?: '',
     ]
+    // signalbricks/platform#699: SignalBricks may have lost track of where this
+    // hub manages locks (hub deleted, token revoked); the hub hasn't.
+    if (holdsLockState()) query.lock_state = '1'
     String qs = query.collect { k, v -> "${k}=${URLEncoder.encode(v.toString(), 'UTF-8')}" }.join('&')
     return "${SB_PORTAL_URL}/oauth/hubitat/authorize?${qs}&state=${stateRedirect}"
+}
+
+// Lock code management state a Reconnect keeps (#46), which ties this hub to
+// the organization and hub SignalBricks manages its locks for.
+Boolean holdsLockState() {
+    return state.lockConfig != null || state.fingerprintKey != null || !!approvedAdoptedSlots || !!fullControlLocks
+}
+
+// Drops that state. Local only, so it can't fail on SignalBricks.
+void wipeLockState() {
+    state.remove('lockConfig')
+    state.remove('fingerprintKey')
+    app.removeSetting('approvedAdoptedSlots')
+    app.removeSetting('fullControlLocks')
 }
 
 // Never log `params` here: it carries the authorization code and this app's access_token.
@@ -678,6 +731,10 @@ def oauthCallback() {
 
 void issueConnectLink() {
     if (!state.sbToken || !ensureAccessToken()) return
+    // Opening /reconnect again (a restored tab, a link scanner) doesn't extend
+    // an open window: it keeps its first click's expiry (platform#699).
+    Map open = atomicState.connectLink
+    if (open && now() < (open.expiresAt as long)) return
     long at = now()
     atomicState.connectLink = [issuedAt: at, expiresAt: at + CONNECT_LINK_SECONDS * 1000L]
     runIn(CONNECT_LINK_SECONDS, 'expireConnectLink', [overwrite: true, data: [issuedAt: at]])
@@ -1042,6 +1099,8 @@ void subscribeToAppInfo() {
 
 // An HPM update runs no initialize(), so the first daily check-in or event
 // with a new version subscribes (once; initialize() unsubscribes everything first).
+// If re-subscribing the telemetry events fails, the flag stays unset so the
+// next check-in or event tries again (hubitat#52).
 void ensureAppInfoSubscription() {
     if (state.appInfoSubscribed == APP_VERSION) return
     try {
@@ -1049,6 +1108,7 @@ void ensureAppInfoSubscription() {
         subscribeToEvents()
     } catch (Exception e) {
         log.warn "SignalBricks Telemetry: re-subscribing failed (${e.class.simpleName})"
+        return
     }
     subscribeToAppInfo()
 }
@@ -1149,7 +1209,9 @@ Integer occupiedSlotCount(lock) {
         String raw = lock.currentValue('lockCodes')?.toString()
         if (!raw) return null
         raw = raw.trim()
-        // Plain JSON is never passed to decrypt(); anything else must decrypt
+        // Plain JSON is never passed to decrypt(); anything else must decrypt.
+        // A JSON array or string is not a slot map.
+        if (raw.startsWith('[') || raw.startsWith('"')) return null
         String json = raw.startsWith('{') ? raw : decrypt(raw)
         def parsed = parseJson(json)
         return parsed instanceof Map ? parsed.size() : null
