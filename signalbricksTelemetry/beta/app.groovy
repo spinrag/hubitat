@@ -68,10 +68,10 @@
  * mapping, which exchanges it for an ingestion token. The app is a public
  * OAuth client and uses PKCE (S256); there is no client secret.
  *
- * Reconnect (#46) is a button that opens the connect link for 10 minutes, so
- * it is available while lock code management is on: the callback, or the
- * link's expiry, replaces the access token the link carried and registers the
- * new one. Only the token changes.
+ * Reconnect (#46) opens the app's own /reconnect, which starts a 10-minute
+ * window and forwards to the sign-in, so it is available while lock code
+ * management is on: the callback, or the window's expiry, replaces the access
+ * token the link carried and registers the new one. Only the token changes.
  *
  * Runs alongside the SignalBricks Integration (lock-code) app; the two are
  * independent.
@@ -85,7 +85,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.5.2'
+@Field static final String APP_VERSION = '1.5.3'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -130,8 +130,11 @@ import javax.crypto.spec.SecretKeySpec
 // Reconnect link (#46): a click on Reconnect opens a sign-in link for this long.
 @Field static final int CONNECT_LINK_SECONDS = 600
 // Automatic retries of a registration that failed for a reason that may pass
-// (timeout, rate limit, SignalBricks unavailable): after about 30 s, 2 min, 5 min.
+// (timeout, rate limit, SignalBricks unavailable): after about 30 s, 2 min, 5 min,
+// then every 30 minutes for 24 hours after the first failure (#46).
 @Field static final List<Integer> REGISTER_RETRY_SECONDS = [30, 120, 300]
+@Field static final int REGISTER_SLOW_RETRY_SECONDS = 1800
+@Field static final long REGISTER_RETRY_WINDOW_MS = 24L * 60 * 60 * 1000
 // Daily check-in (#13): runs that check once a day, so a quiet hub reports a
 // new version without waiting for an event. Each hub picks its own random
 // time, outside 02:00-03:59 (hub maintenance and backups).
@@ -179,6 +182,11 @@ mappings {
     // Hubitat cloud forwards the OAuth `code` here (via the stateredirect `state`).
     path('/oauthCallback') {
         action: [GET: 'oauthCallback']
+    }
+    // Reconnect (#46): starts the 10-minute sign-in window, then forwards to
+    // SignalBricks. Never log its params: they carry the access token.
+    path('/reconnect') {
+        action: [GET: 'apiReconnect']
     }
 
     // Lock code management (#472). Every handler returns 404 unless the
@@ -255,15 +263,14 @@ Map mainPage() {
                 }
                 // The connect URL carries this app's access token in the OAuth
                 // state, and while lock management is on that token is the one
-                // SignalBricks holds for lock control: so the link exists only
-                // for a few minutes after a click (#46).
+                // SignalBricks holds for lock control. One click (#46): the link
+                // opens this app's /reconnect, which starts the 10-minute window
+                // and only then sends the browser to SignalBricks.
                 String until = connectLinkUntil()
-                if (until) {
-                    href(name: 'hrefReconnect', title: 'Continue to SignalBricks', description: "Sign in again. This link works until ${until} (hub time); after that the app replaces its access token and registers the new one", style: 'external', url: connectUrl())
-                } else {
-                    input(name: 'btnReconnect', type: 'button', title: 'Reconnect to SignalBricks')
-                    paragraph '<small>Reconnect makes a sign-in link that works for 10 minutes and issues a new ingestion token. Finishing it, or letting it expire, replaces this app\'s access token and registers the new one. Lock code management stays on, with its slot rules, approvals and pending code changes.</small>'
-                }
+                href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: reconnectEntryUrl(),
+                    description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
+                        'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
+                paragraph '<small>The sign-in link works for 10 minutes. Whether you finish it or not, the app then replaces its access token and registers the new one, so an unused link can\'t be reused. Lock code management stays on, with its slot rules, approvals and pending code changes.</small>'
                 input(name: 'btnDisconnect', type: 'button', title: 'Disconnect')
                 paragraph '<small>Disconnect stops sending immediately. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
             } else {
@@ -357,11 +364,14 @@ Boolean syncLockManagementEnabled() {
     state.lockMgmtLastEnabled = enabled
     if (!wasEnabled && enabled) {
         log.info 'SignalBricks Telemetry: lock code management turned on; access token rotated'
+        // An open Reconnect window carried the old token, so it is dead now (#46)
+        clearConnectLink()
         createAccessToken()
         return false
     }
     if (!wasEnabled || enabled) return false
     log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
+    clearConnectLink()
     createAccessToken()
     abandonPendingCodeChanges('lock_management_disabled')
     state.remove('lockConfig')
@@ -444,8 +454,6 @@ void appButtonHandler(String btn) {
         state.remove('reregisterAttemptAt')
         unschedule('dailyCheckIn')
         atomicState.remove('checkInSecond')
-    } else if (btn == 'btnReconnect') {
-        issueConnectLink()
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         // Any open Reconnect link carried the old token, so it is dead now
@@ -623,7 +631,9 @@ def oauthCallback() {
 }
 
 // --- Reconnect link (#46) ---
-// Reconnect is a button: a click opens the sign-in link for CONNECT_LINK_SECONDS.
+// The app page's Reconnect link opens /reconnect (apiReconnect), which opens a
+// window of CONNECT_LINK_SECONDS and forwards to the sign-in; viewing the page
+// starts nothing.
 // The callback (success or failure) replaces the access token and registers
 // the new one; if no callback arrives in time, expireConnectLink does the same
 // with the ingestion token the app already holds. Either way the token in the
@@ -637,6 +647,32 @@ void issueConnectLink() {
     atomicState.connectLink = [issuedAt: at, expiresAt: at + CONNECT_LINK_SECONDS * 1000L]
     runIn(CONNECT_LINK_SECONDS, 'expireConnectLink', [overwrite: true, data: [issuedAt: at]])
     log.info "SignalBricks Telemetry: Reconnect link opened for ${CONNECT_LINK_SECONDS.intdiv(60)} minutes"
+}
+
+// The Reconnect entry point on the app page: this app's own /reconnect through
+// Hubitat cloud. App endpoints need the access token, so this URL carries it,
+// like the authorize URL it forwards to; it is only rendered on the app page
+// (behind the hub's own login), and nothing leaves the hub until it is clicked.
+// Never log it.
+String reconnectEntryUrl() {
+    return "${getFullApiServerUrl()}/reconnect?access_token=${state.accessToken}"
+}
+
+// GET /reconnect: start the window, then forward the browser to SignalBricks
+// with a page that has no script (meta refresh, plus a link). no-referrer:
+// neither URL may be sent onwards. Never log params or the URL.
+Map apiReconnect() {
+    if (!state.sbToken) {
+        return renderPage(false, 'Not connected', 'This app is not connected to SignalBricks.',
+            'Close this window and use <b>Connect to SignalBricks</b> in the app.')
+    }
+    issueConnectLink()
+    String url = escapeHtml(connectUrl())
+    String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${url}"><title>${escapeHtml(APP_NAME)}: Reconnect</title>
+<style>body{margin:0;padding:24px;font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}</style></head>
+<body><p>Opening SignalBricks&hellip;</p><p><a href="${url}" rel="noreferrer">Continue to SignalBricks</a></p></body></html>"""
+    return render(contentType: 'text/html', data: html, status: 200)
 }
 
 // The open link's expiry as hub time (HH:mm:ss), or null when no link is open.
@@ -745,11 +781,6 @@ Map handleOauthCallback() {
 Map renderPage(boolean ok, String headline, String detailHtml,
         String nextHtml = 'Close this window, open the app and connect again from its <b>Connection</b> section.') {
     String title = escapeHtml("${APP_NAME}: ${headline}")
-    String back = appPageUrl()
-    String backHtml = back
-        ? """<a class="btn" href="${escapeHtml(back)}">Back to the app</a>
-<p class="hint">The link works on the hub's local network. Elsewhere, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${escapeHtml(APP_NAME)}</b> on the hub.</p>"""
-        : """<p class="hint">To get back to the app, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${escapeHtml(APP_NAME)}</b> on the hub.</p>"""
     String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>${title}</title>
 <style>
@@ -763,7 +794,7 @@ h1{display:flex;align-items:center;gap:12px;margin:0 0 12px;font-size:22px;line-
 .mark{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;color:var(--on-mark);font-size:18px;font-weight:700}
 .ok .mark{background:var(--ok)}.err .mark{background:var(--err)}
 p{margin:0 0 12px}
-.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;color:var(--link);font-weight:600;text-decoration:none}
+.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--link);font:inherit;font-weight:600;cursor:pointer}
 .btn:hover,.btn:focus{text-decoration:underline}
 .hint{margin:16px 0 0;color:var(--muted);font-size:14px}
 </style></head>
@@ -772,19 +803,10 @@ p{margin:0 0 12px}
 <h1><span class="mark" aria-hidden="true">${ok ? '&#10003;' : '!'}</span>${escapeHtml(headline)}</h1>
 <p>${detailHtml}</p>
 <p>${nextHtml}</p>
-${backHtml}
+<button type="button" class="btn" onclick="window.close()">Close this window</button>
+<p class="hint">If this window doesn't close, close it yourself and return to the app; it's still open in your other tab. Reopen or refresh it to see the new status.</p>
 </main></body></html>"""
     return render(contentType: 'text/html', data: html, status: 200)
-}
-
-// The app's page on the hub, by local IP; null when it can't be built
-String appPageUrl() {
-    try {
-        String ip = location?.hub?.localIP?.toString()
-        String id = app?.id?.toString()
-        if (ip ==~ /\d{1,3}(\.\d{1,3}){3}/ && id ==~ /\d+/) return "http://${ip}/installedapp/configure/${id}"
-    } catch (Exception ignored) { }
-    return null
 }
 
 // --- Lock code management (#472) ---
@@ -851,15 +873,19 @@ Boolean registerRetryable(Integer status) {
     return !status || status in [408, 429] || status >= 500
 }
 
+// The slow tail matters after an unattended token swap (an expired Reconnect
+// window): SignalBricks must get the new token without anyone clicking Done.
 void scheduleRegisterRetry() {
-    int attempt = ((atomicState.registerRetry?.attempt ?: 0) as int) + 1
-    if (attempt > REGISTER_RETRY_SECONDS.size()) {
-        atomicState.registerRetry = [attempt: attempt - 1, exhausted: true]
+    Map prev = atomicState.registerRetry
+    int attempt = ((prev?.attempt ?: 0) as int) + 1
+    long since = prev?.since != null ? (prev.since as long) : now()
+    int delay = attempt <= REGISTER_RETRY_SECONDS.size() ? REGISTER_RETRY_SECONDS[attempt - 1] : REGISTER_SLOW_RETRY_SECONDS
+    if (attempt > REGISTER_RETRY_SECONDS.size() && now() + delay * 1000L > since + REGISTER_RETRY_WINDOW_MS) {
+        atomicState.registerRetry = [attempt: attempt - 1, exhausted: true, since: since]
         unschedule('registerRetryRun')
         return
     }
-    int delay = REGISTER_RETRY_SECONDS[attempt - 1]
-    atomicState.registerRetry = [attempt: attempt, at: now() + delay * 1000L]
+    atomicState.registerRetry = [attempt: attempt, at: now() + delay * 1000L, since: since]
     runIn(delay, 'registerRetryRun', [overwrite: true])
 }
 
@@ -875,7 +901,7 @@ void registerRetryRearm() {
 void registerRetryRun() {
     Map r = atomicState.registerRetry
     if (!r || r.exhausted || r.inFlight) return
-    atomicState.registerRetry = [attempt: r.attempt, inFlight: true]
+    atomicState.registerRetry = [attempt: r.attempt, inFlight: true, since: r.since]
     // Nothing to send any more (disconnected, or lock management off and never registered)
     if (!registerWithPlatform(null, true)) clearRegisterRetry()
 }
@@ -890,10 +916,13 @@ String registerRetryStatus() {
     Map r = atomicState.registerRetry
     if (!r) return null
     int total = REGISTER_RETRY_SECONDS.size()
-    if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
-    if (r.inFlight) return "<b>Registration retries:</b> retry ${r.attempt} of ${total} in progress"
+    if (r.exhausted) return "<b>Registration retries:</b> automatic retries failed for 24 hours; click Done to try again"
+    Boolean slow = (r.attempt as int) > total
+    String n = slow ? "retry ${r.attempt}" : "retry ${r.attempt} of ${total}"
+    String tail = slow ? ' (every 30 minutes for 24 hours)' : ''
+    if (r.inFlight) return "<b>Registration retries:</b> ${n} in progress${tail}"
     String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
-    return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
+    return "<b>Registration retries:</b> ${n} at ${when} (hub time)${tail}"
 }
 
 // Hubitat platform version, sent with events and registration for the

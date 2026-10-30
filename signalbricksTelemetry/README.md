@@ -31,23 +31,22 @@ Version 1.1.0 adds optional **lock code management** (off by default): SignalBri
 2. Select the locks and sensors you want to report, then click **Done** and reopen the app.
 3. Click **Connect to SignalBricks**. Sign in, then choose the **organization**, **property**, and **hub**. If this hub was connected before, it is preselected. You can also create a new hub entry. If the organization has no properties yet, you can create one on the same page.
    - If you work for a management company, choose the **property owner's organization**. Hubs belong to the owner, not the management company.
-4. After you approve, Hubitat shows a confirmation page from the hub. Since 1.5.1 it is a card with the outcome: *Connected*, *Not connected*, *Connect link expired* or *Connection failed*, with what to do next. Its **Back to the app** link opens the app by the hub's local IP address, so it works on the hub's network; elsewhere, go back to the hub window you connected from. The app then shows **Status: Connected**. If the connect failed, the app's **Last error** line shows the reason.
+4. After you approve, Hubitat shows a confirmation page from the hub. Since 1.5.1 it is a card with the outcome: *Connected*, *Not connected*, *Connect link expired* or *Connection failed*, with what to do next. Since 1.5.3 it has no link back to the app (it opens in its own window), but a **Close this window** button. Browsers often block that button, because the sign-in went through several pages in that window; then close the window yourself. The app is still open in your other tab. The app then shows **Status: Connected**. If the connect failed, the app's **Last error** line shows the reason.
 
 **Reconnect** issues a new ingestion token and revokes the previous one. **Disconnect** stops sending right away. To revoke the token on the SignalBricks side as well, remove it under **Tokens** in the portal.
 
 ### Reconnect
 
-Since 1.5.2 **Reconnect to SignalBricks** is a button, and it is shown whether or not lock code management is on (#46):
+Since 1.5.2 **Reconnect to SignalBricks** is shown whether or not lock code management is on (#46); since 1.5.3 it is one link. Click it and sign in, as for Connect, in the new window. The app page then shows until when that sign-in works: 10 minutes after the click.
 
-1. Click **Reconnect to SignalBricks**. The page then shows **Continue to SignalBricks**, with the time the link stops working: 10 minutes after the click.
-2. Click **Continue to SignalBricks** and sign in as for Connect.
-
-Hubitat cloud only routes the sign-in result back to the app when the link carries the app's current access token, and while lock code management is on that is the token SignalBricks uses for lock control. So the link exists only for those 10 minutes, and the token in it is always replaced:
+Hubitat cloud only routes the sign-in result back to the app when the link carries the app's current access token, and while lock code management is on that is the token SignalBricks uses for lock control. So the Reconnect link goes to the app's own `/reconnect` first: that starts the 10-minute window and then forwards the browser to SignalBricks. Viewing the app page starts nothing. Once the window is open, the token in it is always replaced:
 
 - When you finish, or cancel, the sign-in, the app replaces its access token and registers the new one with SignalBricks.
-- If no sign-in result arrives within 10 minutes, the app does the same with the ingestion token it already has. The link stops working; click **Reconnect** again for a new one.
+- If no sign-in result arrives within 10 minutes, the app does the same with the ingestion token it already has. The link stops working, and finishing that old sign-in later ends on a Hubitat error page; click **Reconnect** again.
 
-Only the token changes. Lock code management stays on, and the slot rules, fingerprint key, approvals, full lock control and code changes in progress are kept; SignalBricks can't reach the hub only for the moment between the swap and the registration. If that registration fails for a reason that may pass (a timeout, rate limiting, SignalBricks unavailable), the app retries after about 30 seconds, 2 minutes and 5 minutes, and the **Connection** section shows *Registration retries: retry N of 3 at …*. It never goes back to the old token.
+Only the token changes. Lock code management stays on, and the slot rules, fingerprint key, approvals, full lock control and code changes in progress are kept; SignalBricks can't reach the hub only for the moment between the swap and the registration. If that registration fails for a reason that may pass (a timeout, rate limiting, SignalBricks unavailable), the app retries after about 30 seconds, 2 minutes and 5 minutes, then every 30 minutes for 24 hours, and the **Connection** section shows *Registration retries: …*. It never goes back to the old token.
+
+The confirmation page opens in its own window, so since 1.5.3 it has no link back to the app, only a **Close this window** button (often blocked by the browser; then close it yourself). Return to the app, which is still open in your other tab, and refresh it to see the new status.
 
 ## Updating
 
@@ -316,7 +315,7 @@ Added in 1.3.0 (signalbricks/platform#532). The onboarding wizard needs `/slots`
 After every Connect or Reconnect (once the access token has been rotated), when a Reconnect link expires unused, on every **Done**, on **Rotate access token and re-register**, and on **Disconnect**, the app POSTs to `<ingest URL>/register` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/register`) with its ingestion token:
 
 ```json
-{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.5.2", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true, "capabilities": ["relocate", "registered_slots", "full_control"]}
+{"cloudEndpointBase": "https://cloud.hubitat.com/api/<hubUID>/apps/<appId>", "appAccessToken": "<only while enabled, else null>", "hubUid": "<hubUID>", "appId": "<appId>", "version": "1.5.3", "hubFirmwareVersion": "<Hubitat platform version>", "lockManagement": true, "capabilities": ["relocate", "registered_slots", "full_control"]}
 ```
 
 Since 1.4.0 `capabilities` lists the optional lock management features this version supports (`relocate`; since 1.5.0 also `registered_slots` and `full_control`), so SignalBricks only offers them on hubs that have them. Older versions don't send it.
@@ -331,7 +330,7 @@ SignalBricks accepts it only with the ingestion token the Connect flow issued fo
 
 Hubs connected before lock code management existed (signalbricks/platform#505) hold a token without that binding. SignalBricks answers their enable with `403 TOKEN_NOT_BOUND_TO_APP`, and their disable with `200` and `reconnect_required: true`, storing nothing and leaving any existing registration as it is (signalbricks/platform#522). In either case the app shows **Reconnect to SignalBricks to enable lock management** and doesn't retry. Click **Reconnect to SignalBricks** and finish the sign-in; the app then registers lock code management with the new token.
 
-Since 1.5.2 a registration that fails for a reason that may pass (no answer, `408` timeout, `429`, or `5xx`) is retried automatically after about 30 seconds, 2 minutes and 5 minutes, and the **Connection** section shows the retry. Other answers (`400`, `401`, `404`, reconnect required) aren't retried. **Done** starts a fresh registration.
+Since 1.5.2 a registration that fails for a reason that may pass (no answer, `408` timeout, `429`, or `5xx`) is retried automatically after about 30 seconds, 2 minutes and 5 minutes, then (1.5.3+) every 30 minutes for 24 hours after the first failure, and the **Connection** section shows the retry. Other answers (`400`, `401`, `404`, reconnect required) aren't retried. **Done** starts a fresh registration.
 
 ### Encrypted lock codes
 
@@ -339,7 +338,7 @@ Some newer lock drivers can store `lockCodes` encrypted (a driver preference suc
 
 ## Development
 
-`tests/LockManagementHarness.groovy` exercises the lock-management handlers against a stubbed Hubitat sandbox, with fake locks and codes, `tests/RelocateHarness.groovy` the [relocate](#relocate) endpoint, `tests/FullControlHarness.groovy` [registered slots and full lock control](#registered-slots-and-full-lock-control), including booking codes on every new path, `tests/ConnectHarness.groovy` the Connect confirmation page for each outcome (headline and marker, inline CSS only, no-referrer, the back link, escaped text, no token, code or request parameter), and `tests/ReconnectHarness.groovy` the [Reconnect](#reconnect) button and its 10-minute link with lock code management on (click then callback, click then expiry, expiry racing the callback, the expiry surviving **Done**, registration retries, the slot rules, fingerprint key, approvals and pending code changes kept, and no token logged or shown outside the open link). They are not loaded by Hubitat or HPM. Run each from the repository root with Docker:
+`tests/LockManagementHarness.groovy` exercises the lock-management handlers against a stubbed Hubitat sandbox, with fake locks and codes, `tests/RelocateHarness.groovy` the [relocate](#relocate) endpoint, `tests/FullControlHarness.groovy` [registered slots and full lock control](#registered-slots-and-full-lock-control), including booking codes on every new path, `tests/ConnectHarness.groovy` the Connect confirmation page for each outcome (headline and marker, inline CSS only, no-referrer, the back link, escaped text, no token, code or request parameter), and `tests/ReconnectHarness.groovy` the [Reconnect](#reconnect) link and its 10-minute window with lock code management on (click then callback, click then expiry, expiry racing the callback, the expiry surviving **Done**, registration retries, the slot rules, fingerprint key, approvals and pending code changes kept, and no token logged or shown outside the open link). They are not loaded by Hubitat or HPM. Run each from the repository root with Docker:
 
 ```bash
 docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
@@ -376,8 +375,8 @@ docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" -v /tmp/sb-
 ## Troubleshooting
 
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
-- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks**, then **Continue to SignalBricks**, and sign in. Lock code management can stay on.
-- **"Reconnect to SignalBricks to enable lock management"**: this hub was connected before lock code management existed, so its token can't enable it. Click **Reconnect to SignalBricks**, then **Continue to SignalBricks**, and sign in; lock code management can stay on. Telemetry keeps working meanwhile.
+- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** and sign in. Lock code management can stay on.
+- **"Reconnect to SignalBricks to enable lock management"**: this hub was connected before lock code management existed, so its token can't enable it. Click **Reconnect to SignalBricks** and sign in; lock code management can stay on. Telemetry keeps working meanwhile.
 - **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
 - **A code change failed** (`lock_code_result` with `result: "failed"`): check the lock is awake and in range of the hub, then retry from SignalBricks. Changes that failed with `not_applied` or `lock_codes_unreadable` can be retried without re-entering the code for 24 hours; other failures need a new request. `Code changes awaiting the lock` in the app shows how many are in progress or failed.
 - **Slots answer `409 lock_codes_unreadable`**: see [Encrypted lock codes](#encrypted-lock-codes).

@@ -1,8 +1,8 @@
 // Connect confirmation page (#44), with a stubbed Hubitat sandbox: the page
 // oauthCallback returns for each outcome (connected, failed exchange, denied,
 // missing code, expired link), styled like SignalBricks Integration's (#40):
-// headline and marker, inline CSS only, no-referrer, the back link and its
-// validation, escaped text, and no token, code, verifier or request param on
+// headline and marker, inline CSS only, no-referrer, no back link (the page
+// opens in its own window, #46), escaped text, and no token, code, verifier or request param on
 // the page. Also checks the token is still rotated on every callback, and that
 // the app page's Last error is escaped.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
@@ -81,7 +81,7 @@ List secrets = []
 String INGEST_TOKEN = 'sbit_fakeingesttokenfakeingesttoken00'
 secrets << INGEST_TOKEN
 
-check('version is 1.5.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.2')
+check('version is 1.5.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.3')
 
 def callback = { Map p ->
     String before = app.state.accessToken
@@ -138,10 +138,13 @@ headlines.each { k, h ->
     String html = pages[k]
     String status = k == 'connected' ? 'ok' : 'err'
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Telemetry: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
-    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.5.2</p>'))
+    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.5.3</p>'))
     check("page ${k}: inline CSS only, light and dark, wraps long text", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && html.contains('overflow-wrap:anywhere') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
-    check("page ${k}: back link to the app on the hub, with guidance", html.contains('<a class="btn" href="http://192.168.1.10/installedapp/configure/42">Back to the app</a>') && html.contains('Apps</b> &rarr; <b>SignalBricks Telemetry'))
-    check("page ${k}: no-referrer, so the back link doesn't send the callback URL", html.contains('<meta name="referrer" content="no-referrer">'))
+    check("page ${k}: no back link (it opened in its own window); says to close it and return to the app", !html.contains('<a ') && !html.contains('installedapp') && !html.contains('Back to the app') &&
+        html.contains("If this window doesn't close, close it yourself and return to the app; it's still open in your other tab."))
+    check("page ${k}: a Close this window button, whose static window.close() is the only script", html.contains('<button type="button" class="btn" onclick="window.close()">Close this window</button>') &&
+        (html =~ /(?i)\son[a-z]+\s*=/).collect { it }.size() == 1 && !html.toLowerCase().contains('javascript:') && !html.toLowerCase().contains('<script'))
+    check("page ${k}: no-referrer", html.contains('<meta name="referrer" content="no-referrer">'))
     check("page ${k}: no token, code or verifier", !secrets.any { it && html.contains(it) } && !html.contains('access_token') && !html.contains('fake-auth-code') && !html.contains('fake-app-token') && !html.contains('code_verifier'))
 }
 check('page connected: says Connected on reopen', pages.connected.contains('<b>Status: Connected</b>'))
@@ -180,23 +183,10 @@ app.mainPage()
 String mainHtml = app.paragraphs.join('\n')
 check('app page not connected: Last error shows the raw error escaped', mainHtml.contains('<b>Last error:</b> SignalBricks did not authorize this hub (&lt;script&gt;alert(2)&lt;/script&gt;)') && !mainHtml.contains('<script'))
 
-// --- Back link validation: guidance instead of the link ---
-String goodIp = app.location.hub.localIP
-app.location.hub.localIP = '"><script>x</script>'
-result = callback([:])
-check('bad local IP: no link, guidance on where to find the app', !result.data.contains('Back to the app</a>') && result.data.contains('Apps</b> &rarr; <b>SignalBricks Telemetry') && !result.data.contains('<script'))
-app.location.hub.localIP = '192.168.1.10/evil'
-check('local IP with a path: no link', !callback([:]).data.contains('installedapp'))
-app.location.hub.remove('localIP')
-result = callback([:])
-check('no local IP at all: still renders, no link', result.data.contains('Not connected') && !result.data.contains('installedapp'))
-app.location.hub.localIP = goodIp
-app.app.id = 'abc'
-check('non-numeric app id: no link', !callback([:]).data.contains('installedapp'))
-app.app.id = 42
+// --- No back link whatever the hub reports (the URL helper is gone) ---
 app.location = null
 result = callback([:])
-check('no location: still renders, no link', result.data.contains('Not connected') && !result.data.contains('installedapp'))
+check('no location: still renders, no link', result.data.contains('Not connected') && !result.data.contains('<a '))
 
 // --- Nothing secret logged ---
 check('logs: no token, verifier or code', !app.logged.any { l -> secrets.any { it && l.contains(it) } || l.contains('fake-auth-code') })
