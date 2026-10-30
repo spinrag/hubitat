@@ -104,7 +104,7 @@ def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.6', app.sbAppVersion == '1.4.6')
+check('version is 1.4.7', app.sbAppVersion == '1.4.7')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -139,7 +139,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.6' && q.location == 'Ross Farm House')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.7' && q.location == 'Ross Farm House')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -162,12 +162,12 @@ secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.6', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.7', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.6')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.7')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
@@ -397,7 +397,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.6'
+app.state.sbRegisteredVersion = '1.4.7'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -409,7 +409,7 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.6' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.7' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text

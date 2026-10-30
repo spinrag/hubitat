@@ -108,7 +108,7 @@ def CREDENTIAL_2 = CREDENTIAL.replace('00', '22')
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.4.6', app.sbAppVersion == '1.4.6')
+check('version is 1.4.7', app.sbAppVersion == '1.4.7')
 
 // --- A connected hub with bookings, slot assignments and a pending code write ---
 app.settings = [locks: ['1'] as String[], codeNamePrefix: 'GT:', minCodePosition: 50]
@@ -117,7 +117,7 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.state.sbOrgName = 'Test Org'
 app.state.sbHubName = 'Main'
-app.state.sbRegisteredVersion = '1.4.6'
+app.state.sbRegisteredVersion = '1.4.7'
 app.atomicState.bookings = ['101': [id: 101, guest: 'Fake Guest', code: '9876', lockId: '1', checkIn: '2030-01-01T16:00:00Z', checkOut: '2030-01-03T11:00:00Z']]
 app.atomicState.codeAssignments = ['1': ['101': 51]]
 app.atomicState.lastSync = [at: app.clock, source: 'PUT /sync']

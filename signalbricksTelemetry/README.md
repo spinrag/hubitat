@@ -135,19 +135,19 @@ Since 1.6.0 (signalbricks/platform#692) the app sends SignalBricks a short repor
 
 **When.** Every day at the [daily check-in](#updating) time, whether or not anything changed; when you click **Done**; after **Connect** or **Reconnect**; and about a minute after a booking app announces a new version or changed settings. Only while connected.
 
-**Where.** `POST <ingestion URL>/report` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/report`) with the same `Authorization: Bearer <token>` as events, HTTPS only. A report that fails for a reason that may pass (no answer, `408`, `429`, `5xx`) is retried after about 30 seconds, 2 minutes and 5 minutes, then waits for the next day; other answers aren't retried. A failure is logged with its HTTP status only, and shown in the **Connection** section as *Hub report: …*.
+**Where.** `POST <ingestion URL>/report` (`https://ingest.signalbricks.co/v1/webhooks/hubitat/report`) with the same `Authorization: Bearer <token>` as events, HTTPS only. A report that fails for a reason that may pass (no answer, `408`, `429`, `5xx`) is retried after about 30 seconds, 2 minutes and 5 minutes, then waits for the next day; other answers aren't retried. A failure is logged with its HTTP status only, and shown in the **Connection** section as *Hub report: …*. Since 1.6.1 a `4xx` also ends the after-update resend until the next version (the daily report still goes out), and handling the other apps' announcements never interrupts the check-in, telemetry or lock code management: any error there is caught and logged by its class only.
 
 **What.** Field names and limits are the platform's contract (`docs/hub-reporting.md`, schema version 1); a field the app can't fill is left out:
 
 | Field | Value |
 |---|---|
 | `schemaVersion`, `sentAt`, `reason` | `1`, when the hub built it (epoch ms), `daily` / `installed` / `updated` |
-| `telemetry.version`, `telemetry.maxManagedSlot` | This app's version, and the ceiling for SignalBricks slots (the *Highest slot SignalBricks may manage* setting, default 25) |
+| `telemetry.version`, `telemetry.maxManagedSlot` | This app's version, and the ceiling for SignalBricks slots (the *Highest slot SignalBricks may manage* setting, default 25). Since 1.6.1 the ceiling is sent only while lock code management is on |
 | `apps[]` | The latest announcement of each booking app on the hub (`signalbricksAppInfo` location events: SignalBricks Integration 1.4.6+, the OwnerRez app from the SignalBricks fork 1.1.4-cto-sb7+): `appId`, `name`, `version`, `minCodePosition`, `codeNamePrefix`, `manageDoorCodes` (OwnerRez fork only), plus `lastSeenAt`. At most 20; an app not heard from for 7 days is dropped |
 | `hub.firmwareVersion`, `hub.uptimeSec`, `hub.timeZone` | The hub's platform version, uptime in seconds and time zone |
 | `locks[]` | One entry per lock selected for telemetry or code management (at most 200): `deviceId`, `name` (the device label, at most 64 characters), `battery`, `lock` (`locked`, `unlocked`, `unlocked with timeout`, `unknown` or `jammed`), `jammed`, `maxCodes`, `codeLength`, `driver` (at most 64 characters) and `occupiedSlots` |
 
-`occupiedSlots` is a **count**. To count the slots the app reads the lock's `lockCodes` (decrypting it when the driver encrypts it); it never subscribes to `lockCodes`, and never sends or logs a code, code name or guest name. The announcements are filtered to the fields above, so nothing else another app might put in them is sent. The report stays well under the platform's 64 KB limit; on a hub with very many locks, locks at the end of the list are left out.
+`occupiedSlots` is a **count**. To count the slots the app reads the lock's `lockCodes` (decrypting it when the driver encrypts it; since 1.6.1 plain JSON is never passed to `decrypt()`, and a value that isn't a slot map gives no count); it never subscribes to `lockCodes`, and never sends or logs a code, code name or guest name. The announcements are filtered to the fields above, so nothing else another app might put in them is sent. The report stays well under the platform's 64 KB limit; on a hub with very many locks, locks at the end of the list are left out.
 
 ## Lock code management (optional)
 
