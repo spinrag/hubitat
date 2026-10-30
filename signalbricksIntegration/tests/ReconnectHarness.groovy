@@ -63,6 +63,8 @@ abstract class HubitatStub extends Script {
     void unschedule() { scheduled.clear() }
     void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
+    List locationEvents = []
+    void sendLocationEvent(Map m) { locationEvents << m }
     void unsubscribe() {}
     def parseJson(String s) { new JsonSlurper().parseText(s) }
     String createAccessToken() { tokenSeq++; state.accessToken = "fake-app-token-000${tokenSeq}"; return state.accessToken }
@@ -106,7 +108,7 @@ def CREDENTIAL_2 = CREDENTIAL.replace('00', '22')
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.4.5', app.sbAppVersion == '1.4.5')
+check('version is 1.4.6', app.sbAppVersion == '1.4.6')
 
 // --- A connected hub with bookings, slot assignments and a pending code write ---
 app.settings = [locks: ['1'] as String[], codeNamePrefix: 'GT:', minCodePosition: 50]
@@ -115,7 +117,7 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.state.sbOrgName = 'Test Org'
 app.state.sbHubName = 'Main'
-app.state.sbRegisteredVersion = '1.4.5'
+app.state.sbRegisteredVersion = '1.4.6'
 app.atomicState.bookings = ['101': [id: 101, guest: 'Fake Guest', code: '9876', lockId: '1', checkIn: '2030-01-01T16:00:00Z', checkOut: '2030-01-03T11:00:00Z']]
 app.atomicState.codeAssignments = ['1': ['101': 51]]
 app.atomicState.lastSync = [at: app.clock, source: 'PUT /sync']

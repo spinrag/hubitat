@@ -61,6 +61,16 @@
  * Updates (#13): a daily check-in at a random per-hub time re-registers when
  * the version changed, since an HPM update doesn't run updated().
  *
+ * Hub report (signalbricks/platform#692): booking apps on the hub announce
+ * their version and slot settings with a hub-local `signalbricksAppInfo`
+ * location event; the app keeps the latest per app. At the daily check-in,
+ * and on install, Done and Connect, it posts a report to the ingestion
+ * service's /report: its version and ceiling, those app infos, the hub's
+ * firmware, uptime and time zone, and per lock its battery, lock state,
+ * maxCodes, code length, driver and the NUMBER of occupied code slots. Never
+ * a code, code name, token or guest name. Contract: the platform's
+ * docs/hub-reporting.md.
+ *
  * Setup uses Hubitat's documented OAuth "stateredirect" pattern with
  * SignalBricks as the OAuth provider: "Connect to SignalBricks" opens the
  * SignalBricks portal, the user picks the organization/property/hub, and
@@ -85,7 +95,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.5.3'
+@Field static final String APP_VERSION = '1.6.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -140,6 +150,18 @@ import javax.crypto.spec.SecretKeySpec
 // time, outside 02:00-03:59 (hub maintenance and backups).
 @Field static final int CHECK_IN_WINDOW_START_SEC = 4 * 3600
 @Field static final int CHECK_IN_WINDOW_SEC = 22 * 3600
+// Hub report (signalbricks/platform#692), docs/hub-reporting.md on the platform.
+@Field static final String APP_INFO_EVENT = 'signalbricksAppInfo'
+@Field static final int REPORT_SCHEMA_VERSION = 1
+@Field static final int MAX_REPORT_APPS = 20
+@Field static final int MAX_REPORT_LOCKS = 200
+@Field static final long APP_INFO_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
+// The platform refuses bodies over 64 KB; stay well under it.
+@Field static final int REPORT_MAX_BYTES = 60000
+@Field static final int REPORT_NAME_MAX = 64
+@Field static final List<String> REPORT_LOCK_STATES = ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed']
+// A new or changed app announcement is reported this long after it arrives.
+@Field static final int APP_INFO_REPORT_DELAY_SECONDS = 60
 
 // Set/delete verification (#520). Each attempt is checked 30s after it is
 // sent and again at its final check; the final check backs off per attempt
@@ -240,7 +262,7 @@ Map mainPage() {
         }
 
         section('<b>Door codes in telemetry (optional)</b>') {
-            paragraph 'Off by default: the code used to unlock a lock is removed before anything is sent; only its slot and name are. When on, the code of lock events is sent to SignalBricks, which keeps only a keyed hash of it, and only if an admin of your SignalBricks organization has also turned on <i>Hash door codes from Hubitat telemetry</i>. Otherwise SignalBricks removes it. Codes are never logged here, and lock code lists (<code>lockCodes</code>) are never read for telemetry.'
+            paragraph 'Off by default: the code used to unlock a lock is removed before anything is sent; only its slot and name are. When on, the code of lock events is sent to SignalBricks, which keeps only a keyed hash of it, and only if an admin of your SignalBricks organization has also turned on <i>Hash door codes from Hubitat telemetry</i>. Otherwise SignalBricks removes it. Codes are never logged here, and lock code lists (<code>lockCodes</code>) are never sent: the daily hub report only counts the occupied slots.'
             input(name: 'includeDoorCodes', type: 'bool', title: 'Include door codes (hashed by SignalBricks)', defaultValue: false, submitOnChange: true)
         }
 
@@ -251,8 +273,10 @@ Map mainPage() {
                 paragraph "<b>Status:</b> Connected${state.connectedAt ? " since ${state.connectedAt}" : ''}"
                 paragraph "<b>Sending to:</b> ${state.ingestUrl}"
                 if (checkInTime()) {
-                    paragraph "<small>Daily update check-in at ${checkInTime()} (hub time).</small>"
+                    paragraph "<small>Daily check-in and hub report at ${checkInTime()} (hub time).</small>"
                 }
+                String report = reportStatus()
+                if (report) paragraph report
                 if (state.lastError) {
                     paragraph "<b>Last error:</b> ${escapeHtml(state.lastError)}"
                 }
@@ -340,6 +364,7 @@ void installed() {
     log.info "${appNameAndVersion()} installed"
     ensureAccessToken()
     initialize()
+    sendHubReport('installed')
 }
 
 void updated() {
@@ -351,6 +376,7 @@ void updated() {
         // management is on or was registered.
         registerWithPlatform()
     }
+    sendHubReport('updated')
 }
 
 // On an off -> on flip: rotate the access token before it is registered, so
@@ -396,10 +422,12 @@ void initialize() {
     unsubscribe()
     unschedule()
     subscribeToEvents()
+    subscribeToAppInfo()
     scheduleDailyCheckIn()
     // unschedule() also removed these timers; put them back for the time left
     connectLinkRearm()
     registerRetryRearm()
+    reportRetryRearm()
     if (debugLogging) {
         runIn(1800, 'logsOff')
     }
@@ -437,6 +465,8 @@ void appButtonHandler(String btn) {
         createAccessToken()
         clearConnectLink()
         clearRegisterRetry()
+        clearReportRetry()
+        unschedule('sendAppInfoReport')
         abandonPendingCodeChanges('disconnected')
         state.remove('lockConfig')
         state.remove('fingerprintKey')
@@ -452,6 +482,10 @@ void appButtonHandler(String btn) {
         state.remove('lockMgmtReconnectRequired')
         state.remove('registeredVersion')
         state.remove('reregisterAttemptAt')
+        state.remove('reportedVersion')
+        state.remove('reportAttemptAt')
+        state.remove('lastReportAt')
+        state.remove('lastReportError')
         unschedule('dailyCheckIn')
         atomicState.remove('checkInSecond')
     } else if (btn == 'btnRotateLockToken') {
@@ -502,6 +536,7 @@ void eventHandler(evt) {
         log.warn "SignalBricks Telemetry: failed to send ${evt.name} for device ${evt.deviceId} (${e.class.simpleName})"
     }
     reregisterIfVersionChanged()
+    reportIfVersionChanged()
 }
 
 // Door codes (PINs) must never leave the hub, unless "Include door codes" is
@@ -768,7 +803,9 @@ Map handleOauthCallback() {
     if (state.sbToken && !state.lastError) {
         log.info 'Connected to SignalBricks'
         subscribeToEvents()
+        subscribeToAppInfo()
         scheduleDailyCheckIn()
+        sendHubReport('updated')
         return renderPage(true, 'Connected', 'This hub is now connected to SignalBricks and sends its telemetry there.',
             'Reopen the app: it shows <b>Status: Connected</b>. You can close this window.')
     }
@@ -975,11 +1012,335 @@ String checkInTime() {
     return String.format('%02d:%02d', t.intdiv(3600), (t.intdiv(60)) % 60)
 }
 
-// Scheduled daily. Sends nothing unless the version changed since the last
-// registration (same guards and backoff as after an event).
+// Scheduled daily: re-registers if the version changed since the last
+// registration (same guards and backoff as after an event), and sends the
+// daily hub report (#692) whether or not anything changed.
 void dailyCheckIn() {
     logDebug 'daily check-in'
+    ensureAppInfoSubscription()
     reregisterIfVersionChanged()
+    sendHubReport('daily')
+}
+
+// --- Hub report (signalbricks/platform#692) ---
+// Field names, types and limits follow the platform's docs/hub-reporting.md
+// exactly. A field that can't be filled is left out. Counts only: never a
+// code, code name, PIN, token or guest name.
+
+// Booking apps announce themselves with a hub-local location event.
+void subscribeToAppInfo() {
+    subscribe(location, APP_INFO_EVENT, 'appInfoHandler')
+    state.appInfoSubscribed = APP_VERSION
+}
+
+// An HPM update runs no initialize(), so the first daily check-in or event
+// with a new version subscribes (once; initialize() unsubscribes everything first).
+void ensureAppInfoSubscription() {
+    if (state.appInfoSubscribed == APP_VERSION) return
+    unsubscribe()
+    subscribeToEvents()
+    subscribeToAppInfo()
+}
+
+void appInfoHandler(evt) {
+    Map info = parseAppInfo(evt?.value)
+    if (!info) return
+    Map apps = atomicState.appInfos ?: [:]
+    Map prev = apps[info.appId]
+    Map seen = info + [lastSeenAt: now()]
+    apps[info.appId] = seen
+    atomicState.appInfos = pruneAppInfos(apps)
+    logDebug "app info from ${info.name ?: 'an app'} ${info.version ?: ''} (app ${info.appId})"
+    // A new or changed app goes out shortly, not only with the next daily report
+    Map prevInfo = prev ? prev.findAll { k, v -> k != 'lastSeenAt' } : null
+    if (prevInfo != info && state.sbToken && isHttps(state.ingestUrl)) {
+        runIn(APP_INFO_REPORT_DELAY_SECONDS, 'sendAppInfoReport', [overwrite: true])
+    }
+}
+
+void sendAppInfoReport() {
+    sendHubReport('updated')
+}
+
+// Only the contract keys, each only with the type and range the platform
+// accepts; anything else in the event is dropped. Null without an appId.
+Map parseAppInfo(def value) {
+    def v
+    try {
+        v = value instanceof Map ? value : parseJson(value?.toString())
+    } catch (Exception e) {
+        return null
+    }
+    if (!(v instanceof Map)) return null
+    String appId = (v.appId instanceof String || v.appId instanceof Number) ? reportString(v.appId, 32) : null
+    if (!appId) return null
+    Map out = [:]
+    Integer schemaVersion = reportInt(v.schemaVersion, 1, 1000)
+    if (schemaVersion != null) out.schemaVersion = schemaVersion
+    out.appId = appId
+    String name = v.name instanceof String ? reportString(v.name, 64) : null
+    if (name) out.name = name
+    String version = v.version instanceof String ? reportString(v.version, 32) : null
+    if (version) out.version = version
+    Integer minCodePosition = reportInt(v.minCodePosition, 0, MAX_SLOT)
+    if (minCodePosition != null) out.minCodePosition = minCodePosition
+    if (v.codeNamePrefix instanceof String && v.codeNamePrefix.length() <= 16) out.codeNamePrefix = v.codeNamePrefix
+    if (v.manageDoorCodes instanceof Boolean) out.manageDoorCodes = v.manageDoorCodes
+    return out
+}
+
+// A trimmed, non-empty string of at most max characters, or null
+String reportString(def v, int max) {
+    String s = v?.toString()?.trim()
+    return s && s.length() <= max ? s : null
+}
+
+// A whole JSON number in min..max, or null (strings and booleans don't count)
+Integer reportInt(def v, int min, int max) {
+    if (!(v instanceof Number) || v instanceof Boolean) return null
+    try {
+        BigDecimal d = new BigDecimal(v.toString())
+        if (d.stripTrailingZeros().scale() > 0) return null
+        int n = d.intValueExact()
+        return n >= min && n <= max ? n : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+// Drops apps not seen for 7 days, and keeps the most recently seen 20
+Map pruneAppInfos(Map apps) {
+    long cutoff = now() - APP_INFO_MAX_AGE_MS
+    List kept = apps.values().findAll { it instanceof Map && it.lastSeenAt != null && (it.lastSeenAt as long) >= cutoff }
+        .sort { -(it.lastSeenAt as long) }
+        .take(MAX_REPORT_APPS)
+    return kept.collectEntries { [(it.appId.toString()): it] }
+}
+
+// A device attribute coerced to a number ("85", 85, "250.0"), or null
+BigDecimal reportNumber(def v) {
+    if (v == null) return null
+    try {
+        return new BigDecimal(v.toString().trim())
+    } catch (Exception e) {
+        return null
+    }
+}
+
+// Number of slots in the lock's lockCodes, which may be encrypted. The
+// decrypted map holds codes: only its size leaves this method.
+Integer occupiedSlotCount(lock) {
+    try {
+        String raw = lock.currentValue('lockCodes')?.toString()
+        if (!raw) return null
+        String json = null
+        try {
+            json = decrypt(raw)
+        } catch (Exception e) {
+            // Not encrypted, or decrypt() not available: use the raw value
+        }
+        def parsed = parseJson(json ?: raw)
+        return parsed instanceof Map ? parsed.size() : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+Map reportLock(lock) {
+    Map l = [deviceId: lock.id.toString()]
+    String name = lock.displayName?.toString()?.trim()
+    if (name) l.name = name.take(REPORT_NAME_MAX)
+    BigDecimal battery = reportNumber(lock.currentValue('battery'))
+    if (battery != null) l.battery = battery
+    String lockState = lock.currentValue('lock')?.toString()?.toLowerCase()
+    if (lockState != null) {
+        if (REPORT_LOCK_STATES.contains(lockState)) l.lock = lockState
+        // Exactly the lock attribute; nothing else is inferred
+        l.jammed = lockState == 'jammed'
+    }
+    BigDecimal maxCodes = reportNumber(lock.currentValue('maxCodes'))
+    if (maxCodes != null) l.maxCodes = maxCodes.intValue()
+    BigDecimal codeLength = reportNumber(lock.currentValue('codeLength'))
+    if (codeLength != null) l.codeLength = codeLength.intValue()
+    try {
+        String driver = lock.typeName?.toString()?.trim()
+        if (driver) l.driver = driver.take(REPORT_NAME_MAX)
+    } catch (Exception e) {
+        // left out
+    }
+    Integer occupied = occupiedSlotCount(lock)
+    if (occupied != null) l.occupiedSlots = occupied
+    return l
+}
+
+// Every lock selected in the app, for telemetry or for code management, once
+List reportLocks() {
+    return ((locks ?: []) + (codeLocks ?: [])).unique { it.id.toString() }.take(MAX_REPORT_LOCKS).collect { lock ->
+        try {
+            return reportLock(lock)
+        } catch (Exception e) {
+            // One unreadable device doesn't hold up the report
+            return [deviceId: lock.id.toString()]
+        }
+    }
+}
+
+Map reportHub() {
+    Map hub = [:]
+    String firmware = hubFirmwareVersion()
+    if (firmware) hub.firmwareVersion = firmware
+    try {
+        BigDecimal uptime = reportNumber(location?.hub?.uptime)
+        if (uptime != null && uptime >= 0) hub.uptimeSec = uptime.longValue()
+    } catch (Exception e) {
+        // left out
+    }
+    try {
+        String tz = location?.timeZone?.ID
+        if (tz) hub.timeZone = tz
+    } catch (Exception e) {
+        // left out
+    }
+    return hub
+}
+
+Map buildHubReport(String reason) {
+    Map apps = pruneAppInfos(atomicState.appInfos ?: [:])
+    return [
+        schemaVersion: REPORT_SCHEMA_VERSION,
+        sentAt: now(),
+        reason: reason,
+        telemetry: [version: APP_VERSION, maxManagedSlot: managedCeiling()],
+        apps: apps.values().collect { it },
+        hub: reportHub(),
+        locks: reportLocks(),
+    ]
+}
+
+int utf8Length(String s) {
+    return s.getBytes('UTF-8').length
+}
+
+// The report as JSON, under REPORT_MAX_BYTES: locks are left out from the end if needed
+String hubReportBody(String reason) {
+    Map report = buildHubReport(reason)
+    String body = JsonOutput.toJson(report)
+    int size = utf8Length(body)
+    if (size <= REPORT_MAX_BYTES) return body
+    List all = report.locks
+    int keep = all.size()
+    while (keep > 0 && size > REPORT_MAX_BYTES) {
+        keep--
+        size -= utf8Length(JsonOutput.toJson(all[keep])) + 1
+    }
+    report.locks = all.take(keep)
+    log.warn "SignalBricks Telemetry: hub report too large, sending ${keep} of ${all.size()} locks"
+    return JsonOutput.toJson(report)
+}
+
+// Posts the hub report with the ingestion token. Returns whether it was sent.
+// A retry keeps its attempt count; any other report starts afresh.
+Boolean sendHubReport(String reason, Boolean retry = false) {
+    if (!retry) clearReportRetry()
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return false
+    String body
+    try {
+        body = hubReportBody(reason)
+    } catch (Exception e) {
+        log.warn "SignalBricks Telemetry: could not build the hub report (${e.class.simpleName})"
+        return false
+    }
+    Map params = [
+        uri: "${state.ingestUrl}/report",
+        requestContentType: 'application/json',
+        contentType: 'application/json',
+        headers: [Authorization: "Bearer ${state.sbToken}"],
+        body: body,
+        timeout: 15,
+    ]
+    try {
+        asynchttpPost('reportCallback', params, [reason: reason])
+    } catch (Exception e) {
+        // Only the class name: the request carries the ingestion token.
+        log.warn "SignalBricks Telemetry: failed to send the hub report (${e.class.simpleName})"
+        return false
+    }
+    return true
+}
+
+// After an update through HPM (no Done), report the new version on the next
+// event, at most every REREGISTER_INTERVAL_MS until it is accepted.
+void reportIfVersionChanged() {
+    if (state.reportedVersion == APP_VERSION) return
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return
+    if (state.reportAttemptAt && now() - (state.reportAttemptAt as long) < REREGISTER_INTERVAL_MS) return
+    state.reportAttemptAt = now()
+    ensureAppInfoSubscription()
+    sendHubReport('updated')
+}
+
+void reportCallback(resp, Map data) {
+    if (resp.hasError()) {
+        int status = resp.getStatus()
+        // The status only: never the request, which carries the ingestion token
+        log.warn "SignalBricks Telemetry: hub report not accepted (HTTP ${status})"
+        state.lastReportError = "${new Date().format('yyyy-MM-dd HH:mm')} HTTP ${status}"
+        if (state.sbToken && registerRetryable(status)) scheduleReportRetry(data?.reason?.toString())
+        else clearReportRetry()
+        return
+    }
+    clearReportRetry()
+    state.remove('lastReportError')
+    state.lastReportAt = now()
+    state.reportedVersion = APP_VERSION
+    logDebug "hub report sent (${data?.reason})"
+}
+
+// A report that failed for a reason that may pass (no answer, timeout, 429,
+// 5xx) is retried after about 30 s, 2 min and 5 min, like a registration;
+// after that the next daily report follows.
+void scheduleReportRetry(String reason) {
+    Map prev = atomicState.reportRetry
+    int attempt = ((prev?.attempt ?: 0) as int) + 1
+    if (attempt > REGISTER_RETRY_SECONDS.size()) {
+        clearReportRetry()
+        return
+    }
+    int delay = REGISTER_RETRY_SECONDS[attempt - 1]
+    atomicState.reportRetry = [attempt: attempt, at: now() + delay * 1000L, reason: reason ?: 'daily']
+    runIn(delay, 'reportRetryRun', [overwrite: true])
+}
+
+// unschedule() removed a pending retry's timer; put it back for the time left
+void reportRetryRearm() {
+    Map r = atomicState.reportRetry
+    if (!r || r.inFlight) return
+    long left = (long) (((r.at as long) - now()) / 1000)
+    runIn(Math.max(left, 5L), 'reportRetryRun', [overwrite: true])
+}
+
+void reportRetryRun() {
+    Map r = atomicState.reportRetry
+    if (!r || r.inFlight) return
+    atomicState.reportRetry = [attempt: r.attempt, inFlight: true, reason: r.reason]
+    if (!sendHubReport(r.reason?.toString() ?: 'daily', true)) clearReportRetry()
+}
+
+void clearReportRetry() {
+    atomicState.remove('reportRetry')
+    unschedule('reportRetryRun')
+}
+
+// The report line for the app page, or null
+String reportStatus() {
+    List parts = []
+    if (state.lastReportAt) {
+        parts << "last sent ${new Date(state.lastReportAt as long).format('yyyy-MM-dd HH:mm', location?.timeZone ?: TimeZone.getDefault())}"
+    }
+    if (state.lastReportError) parts << "last error ${escapeHtml(state.lastReportError.toString())}"
+    Map r = atomicState.reportRetry
+    if (r) parts << "retry ${r.attempt} of ${REGISTER_RETRY_SECONDS.size()}${r.inFlight ? ' in progress' : ''}"
+    return parts ? "<small><b>Hub report:</b> ${parts.join('; ')}</small>" : null
 }
 
 void registerCallback(resp, Map data) {

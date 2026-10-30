@@ -125,7 +125,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.5.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.3')
+check('version is 1.6.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.0')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -140,7 +140,7 @@ app.state.connectedAt = '2026-10-01 12:00'
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 app.state.lockMgmtRegisteredAt = '2026-10-01 12:00'
-app.state.registeredVersion = '1.5.3'
+app.state.registeredVersion = '1.6.0'
 String KEY = ((1..32).collect { it as byte } as byte[]).encodeBase64().toString()
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY, locks: ['7': [adopted: [40]]]]]
 check('setup: slot rules and fingerprint key accepted', app.apiSetLockConfig().status == 200 && app.state.fingerprintKey == KEY)

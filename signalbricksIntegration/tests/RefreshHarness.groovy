@@ -57,6 +57,8 @@ abstract class HubitatStub extends Script {
     void unschedule() { scheduled.clear() }
     void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
+    List locationEvents = []
+    void sendLocationEvent(Map m) { locationEvents << m }
     void unsubscribe() {}
     void httpPostJson(Map p, Closure c) { throw new IllegalStateException('no network in the harness') }
     def parseJson(String s) { new JsonSlurper().parseText(s) }
@@ -110,7 +112,7 @@ app.settings = [locks: ['1', '2', '3'] as String[]]
 Date now = new Date()
 Map bookings = ['88': [id: '88', guest: 'Ann', code: '24681357', lockId: ['1'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.5', app.sbAppVersion == '1.4.5')
+check('version is 1.4.6', app.sbAppVersion == '1.4.6')
 
 // Saving the app code runs the main page with no state and no settings
 def savedState = app.state, savedAtomic = app.atomicState, savedSettings = app.settings
