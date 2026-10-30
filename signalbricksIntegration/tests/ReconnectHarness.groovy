@@ -1,9 +1,11 @@
 // One-click safe Reconnect (#46) for SignalBricks Integration with a stubbed Hubitat
-// sandbox: Reconnect is a button and the sign-in link (which carries the access token
-// SignalBricks holds) exists only for 10 minutes after a click. Checks click -> callback
+// sandbox: Reconnect is one link to the app's own /reconnect, which opens a 10-minute
+// window and forwards to the sign-in (whose link carries the access token SignalBricks
+// holds); viewing the page starts nothing. Checks click -> callback
 // (success and failure), click -> expiry (token replaced and registered with the
 // credential already held), expiry racing the callback, the expiry surviving an
-// app-wide unschedule(), a lost timer, registration failure -> retries on the app page,
+// app-wide unschedule(), a lost timer, registration failure -> quick then 30-minute
+// retries on the app page,
 // that bookings, slot assignments, pending code writes and settings survive, and that
 // no token is logged or rendered outside the open link.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
@@ -91,6 +93,9 @@ def check = { String label, boolean ok -> println((ok ? 'PASS ' : 'FAIL ') + lab
 def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.inputs.clear(); app.pages()
     (app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description} ${it.url}" }).join('\n') }
 def link = { app.hrefs.find { it.name == 'hrefSbReconnect' } }
+// The page without link URLs: titles, descriptions, paragraphs
+def pageText = { mainPage(); (app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description}" }).join('\n') }
+def entryUrl = { "${app.fullApiServerUrl}/reconnect?access_token=${app.state.accessToken}".toString() }
 def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def registers = { app.http.findAll { it.async == 'sbRegisterCallback' } }
 def expiryJob = { app.scheduled.find { it.handler == 'sbConnectLinkExpire' } }
@@ -122,23 +127,32 @@ def survived = { String when ->
     check("${when}: still connected with the same credential", app.state.sbCredential != null && app.state.sbConnected == true)
 }
 
-// --- Before a click: a button, no link, no token on the page ---
+// --- Before a click: one Reconnect link to the app's own /reconnect; viewing arms nothing ---
 String page = mainPage()
-check('page: Reconnect is a button, not a link', app.inputs.btnSbReconnect?.type == 'button' && !link())
-check('page: says the link works for 10 minutes and door codes keep syncing', page.contains('works for 10 minutes') && page.contains('Door codes keep syncing'))
-check('page: no access token anywhere before the click', !page.contains(app.state.accessToken) && !page.contains('access_token'))
+check('page: Reconnect is one link to the app\'s own /reconnect, never to SignalBricks directly', link()?.title == 'Reconnect to SignalBricks' && link().style == 'external' &&
+    link().url == entryUrl() && !page.contains('/oauth/hubitat-integration/authorize') && !app.inputs.btnSbReconnect)
+check('page: says the link works for 10 minutes, an unused link can\'t be reused, and what to do after a Hubitat error',
+    page.contains('works for 10 minutes') && page.contains("an unused link can't be reused") && page.contains('Door codes keep syncing') &&
+    link().description.contains('If you see a Hubitat error after signing in, click Reconnect again.'))
+check('page: the token is only in the Reconnect URL, never in text', !pageText().contains(app.state.accessToken))
+5.times { mainPage() }
+check('page: viewing the page opens no window, schedules nothing and changes no token', app.atomicState.sbConnectLink == null && !expiryJob() && registers().isEmpty() && app.state.accessToken == tokens[0])
 
 // --- Click -> callback success ---
 String t0 = app.state.accessToken
-app.appButtonHandler('btnSbReconnect')
+def entry = app.apiReconnect()
+String fwd = entry.data
 Map l = app.atomicState.sbConnectLink
+check('click: /reconnect forwards to the SignalBricks sign-in with no script and no referrer', entry.status == 200 && entry.contentType == 'text/html' &&
+    fwd.contains('<meta name="referrer" content="no-referrer">') && fwd.contains('<meta http-equiv="refresh" content="0;url=https://app.signalbricks.co/oauth/hubitat-integration/authorize?') &&
+    fwd.contains('>Continue to SignalBricks</a>') && !(fwd =~ /<script|src=/))
+check('click: the forward carries the current token in the sign-in state, HTML-escaped', fwd.contains(URLEncoder.encode("access_token=${t0}", 'UTF-8')) && !fwd.contains('&state=') && fwd.contains('&amp;state='))
 check('click: link opened for 10 minutes', l?.issuedAt == app.clock && l?.expiresAt == app.clock + 600_000L)
 check('click: expiry scheduled in 10 minutes with the link id', expiryJob()?.secs == 600 && expiryJob()?.data?.issuedAt == l.issuedAt)
 check('click: token not changed by the click', app.state.accessToken == t0 && registers().isEmpty())
 page = mainPage()
-check('click: page shows Continue to SignalBricks with the expiry time', link()?.title == 'Continue to SignalBricks' && link().style == 'external' && link().description.contains('until 08:10:00') && !app.inputs.btnSbReconnect)
-check('click: the token is only in the link URL', link().url.contains(URLEncoder.encode("access_token=${t0}", 'UTF-8')) &&
-    !(app.paragraphs + app.inputs.values().collect { "${it.title}" } + app.hrefs.collect { "${it.title} ${it.description}" }).join('\n').contains(t0))
+check('click: the app page shows until when the sign-in works', link()?.title == 'Reconnect to SignalBricks' && link().description.contains('works until 08:10:00'))
+check('click: the token is only in the Reconnect URL', link().url == entryUrl() && !pageText().contains(t0))
 app.replies = ['/oauth/hubitat-integration/token': [access_token: CREDENTIAL_2, organization_name: 'Test Org', hub_name: 'Main']]
 app.params = [code: 'fake-auth-code-1', access_token: t0]
 app.clock += 60_000
@@ -148,7 +162,7 @@ check('callback: Hub authorized', result.data.contains('Hub authorized'))
 check('callback: link closed and its expiry cancelled', app.atomicState.sbConnectLink == null && !expiryJob())
 check('callback: token replaced and registered with the new credential', t1 != t0 && registers().size() == 1 &&
     body(registers()[0]).appAccessToken == t1 && registers()[0].headers.Authorization == "Bearer ${CREDENTIAL_2}".toString())
-check('callback: page shows the Reconnect button again, no token', mainPage().with { !it.contains(t0) && !it.contains(t1) && !it.contains('access_token') } && app.inputs.btnSbReconnect && !link())
+check('callback: page back to plain Reconnect with the new token\'s entry URL, no old token anywhere', mainPage().with { !it.contains(t0) } && !pageText().contains(t1) && link().url == entryUrl() && !link().description.contains('works until'))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Test Org', hub_name: 'Main'])], null)
 survived('callback success')
 // Expiry racing the callback: the job fires anyway (queued just before the callback cancelled it)
@@ -157,7 +171,7 @@ fireExpiry([issuedAt: l.issuedAt])
 check('race (callback first): the stale expiry does nothing', app.state.accessToken == t1 && registers().isEmpty() && app.state.sbCredential == CREDENTIAL_2)
 
 // --- Click -> callback failure (sign-in cancelled): still rotated, registered with the credential held ---
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 app.http.clear()
 app.params = [error: 'access_denied']
 result = app.oauthCallback()
@@ -170,7 +184,7 @@ app.sbRegisterCallback([status: 200, data: '{}'], null)
 survived('callback failure')
 
 // --- Click -> expiry: no callback within 10 minutes ---
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 l = app.atomicState.sbConnectLink
 mainPage()
 String verifier = app.state.sbPkceVerifier
@@ -183,7 +197,7 @@ check('expiry: token replaced', t3 != t2)
 check('expiry: new token registered with the credential already held', registers().size() == 1 && body(registers()[0]).appAccessToken == t3 &&
     registers()[0].headers.Authorization == "Bearer ${CREDENTIAL_2}".toString())
 check('expiry: link closed, verifier dropped', app.atomicState.sbConnectLink == null && app.state.sbPkceVerifier == null)
-check('expiry: page shows the button again, no token', mainPage().with { !it.contains(t2) && !it.contains(t3) && !it.contains('access_token') } && app.inputs.btnSbReconnect && !link())
+check('expiry: page back to plain Reconnect, the old token nowhere', mainPage().with { !it.contains(t2) } && !pageText().contains(t3) && link().url == entryUrl() && !link().description.contains('works until'))
 check('expiry: logged without a token', app.logged.any { it.contains('Reconnect link expired unused; access token replaced, registering it with SignalBricks') })
 app.sbRegisterCallback([status: 200, data: '{}'], null)
 survived('expiry')
@@ -199,7 +213,7 @@ app.sbRegisterCallback([status: 200, data: '{}'], null)
 survived('late callback')
 
 // A newer link: an older link's expiry must not close it
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 Map newer = app.atomicState.sbConnectLink
 app.http.clear()
 fireExpiry([issuedAt: l.issuedAt])
@@ -227,10 +241,10 @@ app.http.clear()
 page = mainPage()
 String t5 = track()
 check('lost timer: rendering the page expires the link and rotates the token', t5 != t4 && app.atomicState.sbConnectLink == null && registers().size() == 1 && body(registers()[0]).appAccessToken == t5)
-check('lost timer: no link, no token on that page', !link() && !page.contains(t4) && !page.contains(t5))
+check('lost timer: the old token nowhere on that page', !page.contains(t4) && !pageText().contains(t5) && !link().description.contains('works until'))
 
 // --- Registration failure after an expiry: automatic retries, shown on the app page ---
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 app.http.clear()
 app.clock += 600_000
 fireExpiry(expiryJob().data)
@@ -244,23 +258,54 @@ app.http.clear()
 app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
 app.sbRegisterRetryRun()
 check('register failure: the retry sends the new token, never the old one', registers().size() == 1 && body(registers()[0]).appAccessToken == t6 && !tokens[0..-2].contains(body(registers()[0]).appAccessToken))
+// The 3 quick retries fail too: no one is watching, so it keeps trying every 30 minutes
+app.sbRegisterCallback([status: 503, data: null], null)
+[120, 300].each { secs ->
+    app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
+    app.sbRegisterRetryRun()
+    app.sbRegisterCallback([status: 503, data: null], null)
+}
+retryJob = app.scheduled.find { it.handler == 'sbRegisterRetryRun' }
+check('unattended: after the quick retries, retry 4 in 30 minutes, shown on the page', retryJob?.secs == 1800 && mainPage().contains('retry 4 at') && mainPage().contains('every 30 minutes for 24 hours'))
+app.clock += 600_000
+app.request = [JSON: [:]]
+app.apiSync()
+check('unattended: a booking sync re-arms the 30-minute retry for the time left', app.scheduled.find { it.handler == 'sbRegisterRetryRun' }?.secs == 1200)
+app.apiUnregister()
+check('unattended: the legacy DELETE /register (app-wide unschedule) re-arms it too', app.scheduled.find { it.handler == 'sbRegisterRetryRun' }?.secs == 1200)
+app.state.accessToken = t6
+app.clock += 1_200_000
+app.http.clear()
+app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
+app.sbRegisterRetryRun()
+check('unattended: the 30-minute retry sends the new token', registers().size() == 1 && body(registers()[0]).appAccessToken == t6)
 app.sbRegisterCallback([status: 200, data: '{}'], null)
 check('register failure: success after a retry clears it', !app.atomicState.sbRegisterRetry && !mainPage().contains('Registration retries'))
 
 // --- Disconnect with a link open: link closed (the token is replaced) ---
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 app.replies['/oauth/hubitat-integration/revoke'] = [:]
 app.appButtonHandler('btnSbDisconnect')
 track()
 check('disconnect: link closed and no expiry left', app.atomicState.sbConnectLink == null && !expiryJob())
-// Not connected: the button does nothing
-app.appButtonHandler('btnSbReconnect')
-check('not connected: no Reconnect link', app.atomicState.sbConnectLink == null && !expiryJob())
+// Not connected: /reconnect opens nothing
+def notConnected = app.apiReconnect()
+check('not connected: /reconnect says so and opens no window', notConnected.data.contains('Not connected') && !notConnected.data.contains('http-equiv') && app.atomicState.sbConnectLink == null && !expiryJob())
+
+// The legacy DELETE /register (app-wide unschedule) keeps an open window's expiry
+app.state.sbCredential = CREDENTIAL_2
+app.state.sbConnected = true
+app.apiReconnect()
+app.clock += 60_000
+app.apiUnregister()
+check('legacy unregister: the open window\'s expiry is re-armed for the time left', expiryJob()?.secs == 540)
+app.state.accessToken = app.createAccessToken(); track()
+app.sbConnectLinkClear()
 
 // Refresh Access Token (Debug) closes an open link: it carried the old token
 app.state.sbCredential = CREDENTIAL_2
 app.state.sbConnected = true
-app.appButtonHandler('btnSbReconnect')
+app.apiReconnect()
 app.appButtonHandler('btbAccessToken')
 track()
 check('refresh access token: link closed, no expiry left', app.atomicState.sbConnectLink == null && !expiryJob())

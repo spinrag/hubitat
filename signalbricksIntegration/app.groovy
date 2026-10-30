@@ -83,16 +83,13 @@ preferences {
                 else {
                     sbConnectionStatus().each { paragraph it }
                     if (state.sbCredential) {
-                        // The sign-in link carries the access token SignalBricks holds, so it
-                        // exists only for a few minutes after a click (#46)
+                        // One click (#46): the link opens this app's /reconnect, which starts the
+                        // 10-minute window and only then sends the browser to SignalBricks
                         String until = sbConnectLinkUntil()
-                        if (until) {
-                            href(name: 'hrefSbReconnect', title: 'Continue to SignalBricks', style: 'external', url: sbConnectUrl(),
-                                description: "Sign in again. This link works until ${until} (hub time); after that the app replaces its access token and registers the new one")
-                        } else {
-                            input(name: 'btnSbReconnect', type: 'button', title: 'Reconnect to SignalBricks')
-                            paragraph '<small>Reconnect makes a sign-in link that works for 10 minutes. Finishing it, or letting it expire, replaces this app\'s access token and registers the new one with SignalBricks. Door codes keep syncing.</small>'
-                        }
+                        href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbReconnectEntryUrl(),
+                            description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
+                                'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
+                        paragraph '<small>The sign-in link works for 10 minutes. Whether you finish it or not, the app then replaces its access token and registers the new one with SignalBricks, so an unused link can\'t be reused. Door codes keep syncing.</small>'
                         input(name: 'btnSbDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                         paragraph '<small>Disconnect tells SignalBricks to delete its copy of the access token, then replaces the token here, so the dispatcher can no longer reach this app.</small>'
                     } else {
@@ -323,10 +320,6 @@ void appButtonHandler(String btnName) {
         case 'btnSbDisconnect':
             sbDisconnect()
             break
-        // A short-lived Reconnect link (#46)
-        case 'btnSbReconnect':
-            sbIssueConnectLink()
-            break
         // Create/refresh access token (this will break the connection until the user reconnects)
         case 'btbAccessToken':
             // Any open Reconnect link carried the old token, so it is dead now
@@ -388,6 +381,14 @@ mappings {
     path('/oauthCallback') {
         action: [
             GET: 'oauthCallback',
+        ]
+    }
+
+    // Reconnect (#46): starts the 10-minute sign-in window, then forwards to SignalBricks.
+    // Never log its params: they carry the access token.
+    path('/reconnect') {
+        action: [
+            GET: 'apiReconnect',
         ]
     }
 
@@ -1259,6 +1260,9 @@ Map apiUnregister() {
         unschedule()
         unsubscribe()
         atomicState.codeRefresh = null
+        // A pending registration retry and an open Reconnect window keep their timers (#46)
+        sbRegisterRetryRearm()
+        sbConnectLinkRearm()
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {
@@ -1994,20 +1998,27 @@ void sbRegister(boolean retry = false) {
 
 // Automatic retries of a registration that failed for a reason that may pass (not verified
 // yet, SignalBricks or Hubitat cloud unavailable, timeout): after about 30 s, 2 min and 5 min,
-// all within the 10 minutes an unverified connection stays valid. Stops on 200, 401 or 409.
+// all within the 10 minutes an unverified connection stays valid. Then (#46), while the
+// credential is held, every 30 minutes for 24 hours after the first failure: a token replaced
+// unattended (an expired Reconnect window) must reach SignalBricks without anyone clicking
+// Done. Stops on 200, 401 or 409.
 List getSbRegisterRetrySeconds() { [30, 120, 300] }
+Integer getSbRegisterSlowRetrySeconds() { 1800 }
+Long getSbRegisterRetryWindowMs() { 24L * 60 * 60 * 1000 }
 
 void sbScheduleRegisterRetry() {
-    int attempt = ((atomicState.sbRegisterRetry?.attempt ?: 0) as int) + 1
-    if (attempt > sbRegisterRetrySeconds.size()) {
-        atomicState.sbRegisterRetry = [attempt: attempt - 1, exhausted: true]
+    Map prev = atomicState.sbRegisterRetry
+    int attempt = ((prev?.attempt ?: 0) as int) + 1
+    long since = prev?.since != null ? (prev.since as long) : now()
+    int delay = attempt <= sbRegisterRetrySeconds.size() ? sbRegisterRetrySeconds[attempt - 1] : sbRegisterSlowRetrySeconds
+    if (attempt > sbRegisterRetrySeconds.size() && now() + delay * 1000L > since + sbRegisterRetryWindowMs) {
+        atomicState.sbRegisterRetry = [attempt: attempt - 1, exhausted: true, since: since]
         unschedule('sbRegisterRetryRun')
         return
     }
-    int delay = sbRegisterRetrySeconds[attempt - 1]
     // Kept in atomicState with its due time, so an app-wide unschedule() (scheduleEvents on
     // every booking sync, Reset State) can put the timer back: see sbRegisterRetryRearm()
-    atomicState.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L]
+    atomicState.sbRegisterRetry = [attempt: attempt, at: now() + delay * 1000L, since: since]
     runIn(delay, 'sbRegisterRetryRun', [overwrite: true])
 }
 
@@ -2024,7 +2035,7 @@ void sbRegisterRetryRun() {
     Map r = atomicState.sbRegisterRetry
     if (!state.sbCredential || !r || r.exhausted || r.inFlight) return
     // In flight until the answer arrives: a sync meanwhile must not re-arm a duplicate
-    atomicState.sbRegisterRetry = [attempt: r.attempt, inFlight: true]
+    atomicState.sbRegisterRetry = [attempt: r.attempt, inFlight: true, since: r.since]
     sbRegister(true)
 }
 
@@ -2042,10 +2053,13 @@ String sbRegisterRetryStatus() {
     Map r = atomicState.sbRegisterRetry
     if (!r) return null
     int total = sbRegisterRetrySeconds.size()
-    if (r.exhausted) return "<b>Registration retries:</b> all ${total} automatic retries failed; click Done to try again"
-    if (r.inFlight) return "<b>Registration retries:</b> retry ${r.attempt} of ${total} in progress"
+    if (r.exhausted) return "<b>Registration retries:</b> automatic retries failed for 24 hours; click Done to try again"
+    boolean slow = (r.attempt as int) > total
+    String n = slow ? "retry ${r.attempt}" : "retry ${r.attempt} of ${total}"
+    String tail = slow ? ' (every 30 minutes for 24 hours)' : ''
+    if (r.inFlight) return "<b>Registration retries:</b> ${n} in progress${tail}"
     String when = new Date(r.at as long).format('HH:mm:ss', location?.timeZone ?: TimeZone.getDefault())
-    return "<b>Registration retries:</b> retry ${r.attempt} of ${total} at ${when} (hub time)"
+    return "<b>Registration retries:</b> ${n} at ${when} (hub time)${tail}"
 }
 
 void sbRegisterCallback(resp, Map data) {
@@ -2142,8 +2156,9 @@ void sbForgetConnection() {
 // --- Reconnect link (#46) ---
 // Hubitat cloud only forwards the OAuth callback when the authorize URL's `state` carries
 // the app's current access token, and while connected that is the token the dispatcher
-// uses to send door codes. So Reconnect is a button: a click opens a link for
-// sbConnectLinkSeconds. The callback (success or failure) replaces the token and registers
+// uses to send door codes. So the app page's Reconnect link opens this app's own /reconnect,
+// which opens a window of sbConnectLinkSeconds and forwards to the sign-in; viewing the page
+// starts nothing. The callback (success or failure) replaces the token and registers
 // the new one; if no callback arrives in time, sbConnectLinkExpire does the same with the
 // credential the app already holds. Either way the token in the link stops working, and
 // nothing else changes: bookings, slot assignments and pending code writes are untouched.
@@ -2157,6 +2172,31 @@ void sbIssueConnectLink() {
     atomicState.sbConnectLink = [issuedAt: at, expiresAt: at + sbConnectLinkSeconds * 1000L]
     runIn(sbConnectLinkSeconds, 'sbConnectLinkExpire', [overwrite: true, data: [issuedAt: at]])
     log.info "${sbAppNameAndVersion}: Reconnect link opened for ${(int) (sbConnectLinkSeconds / 60)} minutes"
+}
+
+// The Reconnect entry point on the app page: this app's own /reconnect through Hubitat cloud.
+// Hubitat's app endpoints need the access token, so this URL carries it, like the authorize
+// URL it forwards to; it is only rendered on the app page (behind the hub's own login), and
+// nothing leaves the hub until it is clicked. Never log it.
+String sbReconnectEntryUrl() {
+    return "${fullApiServerUrl}/reconnect?access_token=${state.accessToken}"
+}
+
+// GET /reconnect: start the window, then forward the browser to SignalBricks with a page that
+// has no script (meta refresh, plus a link). no-referrer: neither URL may be sent onwards.
+// Never log params or the URL.
+Map apiReconnect() {
+    if (!state.sbCredential) {
+        return sbRenderPage(false, 'Not connected', 'This app is not connected to SignalBricks.',
+            'Close this window and use <b>Connect to SignalBricks</b> in the app.')
+    }
+    sbIssueConnectLink()
+    String url = bookingsEsc(sbConnectUrl())
+    String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${url}"><title>${bookingsEsc(sbAppName)}: Reconnect</title>
+<style>body{margin:0;padding:24px;font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}</style></head>
+<body><p>Opening SignalBricks&hellip;</p><p><a href="${url}" rel="noreferrer">Continue to SignalBricks</a></p></body></html>"""
+    return render(contentType: 'text/html', data: html, status: 200)
 }
 
 // The open link's expiry as hub time (HH:mm:ss), or null when no link is open. A link
@@ -2208,11 +2248,6 @@ Integer sbHttpStatus(Exception e) {
 // inline CSS only. detailHtml and nextHtml must be escaped by the caller.
 Map sbRenderPage(boolean ok, String headline, String detailHtml, String nextHtml) {
     String title = bookingsEsc(sbAppName + ': ' + headline)
-    String back = sbAppPageUrl()
-    String backHtml = back
-        ? """<a class="btn" href="${bookingsEsc(back)}">Back to the app</a>
-<p class="hint">The link works on the hub's local network. Elsewhere, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${bookingsEsc(sbAppName)}</b> on the hub.</p>"""
-        : """<p class="hint">To get back to the app, go back to the hub window you connected from, or open <b>Apps</b> &rarr; <b>${bookingsEsc(sbAppName)}</b> on the hub.</p>"""
     String html = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark"><meta name="referrer" content="no-referrer"><title>${title}</title>
 <style>
@@ -2226,7 +2261,7 @@ h1{display:flex;align-items:center;gap:12px;margin:0 0 12px;font-size:22px;line-
 .mark{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;color:var(--on-mark);font-size:18px;font-weight:700}
 .ok .mark{background:var(--ok)}.err .mark{background:var(--err)}
 p{margin:0 0 12px}
-.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;color:var(--link);font-weight:600;text-decoration:none}
+.btn{display:inline-block;margin-top:8px;padding:10px 16px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--link);font:inherit;font-weight:600;cursor:pointer}
 .btn:hover,.btn:focus{text-decoration:underline}
 .hint{margin:16px 0 0;color:var(--muted);font-size:14px}
 </style></head>
@@ -2235,17 +2270,8 @@ p{margin:0 0 12px}
 <h1><span class="mark" aria-hidden="true">${ok ? '&#10003;' : '!'}</span>${bookingsEsc(headline)}</h1>
 <p>${detailHtml}</p>
 <p>${nextHtml}</p>
-${backHtml}
+<button type="button" class="btn" onclick="window.close()">Close this window</button>
+<p class="hint">If this window doesn't close, close it yourself and return to the app; it's still open in your other tab. Reopen or refresh it to see the new status.</p>
 </main></body></html>"""
     return render(contentType: 'text/html', data: html, status: 200)
-}
-
-// The app's page on the hub, by local IP; null when it can't be built
-String sbAppPageUrl() {
-    try {
-        String ip = location?.hub?.localIP?.toString()
-        String id = app?.id?.toString()
-        if (ip ==~ /\d{1,3}(\.\d{1,3}){3}/ && id ==~ /\d+/) return "http://${ip}/installedapp/configure/${id}"
-    } catch (Exception ignored) { }
-    return null
 }
