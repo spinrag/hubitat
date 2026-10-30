@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.6' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.7' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -350,10 +350,10 @@ void appButtonHandler(String btnName) {
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
             sbConnectLinkRearm()
-            sbScheduleAppInfo()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
+            sbScheduleAppInfo()
             break
         // Send a test webhook
         case 'btnTest':
@@ -509,10 +509,11 @@ void updated() {
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
 
-    // Announce the saved settings (#692); SyncState re-arms the daily announcement
-    sbAnnounceAppInfo()
-
     SyncState()
+
+    // Announce the saved settings (#692), after the booking schedules are set up;
+    // SyncState re-armed the daily announcement
+    sbAnnounceAppInfo()
 }
 
 // Setup event subscriptions, and any scheduled tasks
@@ -565,8 +566,6 @@ void scheduleEvents(Map bookings) {
     // ...and a pending SignalBricks registration retry (#34), and an open Reconnect link's expiry (#46)
     sbRegisterRetryRearm()
     sbConnectLinkRearm()
-    // ...and the daily app info announcement (#692)
-    sbScheduleAppInfo()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -605,6 +604,9 @@ void scheduleEvents(Map bookings) {
             }
         }
     }
+
+    // ...and the daily app info announcement (#692), last: it never holds up the bookings
+    sbScheduleAppInfo()
 }
 
 // --- App info announcement (signalbricks/platform#692) ---
@@ -638,9 +640,14 @@ Map sbAppInfo() {
     return info
 }
 
+// Never throws: a failed announcement must not stop booking scheduling or a save
 void sbAnnounceAppInfo() {
-    sendLocationEvent(name: sbAppInfoEvent, value: JsonOutput.toJson(sbAppInfo()), isStateChange: true)
-    state.appInfoVersion = sbAppVersion
+    try {
+        sendLocationEvent(name: sbAppInfoEvent, value: JsonOutput.toJson(sbAppInfo()), isStateChange: true)
+        state.appInfoVersion = sbAppVersion
+    } catch (Exception e) {
+        log.warn "${sbAppNameAndVersion}: app info announcement failed (${e.class.simpleName})"
+    }
 }
 
 // Daily job
@@ -652,12 +659,17 @@ void sbAppInfoDaily() {
 // 04:00-23:59 hub time (clear of the 01:00-03:59 door code refresh). Called after
 // every app-wide unschedule(). After an update through HPM (no Done) the first
 // call also announces the new version right away.
+// Never throws, like sbAnnounceAppInfo.
 void sbScheduleAppInfo() {
-    if (state.appInfoSecond == null) {
-        state.appInfoSecond = 4 * 3600 + (int) (Math.random() * 20 * 3600)
+    try {
+        if (state.appInfoSecond == null) {
+            state.appInfoSecond = 4 * 3600 + (int) (Math.random() * 20 * 3600)
+        }
+        int t = state.appInfoSecond as int
+        schedule("${t % 60} ${(t.intdiv(60)) % 60} ${t.intdiv(3600)} * * ?".toString(), 'sbAppInfoDaily')
+    } catch (Exception e) {
+        log.warn "${sbAppNameAndVersion}: scheduling the app info announcement failed (${e.class.simpleName})"
     }
-    int t = state.appInfoSecond as int
-    schedule("${t % 60} ${(t.intdiv(60)) % 60} ${t.intdiv(3600)} * * ?".toString(), 'sbAppInfoDaily')
     if (state.appInfoVersion != sbAppVersion) sbAnnounceAppInfo()
 }
 

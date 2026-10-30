@@ -112,7 +112,7 @@ app.settings = [locks: ['1', '2', '3'] as String[]]
 Date now = new Date()
 Map bookings = ['88': [id: '88', guest: 'Ann', code: '24681357', lockId: ['1'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.6', app.sbAppVersion == '1.4.6')
+check('version is 1.4.7', app.sbAppVersion == '1.4.7')
 
 // Saving the app code runs the main page with no state and no settings
 def savedState = app.state, savedAtomic = app.atomicState, savedSettings = app.settings

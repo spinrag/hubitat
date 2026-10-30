@@ -57,13 +57,23 @@ abstract class HubitatStub extends Script {
         def data = opts?.data == null ? null : new JsonSlurper().parseText(JsonOutput.toJson(opts.data))
         scheduled << [secs: secs, handler: handler, data: data]
     }
-    void runOnce(Date d, String handler, Map opts = [:]) { scheduled << [at: d, handler: handler] }
-    void schedule(String cron, String handler) { scheduled.removeAll { it.handler == handler }; scheduled << [cron: cron, handler: handler] }
+    // runOnce jobs also go to onces: a later runIn(overwrite) of the same handler hides them in scheduled
+    List onces = []
+    void runOnce(Date d, String handler, Map opts = [:]) { scheduled << [at: d, handler: handler]; onces << [at: d, handler: handler] }
+    Boolean throwOnAppInfoSchedule = false
+    void schedule(String cron, String handler) {
+        if (throwOnAppInfoSchedule && handler == 'sbAppInfoDaily') throw new IllegalStateException('schedule failed 73915246')
+        scheduled.removeAll { it.handler == handler }; scheduled << [cron: cron, handler: handler]
+    }
     void unschedule() { scheduled.clear() }
     void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) { subscriptions << args.toList() }
     void unsubscribe() { subscriptions.clear() }
-    void sendLocationEvent(Map m) { locationEvents << m }
+    Boolean throwOnLocationEvent = false
+    void sendLocationEvent(Map m) {
+        if (throwOnLocationEvent) throw new IllegalStateException('event failed 73915246')
+        locationEvents << m
+    }
     void httpPostJson(Map p, Closure c) { network << p }
     void httpPost(Map p, Closure c) { network << p }
     void asynchttpPost(String cb, Map p, Map d = null) { network << p }
@@ -118,7 +128,7 @@ app.settings = [locks: ['57'] as String[]]
 Date now = new Date(app.clock)
 Map bookings = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.6', app.sbAppVersion == '1.4.6')
+check('version is 1.4.7', app.sbAppVersion == '1.4.7')
 
 // --- Install ---
 app.installed()
@@ -127,7 +137,7 @@ Map ev = app.locationEvents[0]
 check('install: event name signalbricksAppInfo, isStateChange true', ev.name == 'signalbricksAppInfo' && ev.isStateChange == true && ev.value instanceof String)
 Map info = lastInfo()
 check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'])
-check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.6')
+check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.7')
 check('payload: minCodePosition a number, prefix the setting', info.minCodePosition == 50 && info.minCodePosition instanceof Integer && info.codeNamePrefix == 'GT:')
 check('payload: no manageDoorCodes (OwnerRez fork only)', !info.containsKey('manageDoorCodes'))
 check('payload: under 255 characters', ev.value.length() < 255)
@@ -157,7 +167,7 @@ app.atomicState.bookings = bookings
 app.state.accessToken = 'tok-fake-access-0001'
 app.locationEvents.clear()
 app.updated()
-check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.6')
+check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.7')
 check('Done: daily job kept, same time', jobs().size() == 1 && job().cron == cron)
 app.minCodePosition = 60
 app.locationEvents.clear()
@@ -211,7 +221,7 @@ check('random time: still a single job', jobs().size() == 1)
 app.state.appInfoVersion = '1.4.5'
 app.locationEvents.clear()
 app.scheduleEvents([:])
-check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.6')
+check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.7')
 app.scheduleEvents([:])
 check('HPM update: not again on the next re-arm', app.locationEvents.size() == 1)
 
@@ -238,6 +248,28 @@ check('no code name in any announcement', !all.contains('ORB'))
 check('only signalbricksAppInfo location events', app.locationEvents.every { it.name == 'signalbricksAppInfo' })
 check('announce logs nothing with a code or token', !app.logged.any { it.contains(CODE) || it.contains('tok-fake') || it.contains(CREDENTIAL) })
 check('every announcement has exactly the contract keys', app.locationEvents.every { new JsonSlurper().parseText(it.value).keySet() == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'] as Set })
+
+// --- A failed announcement never stops booking scheduling or a save (review F1) ---
+def reconciles = { app.onces.findAll { it.handler == 'reconcileDoorCodes' } }
+Map syncBody = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'], checkIn: now.time + 86400_000, checkOut: now.time + 2 * 86400_000]]
+[['sendLocationEvent throws', { app.throwOnLocationEvent = true }], ['schedule() of the daily job throws', { app.throwOnAppInfoSchedule = true }]].each { label, Closure breakIt ->
+    app.throwOnLocationEvent = false; app.throwOnAppInfoSchedule = false
+    app.scheduled.clear(); app.onces.clear(); app.logged.clear()
+    app.state.appInfoVersion = '1.4.5' // an HPM update: the re-arm also announces
+    breakIt()
+    String err = null
+    try { app.request = [JSON: syncBody]; app.apiSync() } catch (e) { err = e.class.simpleName }
+    check("${label}: PUT /sync still schedules the check-in reconcile", err == null && reconciles().size() == 1 && reconciles()[0].at == new Date(now.time + 86400_000))
+    app.scheduled.clear(); app.onces.clear(); app.subscriptions.clear()
+    err = null
+    try { app.updated() } catch (e) { err = e.class.simpleName }
+    check("${label}: Done still runs SyncState (subscriptions and reconcile)", err == null && reconciles().size() == 1 && app.subscriptions.any { it[1] == 'codeChanged' })
+    err = null
+    try { app.installed(); app.appButtonHandler('btnReset'); app.apiUnregister(); app.sbAppInfoDaily() } catch (e) { err = e.class.simpleName }
+    check("${label}: install, Reset State, DELETE /register and the daily job don't throw", err == null)
+    check("${label}: logged by class name only", app.logged.any { it.contains('(IllegalStateException)') } && !app.logged.any { it.contains(CODE) })
+}
+app.throwOnLocationEvent = false; app.throwOnAppInfoSchedule = false
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

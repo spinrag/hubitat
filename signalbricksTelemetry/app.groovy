@@ -95,7 +95,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.0'
+@Field static final String APP_VERSION = '1.6.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -805,7 +805,8 @@ Map handleOauthCallback() {
         subscribeToEvents()
         subscribeToAppInfo()
         scheduleDailyCheckIn()
-        sendHubReport('updated')
+        // The first report after the first Connect counts as the install
+        sendHubReport(state.lastReportAt ? 'updated' : 'installed')
         return renderPage(true, 'Connected', 'This hub is now connected to SignalBricks and sends its telemetry there.',
             'Reopen the app: it shows <b>Status: Connected</b>. You can close this window.')
     }
@@ -1017,8 +1018,8 @@ String checkInTime() {
 // daily hub report (#692) whether or not anything changed.
 void dailyCheckIn() {
     logDebug 'daily check-in'
-    ensureAppInfoSubscription()
     reregisterIfVersionChanged()
+    ensureAppInfoSubscription()
     sendHubReport('daily')
 }
 
@@ -1028,33 +1029,47 @@ void dailyCheckIn() {
 // code, code name, PIN, token or guest name.
 
 // Booking apps announce themselves with a hub-local location event.
+// Like everything for the hub report, it never throws: telemetry, registration
+// and lock code management don't depend on it.
 void subscribeToAppInfo() {
-    subscribe(location, APP_INFO_EVENT, 'appInfoHandler')
-    state.appInfoSubscribed = APP_VERSION
+    try {
+        subscribe(location, APP_INFO_EVENT, 'appInfoHandler')
+        state.appInfoSubscribed = APP_VERSION
+    } catch (Exception e) {
+        log.warn "SignalBricks Telemetry: subscribing to app announcements failed (${e.class.simpleName})"
+    }
 }
 
 // An HPM update runs no initialize(), so the first daily check-in or event
 // with a new version subscribes (once; initialize() unsubscribes everything first).
 void ensureAppInfoSubscription() {
     if (state.appInfoSubscribed == APP_VERSION) return
-    unsubscribe()
-    subscribeToEvents()
+    try {
+        unsubscribe()
+        subscribeToEvents()
+    } catch (Exception e) {
+        log.warn "SignalBricks Telemetry: re-subscribing failed (${e.class.simpleName})"
+    }
     subscribeToAppInfo()
 }
 
 void appInfoHandler(evt) {
-    Map info = parseAppInfo(evt?.value)
-    if (!info) return
-    Map apps = atomicState.appInfos ?: [:]
-    Map prev = apps[info.appId]
-    Map seen = info + [lastSeenAt: now()]
-    apps[info.appId] = seen
-    atomicState.appInfos = pruneAppInfos(apps)
-    logDebug "app info from ${info.name ?: 'an app'} ${info.version ?: ''} (app ${info.appId})"
-    // A new or changed app goes out shortly, not only with the next daily report
-    Map prevInfo = prev ? prev.findAll { k, v -> k != 'lastSeenAt' } : null
-    if (prevInfo != info && state.sbToken && isHttps(state.ingestUrl)) {
-        runIn(APP_INFO_REPORT_DELAY_SECONDS, 'sendAppInfoReport', [overwrite: true])
+    try {
+        Map info = parseAppInfo(evt?.value)
+        if (!info) return
+        Map apps = atomicState.appInfos ?: [:]
+        Map prev = apps[info.appId]
+        Map seen = info + [lastSeenAt: now()]
+        apps[info.appId] = seen
+        atomicState.appInfos = pruneAppInfos(apps)
+        logDebug "app info from ${info.name ?: 'an app'} ${info.version ?: ''} (app ${info.appId})"
+        // A new or changed app goes out shortly, not only with the next daily report
+        Map prevInfo = prev ? prev.findAll { k, v -> k != 'lastSeenAt' } : null
+        if (prevInfo != info && state.sbToken && isHttps(state.ingestUrl)) {
+            runIn(APP_INFO_REPORT_DELAY_SECONDS, 'sendAppInfoReport', [overwrite: true])
+        }
+    } catch (Exception e) {
+        log.warn "SignalBricks Telemetry: app announcement not recorded (${e.class.simpleName})"
     }
 }
 
@@ -1133,13 +1148,10 @@ Integer occupiedSlotCount(lock) {
     try {
         String raw = lock.currentValue('lockCodes')?.toString()
         if (!raw) return null
-        String json = null
-        try {
-            json = decrypt(raw)
-        } catch (Exception e) {
-            // Not encrypted, or decrypt() not available: use the raw value
-        }
-        def parsed = parseJson(json ?: raw)
+        raw = raw.trim()
+        // Plain JSON is never passed to decrypt(); anything else must decrypt
+        String json = raw.startsWith('{') ? raw : decrypt(raw)
+        def parsed = parseJson(json)
         return parsed instanceof Map ? parsed.size() : null
     } catch (Exception e) {
         return null
@@ -1152,16 +1164,16 @@ Map reportLock(lock) {
     if (name) l.name = name.take(REPORT_NAME_MAX)
     BigDecimal battery = reportNumber(lock.currentValue('battery'))
     if (battery != null) l.battery = battery
-    String lockState = lock.currentValue('lock')?.toString()?.toLowerCase()
+    String lockState = lock.currentValue('lock')?.toString()?.trim()?.toLowerCase()
     if (lockState != null) {
         if (REPORT_LOCK_STATES.contains(lockState)) l.lock = lockState
         // Exactly the lock attribute; nothing else is inferred
         l.jammed = lockState == 'jammed'
     }
-    BigDecimal maxCodes = reportNumber(lock.currentValue('maxCodes'))
-    if (maxCodes != null) l.maxCodes = maxCodes.intValue()
-    BigDecimal codeLength = reportNumber(lock.currentValue('codeLength'))
-    if (codeLength != null) l.codeLength = codeLength.intValue()
+    Integer maxCodes = parseIntLoose(lock.currentValue('maxCodes'))
+    if (maxCodes != null) l.maxCodes = maxCodes
+    Integer codeLength = parseIntLoose(lock.currentValue('codeLength'))
+    if (codeLength != null) l.codeLength = codeLength
     try {
         String driver = lock.typeName?.toString()?.trim()
         if (driver) l.driver = driver.take(REPORT_NAME_MAX)
@@ -1210,7 +1222,8 @@ Map buildHubReport(String reason) {
         schemaVersion: REPORT_SCHEMA_VERSION,
         sentAt: now(),
         reason: reason,
-        telemetry: [version: APP_VERSION, maxManagedSlot: managedCeiling()],
+        // The ceiling only applies while lock code management is on
+        telemetry: lockManagementEnabled == true ? [version: APP_VERSION, maxManagedSlot: managedCeiling()] : [version: APP_VERSION],
         apps: apps.values().collect { it },
         hub: reportHub(),
         locks: reportLocks(),
@@ -1285,8 +1298,13 @@ void reportCallback(resp, Map data) {
         // The status only: never the request, which carries the ingestion token
         log.warn "SignalBricks Telemetry: hub report not accepted (HTTP ${status})"
         state.lastReportError = "${new Date().format('yyyy-MM-dd HH:mm')} HTTP ${status}"
-        if (state.sbToken && registerRetryable(status)) scheduleReportRetry(data?.reason?.toString())
-        else clearReportRetry()
+        if (state.sbToken && registerRetryable(status)) {
+            scheduleReportRetry(data?.reason?.toString())
+        } else {
+            clearReportRetry()
+            // A 4xx won't pass by resending: the HPM-update path stops until the next version
+            if (status >= 400 && status < 500) state.reportedVersion = APP_VERSION
+        }
         return
     }
     clearReportRetry()

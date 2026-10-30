@@ -56,7 +56,11 @@ abstract class HubitatStub extends Script {
         scheduled << [cron: cron, handler: handler]
     }
     void unschedule(String handler = null) { if (handler) scheduled.removeAll { it.handler == handler } else scheduled.clear() }
-    void subscribe(Object... args) { subscriptions << [target: args[0], attribute: args[1], handler: args[2]] }
+    Boolean throwOnLocationSubscribe = false
+    void subscribe(Object... args) {
+        if (throwOnLocationSubscribe && args[0].is(location)) throw new IllegalStateException('subscribe failed 24681357')
+        subscriptions << [target: args[0], attribute: args[1], handler: args[2]]
+    }
     void unsubscribe() { subscriptions.clear() }
     String getHubUID() { '00000000-0000-4000-8000-00000000abcd' }
     String getFullApiServerUrl() { "https://cloud.hubitat.com/api/${getHubUID()}/apps/42" }
@@ -68,7 +72,10 @@ abstract class HubitatStub extends Script {
         posts << [cb: cb, params: p, data: d]
     }
     // Like the hub: decrypts what it encrypted (here "ENC:" + base64), null for anything else
-    String decrypt(String s) { s?.startsWith('ENC:') ? new String(s.substring(4).decodeBase64(), 'UTF-8') : null }
+    List decrypted = []
+    String decrypt(String s) { decrypted << s; s?.startsWith('ENC:') ? new String(s.substring(4).decodeBase64(), 'UTF-8') : null }
+    def tokenReply = null
+    void httpPost(Map p, Closure c) { c([status: 200, data: tokenReply]) }
 }
 
 class FakeResp {
@@ -164,7 +171,7 @@ check('doc example app info validates', appInfoErrors.isEmpty())
 List bad = validateReport(docReport + [extra: 1, locks: [[deviceId: '1', battery: '85', lockCodes: '{}']]])
 check('validator rejects extra keys and string numbers', bad.size() == 3)
 
-check('version is 1.6.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.0')
+check('version is 1.6.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.1')
 
 // --- Fake hub: connected, two booking apps, locks with codes ---
 String INGEST = 'sbit_fakeingesttokenfakeingesttoken00'
@@ -235,10 +242,14 @@ announce([schemaVersion: 1, appId: '388', name: 'SignalBricks Integration', vers
 app.clock = 1_793_318_400_000L
 app.state.appInfos['388'].lastSeenAt = 1_793_311_200_000L
 
-// --- The daily report ---
+// --- The daily report (lock code management on, so the ceiling is sent) ---
 app.posts.clear()
+app.lockManagementEnabled = true
+app.decrypted.clear()
 app.dailyCheckIn()
+app.lockManagementEnabled = false
 check('daily: one report posted', reports().size() == 1)
+check('lockCodes: plain JSON never passed to decrypt()', app.decrypted && !app.decrypted.any { it.trim().startsWith('{') } && app.decrypted.every { it.startsWith('ENC:') || it == 'not json' })
 def post = reports()[0]
 check('daily: POST <ingest>/report', post.params.uri == 'https://ingest.example.invalid/v1/webhooks/hubitat/report')
 check('daily: Bearer ingestion token, JSON', post.params.headers == [Authorization: "Bearer ${INGEST}".toString()] && post.params.requestContentType == 'application/json')
@@ -251,7 +262,7 @@ check('daily: fork app field names match the doc', r.apps.find { it.appId == '41
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
-check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.6.0', maxManagedSlot: 25])
+check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.6.1', maxManagedSlot: 25])
 check('daily: hub firmware, uptime, time zone', r.hub == [firmwareVersion: '2.4.3.152', uptimeSec: 864000, timeZone: 'America/New_York'])
 check('daily: apps as collected, with lastSeenAt', r.apps.find { it.appId == '412' } == docReport.apps[0] && r.apps.find { it.appId == '388' } == docReport.apps[1].findAll { k, v -> k != 'version' } + [version: '1.4.6'])
 // The doc's example rebuilt from this fake hub: same apps, the same front door
@@ -282,8 +293,44 @@ app.posts.clear()
 3.times { app.clock += 24L * 3600 * 1000; app.dailyCheckIn() }
 check('daily: a report every day, version unchanged', reports().size() == 3 && reports().every { bodyOf(it).reason == 'daily' })
 check('daily: no registration on a telemetry-only hub', !app.posts.any { it.cb == 'registerCallback' })
+check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.6.1'] })
+app.maxManagedSlot = '40'
+app.posts.clear(); app.dailyCheckIn()
+check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.6.1'] && validateReport(lastReport()).isEmpty())
+app.maxManagedSlot = '25'
 
-// --- Install, Done, Connect ---
+// lockCodes that parse to something other than an object: no count
+def arr = new FakeLock(id: '61', displayName: 'Array', typeName: 'Z', attrs: [lock: ' Locked ', maxCodes: '30.5', codeLength: '4.0', lockCodes: '[1,2]'])
+def strL = new FakeLock(id: '62', displayName: 'String', typeName: 'Z', attrs: [lockCodes: '"x"'])
+// The same shapes encrypted: they decrypt fine but still aren't a slot map
+def encArr = new FakeLock(id: '63', displayName: 'Enc array', typeName: 'Z', attrs: [lockCodes: 'ENC:' + '[1,2]'.bytes.encodeBase64().toString()])
+def encStr = new FakeLock(id: '64', displayName: 'Enc string', typeName: 'Z', attrs: [lockCodes: 'ENC:' + '"x"'.bytes.encodeBase64().toString()])
+def savedLocks = app.locks
+app.locks = [arr, strL, encArr, encStr]
+app.posts.clear(); app.dailyCheckIn()
+Map arrL = lastReport().locks.find { it.deviceId == '61' }
+Map strLL = lastReport().locks.find { it.deviceId == '62' }
+check("lockCodes '[1,2]' and '\"x\"': no occupiedSlots", !arrL.containsKey('occupiedSlots') && !strLL.containsKey('occupiedSlots'))
+check("encrypted lockCodes decrypting to '[1,2]' or '\"x\"': no occupiedSlots", lastReport().locks.findAll { it.deviceId in ['63', '64'] }.every { !it.containsKey('occupiedSlots') } && lastReport().locks.count { it.deviceId in ['61', '62', '63', '64'] } == 4)
+check('lock state trimmed; fractional maxCodes left out, 4.0 is 4', arrL.lock == 'locked' && arrL.jammed == false && !arrL.containsKey('maxCodes') && arrL.codeLength == 4)
+app.locks = savedLocks
+
+// --- Connect: the first report counts as the install, later ones as updates ---
+def connect = {
+    app.state.pkceVerifier = 'fake-verifier'
+    app.params = [code: 'fake-auth-code']
+    app.tokenReply = [access_token: INGEST, ingest_url: 'https://ingest.example.invalid/v1/webhooks/hubitat']
+    app.handleOauthCallback()
+}
+app.state.remove('lastReportAt')
+app.posts.clear()
+connect()
+check('first Connect: report reason installed', reports().size() == 1 && lastReport().reason == 'installed')
+app.reportCallback(new FakeResp(status: 202, body: ''), [reason: 'installed'])
+connect()
+check('Reconnect: report reason updated', reports().size() == 2 && lastReport().reason == 'updated')
+
+// --- Install, Done ---
 app.posts.clear()
 app.installed()
 check('install: report with reason installed', reports().size() == 1 && lastReport().reason == 'installed')
@@ -325,8 +372,14 @@ check('after 3 retries: no more, until the next daily report', retryJob() == nul
 check('page: last error shown', app.reportStatus()?.contains('HTTP 502'))
 app.posts.clear()
 app.dailyCheckIn()
+app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 400, body: ''), [reason: 'daily'])
 check('400: not retried', retryJob() == null)
+check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.6.1')
+app.state.reportedVersion = '1.5.3'
+app.reportCallback(new FakeResp(status: 503, body: ''), [reason: 'daily'])
+check('503: version not recorded (retried instead)', app.state.reportedVersion == '1.5.3')
+app.clearReportRetry()
 app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 401, body: ''), [reason: 'daily'])
 check('401: not retried', retryJob() == null)
@@ -334,7 +387,7 @@ app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 408, body: ''), [reason: 'daily'])
 check('408 (timeout): retried', retryJob()?.secs == 30)
 app.reportCallback(new FakeResp(status: 202, body: '{"received":true}'), [reason: 'daily'])
-check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.6.0' && app.state.lastReportError == null)
+check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.6.1' && app.state.lastReportError == null)
 check('page: last sent shown', app.reportStatus()?.contains('last sent'))
 app.throwOnPost = true
 app.sendHubReport('daily')
@@ -375,7 +428,10 @@ app.posts.clear()
 app.dailyCheckIn()
 check('apps: not seen for 7 days dropped', lastReport().apps*.appId == ['388'])
 
-// --- 64 KB: 200 locks with long non-ASCII names stay under the limit ---
+// --- 64 KB: 200 locks with long non-ASCII names stay under the limit. JsonOutput
+// writes non-ASCII as \\uXXXX escapes (6 bytes a character), so the body is ASCII;
+// the guard counts UTF-8 bytes either way ---
+check('size: utf8Length counts bytes, not characters', app.utf8Length('\u00e9\u4e2d') == 5)
 List many = (1..230).collect { i -> new FakeLock(id: "${100000 + i}".toString(), displayName: ('é中' * 40), typeName: ('ü' * 70),
     attrs: [battery: '100', lock: 'unlocked with timeout', maxCodes: '1000', codeLength: '32', lockCodes: plain12]) }
 app.locks = many
@@ -385,6 +441,7 @@ app.dailyCheckIn()
 String bigBody = reports()[-1].params.body
 Map big = new JsonSlurper().parseText(bigBody)
 check("size: body under 64 KB (${bigBody.getBytes('UTF-8').length} bytes)", bigBody.getBytes('UTF-8').length <= 60000)
+check('size: non-ASCII names escaped, so the body is ASCII', bigBody.getBytes('UTF-8').length == bigBody.length() && bigBody.contains('\\u00e9'))
 check("size: locks left out from the end (${big.locks.size()} of 200)", big.locks.size() > 50 && big.locks.size() < 200 && big.locks[0].deviceId == '100001')
 check('size: still valid, and the trimming is logged', validateReport(big).isEmpty() && app.logged.any { it.contains('hub report too large') })
 // Small locks: the size limit isn't reached, the 200-lock cap is
@@ -392,6 +449,29 @@ app.locks = (1..230).collect { i -> new FakeLock(id: "${i}".toString(), displayN
 app.posts.clear()
 app.dailyCheckIn()
 check('locks: at most 200, the first selected', { Map b = new JsonSlurper().parseText(reports()[-1].params.body); b.locks.size() == 200 && b.locks[-1].deviceId == '200' }())
+
+// --- The announcement handling never breaks anything else ---
+app.locks = [front]
+app.throwOnLocationSubscribe = true
+app.logged.clear()
+app.initialize()
+check('subscribe failure: initialize still subscribes devices and schedules the check-in', app.subscriptions.any { it.attribute == 'lock' } && app.scheduled.any { it.handler == 'dailyCheckIn' })
+app.state.appInfoSubscribed = '1.5.3'
+app.state.registeredVersion = '1.5.3'
+app.state.remove('reregisterAttemptAt')
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.posts.clear()
+app.dailyCheckIn()
+check('subscribe failure: the daily check-in still re-registers and reports', app.posts.any { it.cb == 'registerCallback' } && reports().size() == 1)
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.throwOnLocationSubscribe = false
+app.state.appInfos = 'not a map'
+app.appInfoHandler([name: 'signalbricksAppInfo', value: JsonOutput.toJson([schemaVersion: 1, appId: '388', name: 'SignalBricks Integration'])])
+check('a broken store: the announcement handler logs and returns', app.logged.any { it.startsWith('SignalBricks Telemetry: app announcement not recorded (') })
+check('guard logs: class names only', !app.logged.any { it.contains('24681357') })
+app.state.appInfos = [:]
 
 // --- Disconnect ---
 app.appButtonHandler('btnDisconnect')
