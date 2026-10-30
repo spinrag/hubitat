@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "sentAt": 1793318400000,
+  "reason": "daily",
+  "telemetry": { "version": "1.6.0", "maxManagedSlot": 25 },
+  "apps": [
+    {
+      "schemaVersion": 1,
+      "appId": "412",
+      "name": "OwnerRez Integration",
+      "version": "1.1.4-cto-sb7",
+      "minCodePosition": 30,
+      "codeNamePrefix": "G: ",
+      "manageDoorCodes": true,
+      "lastSeenAt": 1793314800000
+    },
+    {
+      "schemaVersion": 1,
+      "appId": "388",
+      "name": "SignalBricks Integration",
+      "version": "1.5.0",
+      "minCodePosition": 50,
+      "codeNamePrefix": "GT: ",
+      "lastSeenAt": 1793311200000
+    }
+  ],
+  "hub": { "firmwareVersion": "2.4.3.152", "uptimeSec": 864000, "timeZone": "America/New_York" },
+  "locks": [
+    {
+      "deviceId": "57",
+      "name": "Front door",
+      "battery": 85,
+      "lock": "locked",
+      "jammed": false,
+      "maxCodes": 250,
+      "codeLength": 4,
+      "driver": "Generic Z-Wave Plus Lock",
+      "occupiedSlots": 12
+    }
+  ]
+}

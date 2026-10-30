@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that syncs **OwnerRez booking door codes** to your locks. The SignalBricks dispatcher pushes each booking (guest, code, check-in and checkout, and which locks) to the app, and the app adds the code to those locks before check-in and removes it after checkout.
 
-It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.4.5*.
+It runs **alongside the OwnerRez app** on the same hub and locks, and alongside [SignalBricks Telemetry](../signalbricksTelemetry/README.md). The apps are independent and versioned separately; the app page shows the name with the version, e.g. *SignalBricks Integration 1.4.6*.
 
 Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
@@ -15,6 +15,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 - **Door code refresh.** Off by default. Reads the codes back from the locks one lock at a time, on a schedule you choose or from the app page (see [Door code refresh](#door-code-refresh)).
 - **Bookings page.** Shows the bookings the app knows against its codes on the locks, with codes masked (see [Bookings page](#bookings-page)).
 - **Connect to SignalBricks.** Since 1.4.0 the app connects itself to SignalBricks with OAuth, so the dispatcher gets the hub's addresses and access token from SignalBricks (see [Connect to SignalBricks](#connect-to-signalbricks)).
+- **App info for SignalBricks.** Since 1.4.6 the app tells SignalBricks Telemetry on the same hub its version and slot settings, for the SignalBricks hub page (see [App info for SignalBricks](#app-info-for-signalbricks)).
 - **API.** A small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher. The dispatcher is not part of this repository.
 
 ## Running alongside the OwnerRez app
@@ -28,7 +29,7 @@ Known-good setup:
 
 | App | Code name prefix | Minimum Code Position |
 | --- | --- | --- |
-| OwnerRez (fork 1.1.4-cto-sb2) | `G:` | 30 |
+| OwnerRez (fork 1.1.4-cto-sb7) | `G:` | 30 |
 | SignalBricks Integration | `GT:` | 50 |
 | SignalBricks Telemetry | `SBA:` / `SBM:` | admin and managed slots 1–25 |
 
@@ -69,6 +70,19 @@ The **Door code refresh** section of the app page has:
 Locks are always read one at a time. The next lock starts when the current one has reported its codes (counted only after 2.6 seconds per slot, at least 60 seconds, because large locks report codes while still reading; then 30 seconds to settle), or when its time budget runs out (3 seconds per slot, at least 2 and at most 20 minutes), whichever comes first. A refresh of 13 large locks can take a few hours. Starting a refresh while one is running does nothing. Booking syncs and reconciles carry on during a refresh.
 
 Clicking **Done** never starts a refresh. Up to 1.3.4 the app refreshed every lock at midnight each night, starting a new lock every 90 seconds; on hubs with large locks the reads overlapped and Z-Wave timed out for hours. After updating to 1.3.5 that midnight schedule is removed when you open the app and click **Done**, or else the next time it fires (it then reads no lock).
+
+## App info for SignalBricks
+
+Since 1.4.6 (signalbricks/platform#692) the app announces itself on the hub so SignalBricks can show, on the hub's page, which version runs and whether its **Minimum Code Position** overlaps the slots SignalBricks Telemetry manages (the ceiling set in Telemetry). It sends a hub-local location event, `signalbricksAppInfo`, whose value is:
+
+```json
+{"schemaVersion": 1, "appId": "<this app's id>", "name": "SignalBricks Integration", "version": "1.4.6", "minCodePosition": 50, "codeNamePrefix": "GT: "}
+```
+
+- `minCodePosition` is the **Minimum Code Position** setting as a number; unset is `0` (the app may then use any slot from slot 1 up, which overlaps any ceiling). `codeNamePrefix` is the **Prefix for code name** setting, at most 16 characters.
+- Sent on install, when you click **Done**, and once a day at a time picked at random for each hub between 04:00 and 23:59 hub time (clear of the door code refresh). The daily time survives booking syncs, reconciles, **Reset State** and the legacy `DELETE /register`. After an update through HPM the app announces the new version with the next booking sync; click **Done** to announce it right away.
+- The event stays on the hub. Only [SignalBricks Telemetry](../signalbricksTelemetry/README.md#daily-hub-report) 1.6.0 or later picks it up and includes it in its daily report to SignalBricks. This app makes no network call for it.
+- It carries settings only: no codes, code names, tokens, booking ids or guest names.
 
 ## Bookings page
 
@@ -132,7 +146,7 @@ Use Hubitat Package Manager (HPM). Set this up once on each hub:
 4. If **Hub Login Security** is on, enter the hub's username and password under **Hub Security** in HPM settings. If the hub has HTTPS turned on, also turn on **SSL (HTTPS) Enabled**.
 5. Set the update check time outside 2–4am, when the hub runs nightly maintenance and backups.
 
-You don't need to open the app and click **Done** after an update; the existing schedules and subscriptions keep running with the new code. (After updating to 1.3.5, clicking **Done** removes the old midnight door code refresh right away; see [Door code refresh](#door-code-refresh).)
+You don't need to open the app and click **Done** after an update; the existing schedules and subscriptions keep running with the new code. (After updating to 1.4.6, clicking **Done** announces the new version and settings to SignalBricks Telemetry right away; otherwise that happens with the next booking sync. See [App info for SignalBricks](#app-info-for-signalbricks).) (After updating to 1.3.5, clicking **Done** removes the old midnight door code refresh right away; see [Door code refresh](#door-code-refresh).)
 
 ## Troubleshooting
 
@@ -149,10 +163,10 @@ You don't need to open the app and click **Done** after an update; the existing 
 
 ## Development
 
-`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. `tests/RefreshHarness.groovy` checks the door code refresh: Off by default and after an upgrade, the old midnight job removed, Done not refreshing, the Weekly/Daily times, the one-lock-at-a-time queue, the manual button and progress, re-arming after a booking sync, and that no code is logged. `tests/BookingsHarness.groovy` checks the Bookings page: it renders with no state (as when the hub saves the code), the on lock, not on lock and orphan statuses for current, upcoming and past bookings, the summary and last sync, the layout (bold booking heading, indented locks, a current booking's *not on lock* highlighted, header-style section titles), that rendering logs nothing, and that codes are masked and never rendered in full or logged. `tests/ConnectHarness.groovy` checks Connect to SignalBricks: the authorize URL, the callback, registration and its retries, reconnect and disconnect, the confirmation page for each outcome (headline, inline CSS only, the back link, escaped text, no token, code or request parameter), the app page in each state (one **Status** line, header-style section titles on the app and Debug pages), and that no secret is logged. `tests/ReconnectHarness.groovy` checks the Reconnect link, its `/reconnect` forward and the 10-minute window (viewing the page starts nothing): click then callback (success and failure), click then expiry, expiry racing the callback, the expiry surviving a booking sync, Reset State and Done, a lost timer, quick then 30-minute registration retries after an expiry (re-armed after a booking sync and the legacy DELETE /register), that bookings, slot assignments and pending code writes are kept, and that no token is logged or shown outside the open link. `tests/LogsHarness.groovy` drives the sync, device, command and register endpoints, reconcile and its jobs, the duplicate-code check and the lock event handlers with fake codes and a fake token, and checks that neither appears in any log level. None is loaded by Hubitat or HPM. Run them from the repository root with Docker:
+`tests/IntegrationHarness.groovy` loads the app in a stubbed Hubitat sandbox with fake locks and codes, and checks the name and version display, code naming, which codes the app claims, and which slots a reconcile sets and deletes. `tests/RefreshHarness.groovy` checks the door code refresh: Off by default and after an upgrade, the old midnight job removed, Done not refreshing, the Weekly/Daily times, the one-lock-at-a-time queue, the manual button and progress, re-arming after a booking sync, and that no code is logged. `tests/BookingsHarness.groovy` checks the Bookings page: it renders with no state (as when the hub saves the code), the on lock, not on lock and orphan statuses for current, upcoming and past bookings, the summary and last sync, the layout (bold booking heading, indented locks, a current booking's *not on lock* highlighted, header-style section titles), that rendering logs nothing, and that codes are masked and never rendered in full or logged. `tests/ConnectHarness.groovy` checks Connect to SignalBricks: the authorize URL, the callback, registration and its retries, reconnect and disconnect, the confirmation page for each outcome (headline, inline CSS only, the back link, escaped text, no token, code or request parameter), the app page in each state (one **Status** line, header-style section titles on the app and Debug pages), and that no secret is logged. `tests/ReconnectHarness.groovy` checks the Reconnect link, its `/reconnect` forward and the 10-minute window (viewing the page starts nothing): click then callback (success and failure), click then expiry, expiry racing the callback, the expiry surviving a booking sync, Reset State and Done, a lost timer, quick then 30-minute registration retries after an expiry (re-armed after a booking sync and the legacy DELETE /register), that bookings, slot assignments and pending code writes are kept, and that no token is logged or shown outside the open link. `tests/AppInfoHarness.groovy` checks the [app info](#app-info-for-signalbricks) announcement: exactly the contract keys and no code, code name, token, booking id or guest name, sent on install, Done and by the daily job at a random 04:00-23:59 time that is re-armed after every app-wide unschedule (install, Reset State, booking syncs and reconcile, `/register`), the setting coercion, and that announcing makes no network call and touches no lock. `tests/LogsHarness.groovy` drives the sync, device, command and register endpoints, reconcile and its jobs, the duplicate-code check and the lock event handlers with fake codes and a fake token, and checks that neither appears in any log level. None is loaded by Hubitat or HPM. Run them from the repository root with Docker:
 
 ```bash
-for h in IntegrationHarness RefreshHarness BookingsHarness ConnectHarness ReconnectHarness LogsHarness; do
+for h in IntegrationHarness RefreshHarness BookingsHarness ConnectHarness ReconnectHarness LogsHarness AppInfoHarness; do
   docker run --rm --network none -v "$PWD/signalbricksIntegration:/w:ro" groovy:4.0-jdk17 \
     groovy /w/tests/$h.groovy /w/app.groovy
 done

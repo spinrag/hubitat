@@ -48,6 +48,8 @@ abstract class HubitatStub extends Script {
     void unschedule() { scheduled.clear() }
     void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
+    List locationEvents = []
+    void sendLocationEvent(Map m) { locationEvents << m }
     void unsubscribe() {}
     void httpPostJson(Map p, Closure c) { posts << p; c([data: [ok: true]]) }
     def parseJson(String s) { new JsonSlurper().parseText(s) }

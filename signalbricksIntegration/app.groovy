@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.5' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.6' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -350,6 +350,7 @@ void appButtonHandler(String btnName) {
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
             sbConnectLinkRearm()
+            sbScheduleAppInfo()
             // Re-establish subscriptions so codeChangedHandler still fires
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
@@ -479,6 +480,10 @@ void installed() {
 
     // Door code refresh is Off unless a cadence was chosen (#24)
     scheduleCodeRefresh()
+
+    // Tell SignalBricks Telemetry on this hub the version and slot settings (#692)
+    sbAnnounceAppInfo()
+    sbScheduleAppInfo()
 }
 
 // Called when the settings page is updated (and use clicks done)
@@ -503,6 +508,9 @@ void updated() {
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
+
+    // Announce the saved settings (#692); SyncState re-arms the daily announcement
+    sbAnnounceAppInfo()
 
     SyncState()
 }
@@ -557,6 +565,8 @@ void scheduleEvents(Map bookings) {
     // ...and a pending SignalBricks registration retry (#34), and an open Reconnect link's expiry (#46)
     sbRegisterRetryRearm()
     sbConnectLinkRearm()
+    // ...and the daily app info announcement (#692)
+    sbScheduleAppInfo()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -595,6 +605,60 @@ void scheduleEvents(Map bookings) {
             }
         }
     }
+}
+
+// --- App info announcement (signalbricks/platform#692) ---
+// The app tells SignalBricks Telemetry on the same hub its version and slot
+// settings with a hub-local location event; Telemetry copies the latest one
+// into its daily report. The event never leaves the hub by itself, and this
+// makes no network call. Sent on install, on Done and once a day. Settings
+// only: no codes, code names, tokens, booking ids or guest names.
+String getSbAppInfoEvent() { 'signalbricksAppInfo' }
+
+// The event's value, as in the platform's docs/hub-reporting.md (schemaVersion 1)
+Map sbAppInfo() {
+    Map info = [
+        schemaVersion: 1,
+        appId: app.id.toString(),
+        name: sbAppName,
+        version: sbAppVersion,
+    ]
+    // Unset = 0: the app may then write any slot from slot 1 up
+    def pos = minCodePosition
+    if (pos == null || pos.toString().trim() == '') {
+        info.minCodePosition = 0
+    } else {
+        try {
+            info.minCodePosition = new BigDecimal(pos.toString().trim()).intValue()
+        } catch (Exception e) {
+            // Not a number: left out rather than guessed
+        }
+    }
+    info.codeNamePrefix = (codeNamePrefix ?: '').toString().take(16)
+    return info
+}
+
+void sbAnnounceAppInfo() {
+    sendLocationEvent(name: sbAppInfoEvent, value: JsonOutput.toJson(sbAppInfo()), isStateChange: true)
+    state.appInfoVersion = sbAppVersion
+}
+
+// Daily job
+void sbAppInfoDaily() {
+    sbAnnounceAppInfo()
+}
+
+// Schedules the daily announcement at a time picked at random once per install,
+// 04:00-23:59 hub time (clear of the 01:00-03:59 door code refresh). Called after
+// every app-wide unschedule(). After an update through HPM (no Done) the first
+// call also announces the new version right away.
+void sbScheduleAppInfo() {
+    if (state.appInfoSecond == null) {
+        state.appInfoSecond = 4 * 3600 + (int) (Math.random() * 20 * 3600)
+    }
+    int t = state.appInfoSecond as int
+    schedule("${t % 60} ${(t.intdiv(60)) % 60} ${t.intdiv(3600)} * * ?".toString(), 'sbAppInfoDaily')
+    if (state.appInfoVersion != sbAppVersion) sbAnnounceAppInfo()
 }
 
 // --- Door code refresh (#24) ---
@@ -1260,9 +1324,11 @@ Map apiUnregister() {
         unschedule()
         unsubscribe()
         atomicState.codeRefresh = null
-        // A pending registration retry and an open Reconnect window keep their timers (#46)
+        // A pending registration retry and an open Reconnect window keep their timers (#46),
+        // and the daily app info announcement its schedule (#692)
         sbRegisterRetryRearm()
         sbConnectLinkRearm()
+        sbScheduleAppInfo()
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {

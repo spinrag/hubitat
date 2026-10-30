@@ -1200,7 +1200,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.5.3'
+String VERSION = '1.6.0'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1332,7 +1332,7 @@ app.posts.clear()
 app.state.registeredVersion = VERSION
 app.state.remove('reregisterAttemptAt')
 app.dailyCheckIn()
-check('check-in: same version sends nothing', app.posts.isEmpty())
+check('check-in: same version does not register (only the daily hub report goes out, #692)', registers().isEmpty() && app.posts.size() == 1 && app.posts[0].cb == 'reportCallback')
 app.state.registeredVersion = '1.3.1'
 app.fakeNow += 24L * 3600 * 1000
 app.dailyCheckIn()
@@ -1349,7 +1349,7 @@ app.state.lockMgmtRegistered = false
 app.state.registeredVersion = '1.3.1'
 app.posts.clear()
 app.dailyCheckIn()
-check('check-in: telemetry-only hub never registers', app.posts.isEmpty())
+check('check-in: telemetry-only hub never registers', registers().isEmpty())
 app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true

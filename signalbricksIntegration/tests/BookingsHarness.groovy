@@ -61,6 +61,8 @@ abstract class HubitatStub extends Script {
     void unschedule() { scheduled.clear() }
     void unschedule(String handler) { scheduled.removeAll { it.handler == handler } }
     void subscribe(Object... args) {}
+    List locationEvents = []
+    void sendLocationEvent(Map m) { locationEvents << m }
     void unsubscribe() {}
     void httpPostJson(Map p, Closure c) { throw new IllegalStateException('no network in the harness') }
     def parseJson(String s) { new JsonSlurper().parseText(s) }
@@ -91,7 +93,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.5', app.sbAppVersion == '1.4.5')
+check('version is 1.4.6', app.sbAppVersion == '1.4.6')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -190,7 +192,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.5'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.6'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')

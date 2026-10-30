@@ -52,6 +52,7 @@ Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Z
 - Door code refresh (re-reading the codes from the locks) is off by default and reads one lock at a time, weekly, daily or on demand
 - Small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher (not included in this repo)
 - **Reconnect to SignalBricks** opens a sign-in link for 10 minutes; whether it is used or not, the app then replaces its access token and registers the new one
+- Announces its version and slot settings on the hub (a hub-local location event, no network call) for SignalBricks Telemetry's daily report
 
 📂 [`signalbricksIntegration`](signalbricksIntegration/)
 
@@ -66,6 +67,7 @@ Sends read-only lock, contact, temperature, humidity and battery events to Signa
 - Telemetry never subscribes to `lockCodes`, never controls devices, and doesn't send PINs unless you turn on *Include door codes* (1.3.5+, off by default; SignalBricks then keeps only a keyed hash, and only if your organization's admin also allows it)
 - Non-blocking `asynchttpPost` delivery
 - Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, with hub-side slot enforcement
+- **Daily hub report**: app versions and slot settings, hub firmware and uptime, and lock health (battery, jammed, number of occupied slots; never codes or code names)
 
 📂 [`signalbricksTelemetry`](signalbricksTelemetry/)
 

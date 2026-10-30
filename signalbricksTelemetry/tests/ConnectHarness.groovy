@@ -81,7 +81,7 @@ List secrets = []
 String INGEST_TOKEN = 'sbit_fakeingesttokenfakeingesttoken00'
 secrets << INGEST_TOKEN
 
-check('version is 1.5.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.5.3')
+check('version is 1.6.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.0')
 
 def callback = { Map p ->
     String before = app.state.accessToken
@@ -138,7 +138,7 @@ headlines.each { k, h ->
     String html = pages[k]
     String status = k == 'connected' ? 'ok' : 'err'
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Telemetry: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
-    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.5.3</p>'))
+    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.6.0</p>'))
     check("page ${k}: inline CSS only, light and dark, wraps long text", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && html.contains('overflow-wrap:anywhere') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
     check("page ${k}: no back link (it opened in its own window); says to close it and return to the app", !html.contains('<a ') && !html.contains('installedapp') && !html.contains('Back to the app') &&
         html.contains("If this window doesn't close, close it yourself and return to the app; it's still open in your other tab."))
