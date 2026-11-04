@@ -136,7 +136,7 @@ check('install: one announcement', app.locationEvents.size() == 1)
 Map ev = app.locationEvents[0]
 check('install: event name signalbricksAppInfo, isStateChange true', ev.name == 'signalbricksAppInfo' && ev.isStateChange == true && ev.value instanceof String)
 Map info = lastInfo()
-check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'])
+check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'previousCodeNamePrefix'])
 check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.9')
 check('payload: minCodePosition a number, prefix the setting', info.minCodePosition == 50 && info.minCodePosition instanceof Integer && info.codeNamePrefix == 'GT:')
 check('payload: no manageDoorCodes (OwnerRez fork only)', !info.containsKey('manageDoorCodes'))
@@ -157,6 +157,12 @@ check('minCodePosition unset -> 0', infoWith(null, 'G: ').minCodePosition == 0)
 check('minCodePosition blank -> 0', infoWith('', 'G: ').minCodePosition == 0)
 check('minCodePosition not a number -> left out', !infoWith('abc', 'G: ').containsKey('minCodePosition'))
 check('prefix unset -> empty string', infoWith(50, null).codeNamePrefix == '')
+check('previous prefix unset -> empty string', infoWith(50, 'G:').previousCodeNamePrefix == '')
+app.settings = [previousCodeNamePrefix: ' GT: ']
+check('previous prefix: the setting, trimmed', infoWith(50, 'G:').previousCodeNamePrefix == 'GT:')
+app.settings = [previousCodeNamePrefix: 'ABCDEFGHIJKLMNOPQRS']
+check('previous prefix capped at 16 characters', infoWith(50, 'G:').previousCodeNamePrefix == 'ABCDEFGHIJKLMNOP')
+app.settings = [:]
 check('prefix capped at 16 characters', infoWith(50, 'ABCDEFGHIJKLMNOPQRS').codeNamePrefix == 'ABCDEFGHIJKLMNOP')
 app.minCodePosition = 50
 app.codeNamePrefix = 'GT:'
@@ -247,7 +253,7 @@ check('no token or credential in any announcement', !all.contains('tok-fake') &&
 check('no code name in any announcement', !all.contains('ORB'))
 check('only signalbricksAppInfo location events', app.locationEvents.every { it.name == 'signalbricksAppInfo' })
 check('announce logs nothing with a code or token', !app.logged.any { it.contains(CODE) || it.contains('tok-fake') || it.contains(CREDENTIAL) })
-check('every announcement has exactly the contract keys', app.locationEvents.every { new JsonSlurper().parseText(it.value).keySet() == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'] as Set })
+check('every announcement has exactly the contract keys', app.locationEvents.every { new JsonSlurper().parseText(it.value).keySet() == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'previousCodeNamePrefix'] as Set })
 
 // --- A failed announcement never stops booking scheduling or a save (review F1) ---
 def reconciles = { app.onces.findAll { it.handler == 'reconcileDoorCodes' } }

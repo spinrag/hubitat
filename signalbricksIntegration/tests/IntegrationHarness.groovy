@@ -135,7 +135,8 @@ def prefixRun = { Map lockCodes, Map assignments, Map bks ->
     app.scheduled.clear()
     app.reconcileDoorCodes(bks)
     [sets: app.scheduled.findAll { it.handler == 'trySetCode' }.collect { it.data },
-     deletes: app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition }]
+     deletes: app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition },
+     jobs: app.scheduled.collect { it }]
 }
 def booking77 = { Map extra = [:] -> ['77': [id: '77', guest: 'Cy', code: '20000077', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)] + extra] }
 Map tracked51 = ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'GT:ORB77-Cy', attempt: 1, confirmed: true]]]
@@ -176,15 +177,58 @@ r = prefixRun(sameBooking, tracked51, booking77())
 check('same booking in two slots: the tracked slot wins, the other slot is not rewritten', r.sets.isEmpty() && r.deletes.isEmpty())
 r = prefixRun(sameBooking, tracked51, [:])
 check('same booking in two slots, after checkout: the tracked slot goes first', r.deletes == [51])
-app.tryDeleteCode([lockId: '7', codePosition: 51])
+def delJob = r.jobs.find { it.handler == 'tryDeleteCode' }
+def retryJob = r.jobs.find { it.handler == 'reconcileDoorCodes' }
+check('same booking in two slots, after checkout: a retry reconcile runs after the delete', retryJob != null && retryJob.secs > delJob.secs)
+// The scheduled delete runs and the lock reports the slot gone
+app.tryDeleteCode(delJob.data)
+check('same booking in two slots, after checkout: the delete reached the lock and cleared tracking', lock.deleted == [51] && !app.atomicState.codeAssignments['7']?.containsKey('51'))
 r = prefixRun(['31': [name: 'G:ORB77-Cy', code: '10000031']], app.atomicState.codeAssignments, [:])
 check('same booking in two slots, after checkout: the next reconcile removes the other slot', r.deletes == [31])
+
+// The tracked slot was reassigned outside the app: trust it only when the lock agrees
+Map staleTracked51 = ['7': ['51': [bookingId: 'ORB77', code: '20000070', codeName: 'GT:ORB77-Cy', attempt: 1, confirmed: true]]]
+Map named52 = ['52': [name: 'G:ORB77-Cy', code: '20000077']]
+r = prefixRun(['51': [name: 'Plumber', code: '30000051']] + named52, staleTracked51, booking77())
+check('tracked slot now holds a foreign code: slot 51 is neither written nor deleted', !r.sets.any { it.codePosition == 51 } && !r.deletes.contains(51) && r.sets.isEmpty())
+Map booking88 = ['88': [id: '88', guest: 'Di', code: '20000088', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)]]
+r = prefixRun(['51': [name: 'G:ORB88-Di', code: '20000088']] + named52, staleTracked51, booking77() + booking88)
+check('tracked slot now holds another current booking: no rewrite, no delete', r.sets.isEmpty() && r.deletes.isEmpty())
+
+// A dangerous previous prefix is ignored and the page says why
+def prevRefused = { String prefix, String prev ->
+    app.codeNamePrefix = prefix
+    app.settings = [previousCodeNamePrefix: prev]
+    app.paragraphs.clear()
+    app.pages()
+    [problem: app.previousPrefixProblem(), shown: app.paragraphs.any { it.contains('Previous prefix for code name is not used') }, inUse: app.previousPrefixInUse()]
+}
+app.codeNamePrefix = 'GT:'
+app.settings = [previousCodeNamePrefix: 'G']
+claimed = app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(codes)))
+check('previous prefix G (no colon): ignored, the other app\'s G:ORB55 is not claimed', claimed.keySet() == ['77'] as Set)
+[['', 'GT:', 'empty current prefix'], ['G:', 'G:', 'same as the current prefix'], ['GT:', 'G', 'start of the current prefix'],
+ ['G:', 'X', 'shorter than 2 characters'], ['G:', 'GT', 'no colon'], ['G:', 'SBM:', 'starts with SB'], ['G:', 'sba:', 'starts with SB (any case)']].each { t ->
+    def v = prevRefused(t[0], t[1])
+    check("previous prefix refused (${t[2]}): warning shown and not used", v.problem != null && v.shown && v.inUse == '')
+}
+def okPrev = prevRefused('G:', ' GT: ')
+check('previous prefix GT: with prefix G:: trimmed, used, no warning', okPrev.problem == null && !okPrev.shown && okPrev.inUse == 'GT:')
+app.codeNamePrefix = 'G:'
+app.settings = [:]
+
+// The booking's own code under an older name is not a duplicate (no 409 after a prefix or guest name change)
+lock.attrs.lockCodes = JsonOutput.toJson(ourCode)
+check('duplicate check: own old-prefix code is not a duplicate', !app.helperHasDuplicateCode('7', booking77()['77'], booking77()))
+check('duplicate check: own code with an old guest name is not a duplicate', !app.helperHasDuplicateCode('7', booking77(guest: 'VIP Cy')['77'], booking77()))
+lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'G:ORB88-Di', code: '20000077']])
+check('duplicate check: the same PIN on another current booking still is', app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88))
 
 app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '10000031'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

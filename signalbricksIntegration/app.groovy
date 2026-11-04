@@ -38,7 +38,7 @@ preferences {
             paragraph '<b>' + sbAppNameAndVersion + '</b>'
             paragraph 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to the locks selected below. ' +
                 'Each code is named <code>&lt;prefix&gt;ORB&lt;booking id&gt;-&lt;guest&gt;</code> and is on the lock from before check-in to after checkout. ' +
-                'It manages codes named with its prefix + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
+                'It manages codes named with its prefix (or its previous prefix, after a change) + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
                 '(it can treat such a slot as its own by position even if the slot was reassigned outside the app). ' +
                 'It writes new codes only into empty slots from the minimum code position up. ' +
                 'Do not run Hubitat Lock Code Manager on the same locks.'
@@ -61,6 +61,10 @@ preferences {
             paragraph '<small>Only when you change the prefix above: enter the old one here so codes already on the locks with the old prefix stay this app\'s and are still removed at checkout. ' +
                 'Existing codes keep their old name until their booking ends; new codes get the new prefix. Clear it once the bookings that were on the locks at the change have checked out. ' +
                 'Never enter a prefix another app on this hub still uses.</small>'
+            String prevProblem = previousPrefixProblem()
+            if (prevProblem) {
+                paragraph "<b>Previous prefix for code name is not used:</b> ${prevProblem}."
+            }
         }
 
         // #24: re-reading every slot over Z-Wave is slow, so it is one lock at a time and Off by default
@@ -142,7 +146,7 @@ def bookingsPage() {
         }
         section(title: '<h2>Orphans</h2>') {
             if (v.orphans) {
-                paragraph '<small>Codes with this app\'s prefix + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
+                paragraph '<small>Codes with this app\'s prefix (or its previous prefix) + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
                     'The next reconcile removes them.</small>'
                 v.orphans.each { paragraph it }
             } else {
@@ -641,6 +645,7 @@ Map sbAppInfo() {
         }
     }
     info.codeNamePrefix = (codeNamePrefix ?: '').toString().take(16)
+    info.previousCodeNamePrefix = (settings?.previousCodeNamePrefix ?: '').toString().trim().take(16)
     return info
 }
 
@@ -1124,7 +1129,8 @@ void tryDeleteCode(Map data) {
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
     if (assignments[lockKey]) {
-        assignments[lockKey].remove("${data.codePosition}")
+        // String key: remove() with a GString never matches the stored key
+        assignments[lockKey].remove("${data.codePosition}".toString())
         atomicState.codeAssignments = assignments
         log.debug "tryDeleteCode: removed assignment lock ${data.lockId} pos ${data.codePosition}"
     }
@@ -1752,7 +1758,7 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             return false
         }
 
-        if (existing.name.contains('ORB')) {
+        if (existing.name?.contains('ORB')) {
             // Extract the booking id with a regex (hyphen-safe) instead of splitting
             // on '-', which threw when the guest name contained a hyphen (the id
             // landed past parts[1], so substring(indexOf('ORB')) == substring(-1)).
@@ -1760,6 +1766,8 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             def m = (existing.name =~ /ORB(\d+)/)
             if (m.find()) {
                 String bookingId = m.group(1)
+                // The booking's own code under an older name (prefix or guest name changed)
+                if (bookingId == "${booking.id}") return false
                 if (bookings && bookings.containsKey(bookingId)) {
                     // Only warn if the bookings overlap check-in to check-out
                     Map otherBooking = bookings[bookingId]
@@ -1819,7 +1827,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
 
     String prefix = codeNamePrefix ?: ''
     // Codes named with the previous prefix stay this app's after a prefix change
-    List prefixes = [prefix, settings?.previousCodeNamePrefix ?: ''].findAll { it }
+    List prefixes = [prefix, previousPrefixInUse()].findAll { it }
     Map result = [:]
 
     // Slots this app assigned that still hold a code, by booking id
@@ -1831,7 +1839,11 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
         lockAssignments.each { pos, assignment ->
             if (!assignment.bookingId) return
             def bMatcher = (assignment.bookingId =~ /(\d+)/)
-            if (bMatcher.find() && (codes[pos] || codes["${pos}"])) trackedPos[bMatcher.group(1)] = "${pos}"
+            def lockCode = codes[pos] ?: codes["${pos}"]
+            if (!bMatcher.find() || !lockCode) return
+            // Only when the lock agrees: no name there, or the same ORB<id>
+            def nMatcher = (lockCode.name ?: '') =~ /ORB(\d+)/
+            if (!lockCode.name || (nMatcher.find() && nMatcher.group(1) == bMatcher.group(1))) trackedPos[bMatcher.group(1)] = "${pos}"
         }
     }
 
@@ -1874,6 +1886,24 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     }
 
     return result
+}
+
+// Why the Previous prefix setting is ignored, or null when it is usable or unset
+String previousPrefixProblem() {
+    String prev = (settings?.previousCodeNamePrefix ?: '').toString().trim()
+    String prefix = codeNamePrefix ?: ''
+    if (!prev) return null
+    if (!prefix) return 'it is ignored while Prefix for code name is empty'
+    if (prev == prefix) return 'it is the same as Prefix for code name'
+    if (prefix.startsWith(prev)) return 'it is the start of Prefix for code name'
+    if (prev.length() < 2 || !prev.contains(':')) return 'it must be at least 2 characters and contain a colon (:), e.g. <code>GT:</code>'
+    if (prev.toUpperCase().startsWith('SB')) return 'names starting with SB belong to SignalBricks Telemetry'
+    return null
+}
+
+// The previous prefix matched by name, or '' when unset or refused
+String previousPrefixInUse() {
+    return previousPrefixProblem() ? '' : (settings?.previousCodeNamePrefix ?: '').toString().trim()
 }
 
 // Find all unused code positions
