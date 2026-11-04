@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.8' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.9' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -57,6 +57,10 @@ preferences {
             if (!settings?.codeNamePrefix) {
                 paragraph '<b>Set a code name prefix</b> (e.g. <code>GT:</code>) that differs from the OwnerRez app\'s prefix. Without one this app treats every <code>ORB</code> booking code on the selected locks as its own.'
             }
+            input(name: 'previousCodeNamePrefix', type: 'string', title: 'Previous prefix for code name (optional)', submitOnChange: true, defaultValue: '')
+            paragraph '<small>Only when you change the prefix above: enter the old one here so codes already on the locks with the old prefix stay this app\'s and are still removed at checkout. ' +
+                'Existing codes keep their old name until their booking ends; new codes get the new prefix. Clear it once the bookings that were on the locks at the change have checked out. ' +
+                'Never enter a prefix another app on this hub still uses.</small>'
         }
 
         // #24: re-reading every slot over Z-Wave is slow, so it is one lock at a time and Off by default
@@ -126,7 +130,7 @@ def bookingsPage() {
             paragraph v.summary
             v.notes.each { paragraph it }
             paragraph '<small>From this hub\'s state and the locks\' last reported codes; reload the page to update. ' +
-                'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
+                'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix (or its previous prefix) + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
                 'Codes show only their last 2 digits.</small>'
         }
         section(title: '<h2>Known bookings</h2>') {
@@ -1814,16 +1818,33 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     if (!quiet) log.debug 'helperOnlySbCodes'
 
     String prefix = codeNamePrefix ?: ''
+    // Codes named with the previous prefix stay this app's after a prefix change
+    List prefixes = [prefix, settings?.previousCodeNamePrefix ?: ''].findAll { it }
     Map result = [:]
+
+    // Slots this app assigned that still hold a code, by booking id
+    Map lockAssignments = [:]
+    Map trackedPos = [:]
+    if (lockId) {
+        Map assignments = atomicState.codeAssignments ?: [:]
+        lockAssignments = assignments["${lockId}"] ?: [:]
+        lockAssignments.each { pos, assignment ->
+            if (!assignment.bookingId) return
+            def bMatcher = (assignment.bookingId =~ /(\d+)/)
+            if (bMatcher.find() && (codes[pos] || codes["${pos}"])) trackedPos[bMatcher.group(1)] = "${pos}"
+        }
+    }
 
     // First: check lock's reported code names (works when lock driver preserves names)
     codes.each { key, code ->
         if (code.name?.contains('ORB')) {
-            if (prefix && !code.name.startsWith(prefix)) return
+            if (prefix && !prefixes.any { code.name.startsWith(it) }) return
             def matcher = (code.name =~ /ORB(\d+)/)
             if (matcher.find()) {
-                code.key = key
                 String bId = matcher.group(1) // Just the digits, no ORB prefix
+                // A slot this app assigned for the booking wins over a same-booking code in another slot
+                if (trackedPos[bId] && trackedPos[bId] != "${key}") return
+                code.key = key
                 code.bookingId = bId
                 result[bId] = code
                 if (!quiet) log.debug("helperOnlySbCodes: found by name: ${bId} at pos ${key}")
@@ -1832,29 +1853,23 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     }
 
     // Second: check tracked assignments (for lock drivers that don't preserve names)
-    if (lockId) {
-        Map assignments = atomicState.codeAssignments ?: [:]
-        String lockKey = "${lockId}"
-        Map lockAssignments = assignments[lockKey] ?: [:]
+    lockAssignments.each { pos, assignment ->
+        // Extract numeric ID from tracked bookingId (may be "ORB12345" or "12345")
+        String bId = assignment.bookingId
+        if (!bId) return
+        def bMatcher = (bId =~ /(\d+)/)
+        if (bMatcher.find()) bId = bMatcher.group(1)
+        if (result[bId]) return // Already found by name
 
-        lockAssignments.each { pos, assignment ->
-            // Extract numeric ID from tracked bookingId (may be "ORB12345" or "12345")
-            String bId = assignment.bookingId
-            if (!bId) return
-            def bMatcher = (bId =~ /(\d+)/)
-            if (bMatcher.find()) bId = bMatcher.group(1)
-            if (result[bId]) return // Already found by name
-
-            // Verify there is a code at this position on the lock
-            // Don't compare code values — some drivers redact codes as ********
-            if (codes[pos] || codes["${pos}"]) {
-                def lockCode = codes[pos] ?: codes["${pos}"]
-                lockCode.key = pos
-                lockCode.bookingId = bId
-                lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
-                result[bId] = lockCode
-                if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
-            }
+        // Verify there is a code at this position on the lock
+        // Don't compare code values — some drivers redact codes as ********
+        if (codes[pos] || codes["${pos}"]) {
+            def lockCode = codes[pos] ?: codes["${pos}"]
+            lockCode.key = pos
+            lockCode.bookingId = bId
+            lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
+            result[bId] = lockCode
+            if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
         }
     }
 

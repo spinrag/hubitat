@@ -49,6 +49,8 @@ class FakeLock {
     String id; String name; String label
     Map attrs = [:]
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
+    List deleted = []
+    void deleteCode(def pos) { deleted << pos }
 }
 
 def cfg = new CompilerConfiguration()
@@ -123,6 +125,66 @@ app.scheduled.clear()
 app.logged.clear()
 app.reconcileDoorCodes(bookings)
 check('reconcile: no free position -> no set, warning logged', !app.scheduled.any { it.handler == 'trySetCode' } && app.logged.any { it.toString().contains('no free code position') })
+
+// --- Changing the code name prefix (GT: -> G:) and the guest name ---
+// Fake booking ids, guests and codes only.
+def prefixRun = { Map lockCodes, Map assignments, Map bks ->
+    lock.attrs.lockCodes = JsonOutput.toJson(lockCodes)
+    lock.attrs.maxCodes = 60
+    app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(assignments))
+    app.scheduled.clear()
+    app.reconcileDoorCodes(bks)
+    [sets: app.scheduled.findAll { it.handler == 'trySetCode' }.collect { it.data },
+     deletes: app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition }]
+}
+def booking77 = { Map extra = [:] -> ['77': [id: '77', guest: 'Cy', code: '20000077', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)] + extra] }
+Map tracked51 = ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'GT:ORB77-Cy', attempt: 1, confirmed: true]]]
+Map ourCode = ['51': [name: 'GT:ORB77-Cy', code: '20000077']]
+// The other booking app's code left on the lock after that app was removed
+Map leftover = ['31': [name: 'G:ORB55-Bob', code: '10000031']]
+app.minCodePosition = 50
+app.codeNamePrefix = 'G:'
+app.settings = [:]
+
+def r = prefixRun(leftover + ourCode, tracked51, booking77())
+check('prefix change: a tracked old-prefix code stays in its slot (no new slot, no rewrite)', r.sets.isEmpty() && !r.deletes.contains(51))
+check('prefix change: a leftover code with the new prefix and no current booking is removed', r.deletes == [31])
+r = prefixRun(ourCode, tracked51, booking77(guest: 'VIP Cy'))
+check('guest name change only: no rewrite, the code keeps its old name until checkout', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(ourCode, tracked51, booking77(code: '20000078'))
+check('prefix change: a new code for the booking goes into the same slot with the new name', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].codeName == 'G:ORB77-Cy' && r.deletes.isEmpty())
+r = prefixRun(ourCode, tracked51, [:])
+check('prefix change: a tracked old-prefix code is removed after checkout', r.deletes == [51] && r.sets.isEmpty())
+
+// Untracked old-prefix codes (state reset or app reinstalled): only the previous prefix keeps them
+r = prefixRun(ourCode, [:], [:])
+check('untracked old-prefix code without a previous prefix: not this app\'s (left on the lock)', r.deletes.isEmpty())
+r = prefixRun(ourCode, [:], booking77())
+check('untracked old-prefix code without a previous prefix: the booking gets a second slot', r.sets.size() == 1 && r.sets[0].codePosition == 50)
+app.settings = [previousCodeNamePrefix: 'GT:']
+r = prefixRun(ourCode, [:], [:])
+check('previous prefix: an untracked old-prefix code is removed after checkout', r.deletes == [51])
+r = prefixRun(ourCode, [:], booking77())
+check('previous prefix: an untracked old-prefix code for a current booking is kept, no second slot', r.sets.isEmpty() && r.deletes.isEmpty())
+claimed = app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(codes)))
+check('previous prefix: claims codes with either prefix, never SBA:/SBM: or unprefixed names', claimed.keySet() == ['55', '77'] as Set)
+app.settings = [:]
+
+// The removed app's code and this app's tracked code for the same booking
+Map sameBooking = ['31': [name: 'G:ORB77-Cy', code: '10000031']] + ourCode
+r = prefixRun(sameBooking, tracked51, booking77())
+check('same booking in two slots: the tracked slot wins, the other slot is not rewritten', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(sameBooking, tracked51, [:])
+check('same booking in two slots, after checkout: the tracked slot goes first', r.deletes == [51])
+app.tryDeleteCode([lockId: '7', codePosition: 51])
+r = prefixRun(['31': [name: 'G:ORB77-Cy', code: '10000031']], app.atomicState.codeAssignments, [:])
+check('same booking in two slots, after checkout: the next reconcile removes the other slot', r.deletes == [31])
+
+app.paragraphs.clear()
+app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
+app.pages()
+check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '10000031'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
