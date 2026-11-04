@@ -51,6 +51,8 @@ class FakeLock {
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
     List deleted = []
     void deleteCode(def pos) { deleted << pos }
+    List setCalls = []
+    void setCode(def pos, def code, def name) { setCalls << pos }
 }
 
 def cfg = new CompilerConfiguration()
@@ -182,9 +184,10 @@ def retryJob = r.jobs.find { it.handler == 'reconcileDoorCodes' }
 check('same booking in two slots, after checkout: a retry reconcile runs after the delete', retryJob != null && retryJob.secs > delJob.secs)
 // The scheduled delete runs and the lock reports the slot gone
 app.tryDeleteCode(delJob.data)
-check('same booking in two slots, after checkout: the delete reached the lock and cleared tracking', lock.deleted == [51] && !app.atomicState.codeAssignments['7']?.containsKey('51'))
+check('same booking in two slots, after checkout: the delete reached the lock, tracking kept until confirmed', lock.deleted == [51] && app.atomicState.codeAssignments['7']['51'].deleting == true)
 r = prefixRun(['31': [name: 'G:ORB77-Cy', code: '10000031']], app.atomicState.codeAssignments, [:])
 check('same booking in two slots, after checkout: the next reconcile removes the other slot', r.deletes == [31])
+check('same booking in two slots, after checkout: the lock reports slot 51 empty, its tracking is pruned', !app.atomicState.codeAssignments['7']?.containsKey('51'))
 
 // The tracked slot was reassigned outside the app: trust it only when the lock agrees
 Map staleTracked51 = ['7': ['51': [bookingId: 'ORB77', code: '20000070', codeName: 'GT:ORB77-Cy', attempt: 1, confirmed: true]]]
@@ -194,6 +197,54 @@ check('tracked slot now holds a foreign code: slot 51 is neither written nor del
 Map booking88 = ['88': [id: '88', guest: 'Di', code: '20000088', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)]]
 r = prefixRun(['51': [name: 'G:ORB88-Di', code: '20000088']] + named52, staleTracked51, booking77() + booking88)
 check('tracked slot now holds another current booking: no rewrite, no delete', r.sets.isEmpty() && r.deletes.isEmpty())
+
+// Deletes: tracking is kept until the lock confirms (drivers that drop code names)
+def tracked = { Map a -> new JsonSlurper().parseText(JsonOutput.toJson(['7': a])) }
+def assigned = { String pos -> app.atomicState.codeAssignments['7']?.get(pos) }
+Map nameless51 = ['51': [code: '20000077']]
+r = prefixRun(nameless51, tracked51, [:])
+check('nameless driver: a normal checkout still deletes the tracked slot', r.deletes == [51])
+lock.deleted.clear()
+app.tryDeleteCode([lockId: '7', codePosition: 51])
+check('nameless driver: the delete is sent and the slot is marked deleting', lock.deleted == [51] && assigned('51')?.deleting == true)
+// L: the delete was lost, the lock still reports the code
+r = prefixRun(nameless51, app.atomicState.codeAssignments, [:])
+check('L: lost delete on a nameless driver: the next reconcile deletes it again', r.deletes == [51] && r.jobs.any { it.handler == 'reconcileDoorCodes' })
+def codeEvent = { String value, int slot -> [device: [id: '7'], value: value, data: JsonOutput.toJson([codeNumber: slot]), name: 'codeChanged'] }
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
+app.codeChangedHandler(codeEvent('deleted', 51))
+check('confirmed delete (codeChanged deleted) clears tracking', assigned('51') == null)
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
+r = prefixRun([:] + ['40': [name: 'Front desk', code: '10000040']], app.atomicState.codeAssignments, [:])
+check('a deleting slot the lock reports empty is pruned', r.deletes.isEmpty() && assigned('51') == null)
+Map pendingSet = ['50': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: false]]
+r = prefixRun(['40': [name: 'Front desk', code: '10000040']], ['7': pendingSet], [:])
+check('a pending setCode on an empty slot is not pruned', assigned('50')?.confirmed == false)
+app.atomicState.codeAssignments = tracked(pendingSet)
+app.scheduled.clear()
+app.verifySetCode([lockId: '7', codePosition: 50, code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1])
+check('a pending setCode keeps retrying', app.scheduled.any { it.handler == 'verifySetCode' })
+app.atomicState.codeAssignments = tracked(['50': pendingSet['50'] + [deleting: true]])
+app.scheduled.clear()
+app.verifySetCode([lockId: '7', codePosition: 50, code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1])
+check('a setCode retry stops once its slot is being deleted', app.scheduled.isEmpty())
+
+// Upgraded state: stale tracking from earlier versions (deletes never cleared it)
+Map stale = ['31': [bookingId: 'ORB12', code: '20000012', codeName: 'GT:ORB12-Ed', attempt: 1, confirmed: true],
+             '32': [bookingId: 'ORB13', code: '20000013', codeName: 'GT:ORB13-Flo', attempt: 1, confirmed: true],
+             '33': [bookingId: 'ORB14', code: '20000014', codeName: 'GT:ORB14-Gil', attempt: 1, confirmed: true],
+             '34': [bookingId: 'ORB15', code: '20000015', codeName: 'GT:ORB15-Hu', attempt: 1, confirmed: true]]
+Map upgraded = ['31': [name: 'G:ORB99-Ivy', code: '10000099'],  // U1: another app's booking code in a reused slot
+                '32': [name: 'Plumber', code: '30000032']]        // U2: a named code someone added
+                                                                   // 34: empty now
+app.settings = [:]
+app.codeNamePrefix = 'GT:'
+r = prefixRun(upgraded, ['7': stale], [:])
+check('U1/U2: stale tracking never deletes another app\'s or a named code', r.deletes.isEmpty())
+check('U1/U2: and the stale entries are pruned, as is the empty slot\'s', assigned('31') == null && assigned('32') == null && assigned('34') == null)
+r = prefixRun(['33': [code: '30000033']], ['7': stale], [:])
+check('U3: a nameless code in a stale tracked slot is still treated as the app\'s (nameless drivers need it)', r.deletes == [33] && assigned('33') != null)
+app.codeNamePrefix = 'G:'
 
 // A dangerous previous prefix is ignored and the page says why
 def prevRefused = { String prefix, String prev ->
@@ -228,7 +279,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
