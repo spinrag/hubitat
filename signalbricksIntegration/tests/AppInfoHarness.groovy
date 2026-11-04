@@ -128,7 +128,7 @@ app.settings = [locks: ['57'] as String[]]
 Date now = new Date(app.clock)
 Map bookings = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.8', app.sbAppVersion == '1.4.8')
+check('version is 1.4.9', app.sbAppVersion == '1.4.9')
 
 // --- Install ---
 app.installed()
@@ -136,8 +136,8 @@ check('install: one announcement', app.locationEvents.size() == 1)
 Map ev = app.locationEvents[0]
 check('install: event name signalbricksAppInfo, isStateChange true', ev.name == 'signalbricksAppInfo' && ev.isStateChange == true && ev.value instanceof String)
 Map info = lastInfo()
-check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'])
-check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.8')
+check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'previousCodeNamePrefix'])
+check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.9')
 check('payload: minCodePosition a number, prefix the setting', info.minCodePosition == 50 && info.minCodePosition instanceof Integer && info.codeNamePrefix == 'GT:')
 check('payload: no manageDoorCodes (OwnerRez fork only)', !info.containsKey('manageDoorCodes'))
 check('payload: under 255 characters', ev.value.length() < 255)
@@ -157,6 +157,12 @@ check('minCodePosition unset -> 0', infoWith(null, 'G: ').minCodePosition == 0)
 check('minCodePosition blank -> 0', infoWith('', 'G: ').minCodePosition == 0)
 check('minCodePosition not a number -> left out', !infoWith('abc', 'G: ').containsKey('minCodePosition'))
 check('prefix unset -> empty string', infoWith(50, null).codeNamePrefix == '')
+check('previous prefix unset -> empty string', infoWith(50, 'G:').previousCodeNamePrefix == '')
+app.settings = [previousCodeNamePrefix: ' GT: ']
+check('previous prefix: the setting, trimmed', infoWith(50, 'G:').previousCodeNamePrefix == 'GT:')
+app.settings = [previousCodeNamePrefix: 'ABCDEFGHIJKLMNOPQRS']
+check('previous prefix capped at 16 characters', infoWith(50, 'G:').previousCodeNamePrefix == 'ABCDEFGHIJKLMNOP')
+app.settings = [:]
 check('prefix capped at 16 characters', infoWith(50, 'ABCDEFGHIJKLMNOPQRS').codeNamePrefix == 'ABCDEFGHIJKLMNOP')
 app.minCodePosition = 50
 app.codeNamePrefix = 'GT:'
@@ -167,7 +173,7 @@ app.atomicState.bookings = bookings
 app.state.accessToken = 'tok-fake-access-0001'
 app.locationEvents.clear()
 app.updated()
-check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.8')
+check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.9')
 check('Done: daily job kept, same time', jobs().size() == 1 && job().cron == cron)
 app.minCodePosition = 60
 app.locationEvents.clear()
@@ -221,7 +227,7 @@ check('random time: still a single job', jobs().size() == 1)
 app.state.appInfoVersion = '1.4.5'
 app.locationEvents.clear()
 app.scheduleEvents([:])
-check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.8')
+check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.9')
 app.scheduleEvents([:])
 check('HPM update: not again on the next re-arm', app.locationEvents.size() == 1)
 
@@ -247,7 +253,7 @@ check('no token or credential in any announcement', !all.contains('tok-fake') &&
 check('no code name in any announcement', !all.contains('ORB'))
 check('only signalbricksAppInfo location events', app.locationEvents.every { it.name == 'signalbricksAppInfo' })
 check('announce logs nothing with a code or token', !app.logged.any { it.contains(CODE) || it.contains('tok-fake') || it.contains(CREDENTIAL) })
-check('every announcement has exactly the contract keys', app.locationEvents.every { new JsonSlurper().parseText(it.value).keySet() == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix'] as Set })
+check('every announcement has exactly the contract keys', app.locationEvents.every { new JsonSlurper().parseText(it.value).keySet() == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'previousCodeNamePrefix'] as Set })
 
 // --- A failed announcement never stops booking scheduling or a save (review F1) ---
 def reconciles = { app.onces.findAll { it.handler == 'reconcileDoorCodes' } }

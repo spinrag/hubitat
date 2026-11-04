@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.8' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.9' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -38,8 +38,8 @@ preferences {
             paragraph '<b>' + sbAppNameAndVersion + '</b>'
             paragraph 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to the locks selected below. ' +
                 'Each code is named <code>&lt;prefix&gt;ORB&lt;booking id&gt;-&lt;guest&gt;</code> and is on the lock from before check-in to after checkout. ' +
-                'It manages codes named with its prefix + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
-                '(it can treat such a slot as its own by position even if the slot was reassigned outside the app). ' +
+                'It manages codes named with its prefix (or its previous prefix, after a change) + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
+                '(by position, while the lock shows no name there, a driver placeholder with that slot\'s own number such as <code>Code 54</code> or <code>User #54</code> in slot 54, or the same <code>ORB&lt;booking id&gt;</code>). ' +
                 'It writes new codes only into empty slots from the minimum code position up. ' +
                 'Do not run Hubitat Lock Code Manager on the same locks.'
             paragraph 'Runs alongside the OwnerRez app. Give the two apps <b>different, non-empty</b> code name prefixes, neither the start of the other ' +
@@ -56,6 +56,14 @@ preferences {
             input(name: 'codeNamePrefix', type: 'string', title: 'Prefix for code name', submitOnChange: true, defaultValue: '')
             if (!settings?.codeNamePrefix) {
                 paragraph '<b>Set a code name prefix</b> (e.g. <code>GT:</code>) that differs from the OwnerRez app\'s prefix. Without one this app treats every <code>ORB</code> booking code on the selected locks as its own.'
+            }
+            input(name: 'previousCodeNamePrefix', type: 'string', title: 'Previous prefix for code name (optional)', submitOnChange: true, defaultValue: '')
+            paragraph '<small>Only when you change the prefix above: enter the old one here so codes already on the locks with the old prefix stay this app\'s and are still removed at checkout. ' +
+                'Existing codes keep their old name until their booking ends; new codes get the new prefix. Clear it once the bookings that were on the locks at the change have checked out. ' +
+                'Never enter a prefix another app on this hub still uses.</small>'
+            String prevProblem = previousPrefixProblem()
+            if (prevProblem) {
+                paragraph "<b>Previous prefix for code name is not used:</b> ${prevProblem}."
             }
         }
 
@@ -126,7 +134,7 @@ def bookingsPage() {
             paragraph v.summary
             v.notes.each { paragraph it }
             paragraph '<small>From this hub\'s state and the locks\' last reported codes; reload the page to update. ' +
-                'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
+                'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix (or its previous prefix) + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
                 'Codes show only their last 2 digits.</small>'
         }
         section(title: '<h2>Known bookings</h2>') {
@@ -138,7 +146,7 @@ def bookingsPage() {
         }
         section(title: '<h2>Orphans</h2>') {
             if (v.orphans) {
-                paragraph '<small>Codes with this app\'s prefix + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
+                paragraph '<small>Codes with this app\'s prefix (or its previous prefix) + <code>ORB&lt;id&gt;</code> (or in a slot it assigned) that match no known booking for that lock. ' +
                     'The next reconcile removes them.</small>'
                 v.orphans.each { paragraph it }
             } else {
@@ -637,6 +645,7 @@ Map sbAppInfo() {
         }
     }
     info.codeNamePrefix = (codeNamePrefix ?: '').toString().take(16)
+    info.previousCodeNamePrefix = (settings?.previousCodeNamePrefix ?: '').toString().trim().take(16)
     return info
 }
 
@@ -937,6 +946,7 @@ void reconcileDoorCodes(Map bookings) {
         }
 
         Map lockCodes = parseJson(lockCodesRaw)
+        helperPruneAssignments(lock.id, lockCodes)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
         log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
 
@@ -974,12 +984,22 @@ void reconcileDoorCodes(Map bookings) {
                     // slot >= minCodePosition, availableCodePositions is exhausted and
                     // returns null -> casting to int throws (GroovyCastException) and
                     // aborts the whole reconcile. Guard it: warn and skip this booking.
-                    def nextPosition = availableCodePositions[index]
-                    if (nextPosition == null) {
-                        log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
-                        return // continue to next booking
+                    // A slot this app tracks for the booking that the lock reports empty (gone, or
+                    // missing from a partial lockCodes report) is reused: never a second slot
+                    def nextPosition
+                    Integer ownPos = helperTrackedEmptySlot(lock.id, bookingId, lockCodes)
+                    int at = ownPos != null ? availableCodePositions.indexOf(ownPos) : -1
+                    if (at >= index) {
+                        availableCodePositions.remove(at)
+                        nextPosition = ownPos
+                    } else {
+                        nextPosition = availableCodePositions[index]
+                        if (nextPosition == null) {
+                            log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
+                            return // continue to next booking
+                        }
+                        index++
                     }
-                    index++
                     int codePosition = nextPosition
 
                     log.debug "reconcileDoorCodes: trySetCode ${helperLogBooking(booking)}"
@@ -1095,6 +1115,11 @@ void verifySetCode(Map data) {
         return
     }
 
+    if (a.deleting) {
+        log.debug "verifySetCode: slot is being deleted, stopping retry"
+        return
+    }
+
     if (a.confirmed) {
         log.debug "verifySetCode: already confirmed for lock ${data.lockId} pos ${data.codePosition}"
         return
@@ -1116,13 +1141,16 @@ void tryDeleteCode(Map data) {
 
     lock.deleteCode(data.codePosition)
 
-    // Remove from tracked assignments
+    // Keep tracking until the lock confirms the delete (codeChangedHandler) or reports
+    // the slot empty (reconcile): a lost delete on a driver without code names would
+    // otherwise leave the code on the lock with nothing to claim it again
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
-    if (assignments[lockKey]) {
-        assignments[lockKey].remove("${data.codePosition}")
+    String pos = "${data.codePosition}"
+    if (assignments[lockKey]?.get(pos)) {
+        assignments[lockKey][pos].deleting = true
         atomicState.codeAssignments = assignments
-        log.debug "tryDeleteCode: removed assignment lock ${data.lockId} pos ${data.codePosition}"
+        log.debug "tryDeleteCode: assignment lock ${data.lockId} pos ${data.codePosition} marked deleting"
     }
 }
 
@@ -1194,6 +1222,8 @@ void codeChangedHandler(e) {
                     lockAssignments[pos] = assignment
                     assignments[lockId] = lockAssignments
                     atomicState.codeAssignments = assignments
+                } else if (e.value == 'failed' && assignment.deleting) {
+                    log.debug "codeChangedHandler: failed event at pos ${pos} on lock ${lockId} while deleting; reconcile retries the delete"
                 } else if (e.value == 'failed') {
                     int attempt = (assignment.attempt ?: 0)
                     log.warn "codeChangedHandler: FAILED at pos ${pos} on lock ${lockId} for ${assignment.bookingId} (attempt ${attempt}) — retrying"
@@ -1208,6 +1238,12 @@ void codeChangedHandler(e) {
                     runIn(30, 'trySetCode', [ overwrite: false, data: retryData ])
                 } else if (e.value == 'deleted') {
                     log.info "codeChangedHandler: confirmed delete at pos ${pos} on lock ${lockId}"
+                    // A pending setCode keeps its entry so verifySetCode retries it
+                    if (!helperPendingSet(assignment)) {
+                        lockAssignments.remove(pos)
+                        assignments[lockId] = lockAssignments
+                        atomicState.codeAssignments = assignments
+                    }
                 }
             }
         }
@@ -1748,7 +1784,7 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             return false
         }
 
-        if (existing.name.contains('ORB')) {
+        if (existing.name?.contains('ORB')) {
             // Extract the booking id with a regex (hyphen-safe) instead of splitting
             // on '-', which threw when the guest name contained a hyphen (the id
             // landed past parts[1], so substring(indexOf('ORB')) == substring(-1)).
@@ -1756,6 +1792,8 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             def m = (existing.name =~ /ORB(\d+)/)
             if (m.find()) {
                 String bookingId = m.group(1)
+                // The booking's own code under an older name (prefix or guest name changed)
+                if (bookingId == "${booking.id}") return false
                 if (bookings && bookings.containsKey(bookingId)) {
                     // Only warn if the bookings overlap check-in to check-out
                     Map otherBooking = bookings[bookingId]
@@ -1814,16 +1852,33 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     if (!quiet) log.debug 'helperOnlySbCodes'
 
     String prefix = codeNamePrefix ?: ''
+    // Codes named with the previous prefix stay this app's after a prefix change
+    List prefixes = [prefix, previousPrefixInUse()].findAll { it }
     Map result = [:]
+
+    // Slots this app assigned that still hold a code, by booking id
+    Map lockAssignments = [:]
+    Map trackedPos = [:]
+    if (lockId) {
+        Map assignments = atomicState.codeAssignments ?: [:]
+        lockAssignments = assignments["${lockId}"] ?: [:]
+        lockAssignments.each { pos, assignment ->
+            if (!assignment.bookingId) return
+            def bMatcher = (assignment.bookingId =~ /(\d+)/)
+            if (bMatcher.find() && helperTrackedVerdict(assignment, codes[pos] ?: codes["${pos}"], pos) == 'claim') trackedPos[bMatcher.group(1)] = "${pos}"
+        }
+    }
 
     // First: check lock's reported code names (works when lock driver preserves names)
     codes.each { key, code ->
         if (code.name?.contains('ORB')) {
-            if (prefix && !code.name.startsWith(prefix)) return
+            if (prefix && !prefixes.any { code.name.startsWith(it) }) return
             def matcher = (code.name =~ /ORB(\d+)/)
             if (matcher.find()) {
-                code.key = key
                 String bId = matcher.group(1) // Just the digits, no ORB prefix
+                // A slot this app assigned for the booking wins over a same-booking code in another slot
+                if (trackedPos[bId] && trackedPos[bId] != "${key}") return
+                code.key = key
                 code.bookingId = bId
                 result[bId] = code
                 if (!quiet) log.debug("helperOnlySbCodes: found by name: ${bId} at pos ${key}")
@@ -1832,33 +1887,105 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     }
 
     // Second: check tracked assignments (for lock drivers that don't preserve names)
-    if (lockId) {
-        Map assignments = atomicState.codeAssignments ?: [:]
-        String lockKey = "${lockId}"
-        Map lockAssignments = assignments[lockKey] ?: [:]
+    lockAssignments.each { pos, assignment ->
+        // Extract numeric ID from tracked bookingId (may be "ORB12345" or "12345")
+        String bId = assignment.bookingId
+        if (!bId) return
+        def bMatcher = (bId =~ /(\d+)/)
+        if (bMatcher.find()) bId = bMatcher.group(1)
+        if (result[bId]) return // Already found by name
 
-        lockAssignments.each { pos, assignment ->
-            // Extract numeric ID from tracked bookingId (may be "ORB12345" or "12345")
-            String bId = assignment.bookingId
-            if (!bId) return
-            def bMatcher = (bId =~ /(\d+)/)
-            if (bMatcher.find()) bId = bMatcher.group(1)
-            if (result[bId]) return // Already found by name
-
-            // Verify there is a code at this position on the lock
-            // Don't compare code values — some drivers redact codes as ********
-            if (codes[pos] || codes["${pos}"]) {
-                def lockCode = codes[pos] ?: codes["${pos}"]
-                lockCode.key = pos
-                lockCode.bookingId = bId
-                lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
-                result[bId] = lockCode
-                if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
-            }
+        // Only when the lock agrees: a code with no name (drivers that drop names) or
+        // the same ORB<id>. Don't compare code values — some drivers redact codes as ********
+        def lockCode = codes[pos] ?: codes["${pos}"]
+        if (helperTrackedVerdict(assignment, lockCode, pos) == 'claim') {
+            lockCode.key = pos
+            lockCode.bookingId = bId
+            lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
+            result[bId] = lockCode
+            if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")
         }
     }
 
     return result
+}
+
+// What the lock shows in a slot this app tracks: 'empty', 'claim' (no name, a driver
+// placeholder naming this slot's number such as "Code 54" or "User #54" in slot 54, or
+// the same ORB<id>), 'otherBooking' (another ORB<id>) or 'otherName' (any other name).
+// Only ever applied to tracked slots: a "Code #1" in a slot the app never assigned is untouched.
+String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
+    if (!lockCode) return 'empty'
+    String name = lockCode.name?.toString()
+    if (!name || !name.trim()) return 'claim'
+    def p = (name =~ /(?i)^\s*(?:(?:user\s*)?code|user|slot|pin|position|lock\s*code)?\s*(?:#|no\.?)?\s*(\d+)\s*$/)
+    if (p.find() && pos.toString().trim().isInteger() && p.group(1).toInteger() == pos.toString().trim().toInteger()) return 'claim'
+    def nMatcher = (lockCode.name =~ /ORB(\d+)/)
+    if (!nMatcher.find()) return 'otherName'
+    def bMatcher = ("${assignment.bookingId ?: ''}" =~ /(\d+)/)
+    return bMatcher.find() && bMatcher.group(1) == nMatcher.group(1) ? 'claim' : 'otherBooking'
+}
+
+// A setCode not confirmed yet: verifySetCode keeps retrying it
+boolean helperPendingSet(Map assignment) {
+    return assignment.confirmed == false && !assignment.deleting
+}
+
+// The slot this app tracks for a booking that the lock reports empty, or null
+Integer helperTrackedEmptySlot(def lockId, def bookingId, Map codes) {
+    Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
+    def hit = lockAssignments.find { pos, a ->
+        !a.deleting && (a.bookingId ?: '').toString().find(/\d+/) == bookingId.toString() && !codes[pos] && !codes["${pos}"] && pos.toString().isInteger()
+    }
+    return hit ? hit.key.toString().toInteger() : null
+}
+
+// True while a door code refresh is reading this lock (its lockCodes may be partial)
+boolean codeRefreshReading(def lockId) {
+    Map r = atomicState.codeRefresh
+    if (!r || r.index == null || (r.index as int) < 0 || codeRefreshStalled(r)) return false
+    int index = r.index as int
+    return index < r.lockIds.size() && r.lockIds[index] == "${lockId}"
+}
+
+// Drop tracking the lock disagrees with: another booking's ORB<id> in the slot, another
+// name unless a setCode is pending there, or a delete the lock shows done (slot empty).
+// Clears stale tracking left by earlier versions, which never removed an entry on delete.
+// Confirmed entries of empty slots are kept: lockCodes can be partial, and the slot is
+// then reused for the booking. Skipped when the lock reports no codes or is being read.
+void helperPruneAssignments(def lockId, Map codes) {
+    if (!codes || codeRefreshReading(lockId)) return
+    Map assignments = atomicState.codeAssignments ?: [:]
+    String lockKey = "${lockId}"
+    Map lockAssignments = assignments[lockKey]
+    if (!lockAssignments) return
+    List drop = lockAssignments.findAll { pos, a ->
+        String v = helperTrackedVerdict(a, codes[pos] ?: codes["${pos}"], pos)
+        return v == 'otherBooking' || (v == 'empty' && a.deleting) || (v == 'otherName' && !helperPendingSet(a))
+    }.collect { it.key.toString() }
+    if (!drop) return
+    drop.each { lockAssignments.remove(it) }
+    assignments[lockKey] = lockAssignments
+    atomicState.codeAssignments = assignments
+    log.debug "helperPruneAssignments: lock ${lockId}: dropped ${drop.size()} slot assignments"
+}
+
+// Why the Previous prefix setting is ignored, or null when it is usable or unset
+String previousPrefixProblem() {
+    String prev = (settings?.previousCodeNamePrefix ?: '').toString().trim()
+    String prefix = codeNamePrefix ?: ''
+    if (!prev) return null
+    if (!prefix) return 'it is ignored while Prefix for code name is empty'
+    if (prev == prefix) return 'it is the same as Prefix for code name'
+    if (prefix.startsWith(prev)) return 'it is the start of Prefix for code name'
+    if (prev.length() < 2 || !prev.contains(':')) return 'it must be at least 2 characters and contain a colon (:), e.g. <code>GT:</code>'
+    if (prev.toUpperCase().startsWith('SB')) return 'names starting with SB belong to SignalBricks Telemetry'
+    return null
+}
+
+// The previous prefix matched by name, or '' when unset or refused
+String previousPrefixInUse() {
+    return previousPrefixProblem() ? '' : (settings?.previousCodeNamePrefix ?: '').toString().trim()
 }
 
 // Find all unused code positions
