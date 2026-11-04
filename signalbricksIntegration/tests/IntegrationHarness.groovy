@@ -43,6 +43,7 @@ abstract class HubitatStub extends Script {
     void unsubscribe() {}
     def parseJson(String s) { new JsonSlurper().parseText(s) }
     String createAccessToken() { 'tok-fake' }
+    long now() { System.currentTimeMillis() }
 }
 
 class FakeLock {
@@ -241,10 +242,45 @@ app.settings = [:]
 app.codeNamePrefix = 'GT:'
 r = prefixRun(upgraded, ['7': stale], [:])
 check('U1/U2: stale tracking never deletes another app\'s or a named code', r.deletes.isEmpty())
-check('U1/U2: and the stale entries are pruned, as is the empty slot\'s', assigned('31') == null && assigned('32') == null && assigned('34') == null)
+check('U1/U2: and their stale entries are pruned', assigned('31') == null && assigned('32') == null)
+check('a confirmed entry of an empty slot is kept (lockCodes can be partial)', assigned('34') != null)
 r = prefixRun(['33': [code: '30000033']], ['7': stale], [:])
 check('U3: a nameless code in a stale tracked slot is still treated as the app\'s (nameless drivers need it)', r.deletes == [33] && assigned('33') != null)
 app.codeNamePrefix = 'G:'
+
+// P1: a partial or empty lockCodes report must not lose a nameless current code
+app.codeNamePrefix = 'G:'
+r = prefixRun(nameless51, tracked51, booking77())
+check('P1: nameless current code in its tracked slot: nothing to do', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun([:], app.atomicState.codeAssignments, booking77())
+check('P1: lock reports no codes: tracking kept, the booking is written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+r = prefixRun(['40': [name: 'Front desk', code: '10000040']], app.atomicState.codeAssignments, booking77())
+check('P1: partial lockCodes without the slot: tracking kept, no second slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+r = prefixRun(nameless51, app.atomicState.codeAssignments, [:])
+check('P1: the code reappears and is deleted at checkout', r.deletes == [51] && r.sets.isEmpty())
+// While a door code refresh reads the lock, nothing is pruned
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
+app.atomicState.codeRefresh = [runId: 1L, lockIds: ['7'], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0]
+app.helperPruneAssignments('7', ['40': [name: 'Front desk', code: '10000040']])
+check('refresh reading the lock: a deleting entry of an empty slot is not pruned yet', assigned('51')?.deleting == true)
+app.atomicState.codeRefresh = null
+app.helperPruneAssignments('7', ['40': [name: 'Front desk', code: '10000040']])
+check('after the refresh: it is pruned', assigned('51') == null)
+
+// Placeholder names: only a driver placeholder naming the slot's own number counts as no name
+def verdict = { String name, def pos -> app.helperTrackedVerdict([bookingId: 'ORB77'], name == null ? [code: '1'] : [name: name, code: '1'], pos) }
+check('placeholder: "User 51" in slot 51 is claimed', verdict('User 51', '51') == 'claim')
+check('placeholder: "Code #51", "code 51", "Slot no. 51", "Lock Code 51" in slot 51 are claimed', ['Code #51', 'code 51', 'Slot no. 51', 'Lock Code 51'].every { verdict(it, 51) == 'claim' })
+check('placeholder: no name or a blank name is claimed', verdict(null, '51') == 'claim' && verdict('  ', '51') == 'claim')
+check('placeholder: "Code 12" in slot 51 is another name', verdict('Code 12', '51') == 'otherName')
+check('placeholder: "Code" and "CODE#" are other names', verdict('Code', '51') == 'otherName' && verdict('CODE#', '51') == 'otherName')
+check('placeholder: "Cleaner code" and "SBA: Front door code" are never claimed', verdict('Cleaner code', '51') == 'otherName' && verdict('SBA: Front door code', '51') == 'otherName')
+// A hand-set "Code #1" in a slot the app never assigned is never touched
+Map userCode1 = ['1': [name: 'Code #1', code: '30000001']]
+r = prefixRun(userCode1 + named52, ['7': ['52': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]], [:])
+check('untracked "Code #1" in slot 1: never claimed or deleted', r.deletes == [52] && !r.deletes.contains(1))
+r = prefixRun(userCode1, [:], booking77())
+check('untracked "Code #1" in slot 1: not counted as the booking\'s code', r.sets.size() == 1 && r.sets[0].codePosition == 50)
 
 // A dangerous previous prefix is ignored and the page says why
 def prevRefused = { String prefix, String prev ->
@@ -279,7 +315,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

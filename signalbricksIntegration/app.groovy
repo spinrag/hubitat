@@ -39,7 +39,7 @@ preferences {
             paragraph 'Syncs OwnerRez booking door codes from the SignalBricks dispatcher to the locks selected below. ' +
                 'Each code is named <code>&lt;prefix&gt;ORB&lt;booking id&gt;-&lt;guest&gt;</code> and is on the lock from before check-in to after checkout. ' +
                 'It manages codes named with its prefix (or its previous prefix, after a change) + <code>ORB&lt;booking id&gt;</code>, and any slot it assigned earlier ' +
-                '(by position, while the lock shows no name there, a placeholder such as <code>Code 54</code>, or the same <code>ORB&lt;booking id&gt;</code>). ' +
+                '(by position, while the lock shows no name there, a driver placeholder with that slot\'s own number such as <code>Code 54</code> or <code>User #54</code> in slot 54, or the same <code>ORB&lt;booking id&gt;</code>). ' +
                 'It writes new codes only into empty slots from the minimum code position up. ' +
                 'Do not run Hubitat Lock Code Manager on the same locks.'
             paragraph 'Runs alongside the OwnerRez app. Give the two apps <b>different, non-empty</b> code name prefixes, neither the start of the other ' +
@@ -984,12 +984,22 @@ void reconcileDoorCodes(Map bookings) {
                     // slot >= minCodePosition, availableCodePositions is exhausted and
                     // returns null -> casting to int throws (GroovyCastException) and
                     // aborts the whole reconcile. Guard it: warn and skip this booking.
-                    def nextPosition = availableCodePositions[index]
-                    if (nextPosition == null) {
-                        log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
-                        return // continue to next booking
+                    // A slot this app tracks for the booking that the lock reports empty (gone, or
+                    // missing from a partial lockCodes report) is reused: never a second slot
+                    def nextPosition
+                    Integer ownPos = helperTrackedEmptySlot(lock.id, bookingId, lockCodes)
+                    int at = ownPos != null ? availableCodePositions.indexOf(ownPos) : -1
+                    if (at >= index) {
+                        availableCodePositions.remove(at)
+                        nextPosition = ownPos
+                    } else {
+                        nextPosition = availableCodePositions[index]
+                        if (nextPosition == null) {
+                            log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
+                            return // continue to next booking
+                        }
+                        index++
                     }
-                    index++
                     int codePosition = nextPosition
 
                     log.debug "reconcileDoorCodes: trySetCode ${helperLogBooking(booking)}"
@@ -1855,7 +1865,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
         lockAssignments.each { pos, assignment ->
             if (!assignment.bookingId) return
             def bMatcher = (assignment.bookingId =~ /(\d+)/)
-            if (bMatcher.find() && helperTrackedVerdict(assignment, codes[pos] ?: codes["${pos}"]) == 'claim') trackedPos[bMatcher.group(1)] = "${pos}"
+            if (bMatcher.find() && helperTrackedVerdict(assignment, codes[pos] ?: codes["${pos}"], pos) == 'claim') trackedPos[bMatcher.group(1)] = "${pos}"
         }
     }
 
@@ -1888,7 +1898,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
         // Only when the lock agrees: a code with no name (drivers that drop names) or
         // the same ORB<id>. Don't compare code values — some drivers redact codes as ********
         def lockCode = codes[pos] ?: codes["${pos}"]
-        if (helperTrackedVerdict(assignment, lockCode) == 'claim') {
+        if (helperTrackedVerdict(assignment, lockCode, pos) == 'claim') {
             lockCode.key = pos
             lockCode.bookingId = bId
             lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
@@ -1900,12 +1910,16 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     return result
 }
 
-// What the lock shows in a tracked slot: 'empty', 'claim' (no name, a driver's
-// placeholder such as "Code 54" or "code #54", or the same ORB<id>), 'otherBooking'
-// (another ORB<id>) or 'otherName' (any other name)
-String helperTrackedVerdict(Map assignment, def lockCode) {
+// What the lock shows in a slot this app tracks: 'empty', 'claim' (no name, a driver
+// placeholder naming this slot's number such as "Code 54" or "User #54" in slot 54, or
+// the same ORB<id>), 'otherBooking' (another ORB<id>) or 'otherName' (any other name).
+// Only ever applied to tracked slots: a "Code #1" in a slot the app never assigned is untouched.
+String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     if (!lockCode) return 'empty'
-    if (!lockCode.name || lockCode.name.toString() ==~ /(?i)\s*code\s*#?\s*\d*\s*/) return 'claim'
+    String name = lockCode.name?.toString()
+    if (!name || !name.trim()) return 'claim'
+    def p = (name =~ /(?i)^\s*(?:(?:user\s*)?code|user|slot|pin|position|lock\s*code)?\s*(?:#|no\.?)?\s*(\d+)\s*$/)
+    if (p.find() && pos.toString().trim().isInteger() && p.group(1).toInteger() == pos.toString().trim().toInteger()) return 'claim'
     def nMatcher = (lockCode.name =~ /ORB(\d+)/)
     if (!nMatcher.find()) return 'otherName'
     def bMatcher = ("${assignment.bookingId ?: ''}" =~ /(\d+)/)
@@ -1917,17 +1931,37 @@ boolean helperPendingSet(Map assignment) {
     return assignment.confirmed == false && !assignment.deleting
 }
 
-// Drop tracking the lock disagrees with: another booking's ORB<id> in the slot, or, unless
-// a setCode is pending there, another name or an empty slot. Clears stale tracking left by
-// earlier versions, which never removed an entry on delete.
+// The slot this app tracks for a booking that the lock reports empty, or null
+Integer helperTrackedEmptySlot(def lockId, def bookingId, Map codes) {
+    Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
+    def hit = lockAssignments.find { pos, a ->
+        !a.deleting && (a.bookingId ?: '').toString().find(/\d+/) == bookingId.toString() && !codes[pos] && !codes["${pos}"] && pos.toString().isInteger()
+    }
+    return hit ? hit.key.toString().toInteger() : null
+}
+
+// True while a door code refresh is reading this lock (its lockCodes may be partial)
+boolean codeRefreshReading(def lockId) {
+    Map r = atomicState.codeRefresh
+    if (!r || r.index == null || (r.index as int) < 0 || codeRefreshStalled(r)) return false
+    int index = r.index as int
+    return index < r.lockIds.size() && r.lockIds[index] == "${lockId}"
+}
+
+// Drop tracking the lock disagrees with: another booking's ORB<id> in the slot, another
+// name unless a setCode is pending there, or a delete the lock shows done (slot empty).
+// Clears stale tracking left by earlier versions, which never removed an entry on delete.
+// Confirmed entries of empty slots are kept: lockCodes can be partial, and the slot is
+// then reused for the booking. Skipped when the lock reports no codes or is being read.
 void helperPruneAssignments(def lockId, Map codes) {
+    if (!codes || codeRefreshReading(lockId)) return
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${lockId}"
     Map lockAssignments = assignments[lockKey]
     if (!lockAssignments) return
     List drop = lockAssignments.findAll { pos, a ->
-        String v = helperTrackedVerdict(a, codes[pos] ?: codes["${pos}"])
-        return v == 'otherBooking' || (!helperPendingSet(a) && (v == 'empty' || v == 'otherName'))
+        String v = helperTrackedVerdict(a, codes[pos] ?: codes["${pos}"], pos)
+        return v == 'otherBooking' || (v == 'empty' && a.deleting) || (v == 'otherName' && !helperPendingSet(a))
     }.collect { it.key.toString() }
     if (!drop) return
     drop.each { lockAssignments.remove(it) }
