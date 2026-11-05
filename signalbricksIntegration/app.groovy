@@ -785,7 +785,7 @@ void codeRefreshOnLockCodes(e) {
     if (!r || (r.index as int) < 0) return
     int index = r.index as int
     if (index >= r.lockIds.size() || r.lockIds[index] != e.deviceId?.toString()) return
-    codeRefreshAnswered(r)
+    codeRefreshAnswered()
     // Some drivers send lockCodes while still walking the slots; ignore early ones
     if (now() - (r.stepAt as long) < (r.floorSec as long) * 1000L) return
 
@@ -807,13 +807,15 @@ void codeRefreshTimeout(Map data) {
 void codeRefreshAdvance(Map data) {
     Map r = atomicState.codeRefresh
     if (!codeRefreshIsCurrent(r, data, data?.index as int)) return
-    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true)
+    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true, r.stepAt as long)
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
 }
 
 // The lock being read sent lockCodes or codeChanged during this step
-void codeRefreshAnswered(Map r) {
-    if (r.answered) return
+void codeRefreshAnswered() {
+    // Re-read so only the flag is set on the current step, never an older copy written back
+    Map r = atomicState.codeRefresh
+    if (!r || r.answered) return
     r.answered = true
     atomicState.codeRefresh = r
 }
@@ -822,9 +824,20 @@ void codeRefreshAnswered(Map r) {
 // reported no codes: reconcile writes to a lock with an empty lockCodes only after such a
 // read (#55). A lock that never answered stays unmarked. Reconcile is run again for locks
 // whose writes it deferred.
-void codeRefreshLockDone(String lockId, boolean answered) {
+void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
     def lock = locks?.find { lock -> lock.id.toString() == lockId }
     if (!lock) return
+    // An empty lock re-reporting {} sends no event (the value is unchanged), but the lock
+    // still talked to the hub during the step; an offline lock shows no such activity
+    if (!answered) {
+        try {
+            def last = lock.getLastActivity()
+            long at = last instanceof Date ? last.time : (last instanceof Number ? last.longValue() : 0L)
+            answered = at >= stepAt
+        } catch (e) {
+            log.debug "codeRefreshLockDone: lock ${lockId} last activity not available (${e.class.simpleName})"
+        }
+    }
     def raw = lock.currentValue('lockCodes', true)
     List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
     // Unreadable lockCodes (e.g. encrypted) must not stop the refresh
@@ -1299,7 +1312,7 @@ void lockCodesHandler(e) {
 }
 
 void codeChangedHandler(e) {
-    if (codeRefreshReading(e.device?.id)) codeRefreshAnswered(atomicState.codeRefresh)
+    if (codeRefreshReading(e.device?.id)) codeRefreshAnswered()
     // Verify our tracked assignments against what the lock confirmed
     try {
         Map data = e.data ? parseJson(e.data) : null

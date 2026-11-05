@@ -55,6 +55,8 @@ class FakeLock {
     List setCalls = []
     void setCode(def pos, def code, def name) { setCalls << pos }
     int getCodesCalls = 0
+    def lastActivity
+    def getLastActivity() { lastActivity }
     void getCodes() { getCodesCalls++ }
 }
 
@@ -375,6 +377,42 @@ check('#55 read timed out with no answer: not marked read-empty', app.atomicStat
 app.codeRefreshNext([runId: run55.runId, index: 0])
 app.codeChangedHandler(codeEvent('changed', 60))
 check('#55 a codeChanged from the lock being read counts as an answer', app.atomicState.codeRefresh.answered == true)
+// A truly empty lock re-reports {} without an event, but it talked to the hub during the step
+app.atomicState.codeRefresh = null
+lock.lastActivity = new Date(System.currentTimeMillis() - 3600_000L)
+r = prefixRun([:], [:], booking77on(['7']))
+app.atomicState.codeAutoReadAt = [:]
+app.atomicState.codeRefresh = null
+app.codeAutoRead(['7'])
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('#55 timeout, no events, last activity before the step (offline): not marked', app.atomicState.lockCodesReadEmpty == [])
+app.codeRefreshNext([runId: run55.runId, index: 0])
+lock.lastActivity = new Date(System.currentTimeMillis() + 1000)
+app.atomicState.codeWritesDeferred = ['7': 1]
+app.scheduled.clear()
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('#55 timeout, no events, activity after the step started: marked, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && reconciles())
+app.atomicState.codeRefresh = null
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 empty lock that only showed activity: the write lands', setsOn('7') == [50])
+lock.lastActivity = System.currentTimeMillis() + 1000
+app.atomicState.lockCodesReadEmpty = []
+reading('7')
+app.codeRefreshTimeout([runId: 5L, index: 0])
+check('#55 last activity as a number also counts', app.atomicState.lockCodesReadEmpty == ['7'])
+lock.lastActivity = null
+app.atomicState.lockCodesReadEmpty = []
+reset55()
+r = prefixRun([:], [:], booking77on(['7']))
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+// codeRefreshAnswered sets only the flag on the current step
+app.atomicState.codeRefresh = app.atomicState.codeRefresh + [index: 0, stepAt: 42L]
+app.codeRefreshAnswered()
+check('#55 answered flag set without rewriting the step', app.atomicState.codeRefresh.answered == true && app.atomicState.codeRefresh.stepAt == 42L)
+app.atomicState.codeRefresh = null
 
 // A driver that never fills in lockCodes: auto reads at most once per 6 h
 reset55()
