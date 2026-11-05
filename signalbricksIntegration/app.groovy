@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.10' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.11' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -172,11 +172,9 @@ Map bookingsView() {
         Map l = [name: bookingsEsc(lock.label ?: lock.name), codes: null, problem: 'no codes reported']
         def raw = lock.currentValue('lockCodes', true)
         if (raw) {
-            try {
-                l.codes = helperOnlySbCodes(parseJson(raw), lock.id, true)
-            } catch (e) {
-                l.problem = 'codes unreadable'
-            }
+            Map lockCodes = helperParseLockCodes(raw)
+            if (lockCodes == null) l.problem = 'codes unreadable'
+            else l.codes = helperOnlySbCodes(lockCodes, lock.id, true)
         }
         onLock[lock.id.toString()] = l
     }
@@ -353,6 +351,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeAssignments = [:]
             atomicState.lockCodesReadEmpty = []
             atomicState.codeWritesDeferred = [:]
+            atomicState.lockCodesUnreadable = []
             atomicState.codeAutoReadAt = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
@@ -840,8 +839,9 @@ void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
     }
     def raw = lock.currentValue('lockCodes', true)
     List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
-    // Unreadable lockCodes (e.g. encrypted) must not stop the refresh
-    try { if (answered && raw && !parseJson(raw)) readEmpty << lockId } catch (e) { log.debug "codeRefreshLockDone: lock ${lockId} lockCodes not readable (${e.class.simpleName})" }
+    // Unreadable lockCodes (null) is not empty: the lock stays unmarked (#57)
+    Map lockCodes = helperParseLockCodes(raw)
+    if (answered && raw && lockCodes != null && lockCodes.isEmpty()) readEmpty << lockId
     atomicState.lockCodesReadEmpty = readEmpty
     Map deferred = atomicState.codeWritesDeferred ?: [:]
     if (deferred.containsKey(lockId)) {
@@ -962,6 +962,10 @@ List codeRefreshStatus() {
         def lock = locks?.find { lock -> lock.id.toString() == lockId }
         lines << "<b>Waiting:</b> ${lock ? (lock.label ?: lock.name) : "lock ${lockId}"}: ${n} code(s) waiting for a door code read"
     }
+    (atomicState.lockCodesUnreadable ?: []).each { lockId ->
+        def lock = locks?.find { lock -> lock.id.toString() == lockId }
+        lines << "<b>Waiting:</b> ${lock ? (lock.label ?: lock.name) : "lock ${lockId}"}: its lockCodes can't be read (not even with decrypt), so its codes are not reconciled"
+    }
     return lines
 }
 
@@ -1002,6 +1006,8 @@ void reconcileDoorCodes(Map bookings) {
     int deferred = 0
     Map deferredLocks = [:]
     List unreadLocks = []
+    // Locks whose lockCodes can't be read even with decrypt(): skipped (#57)
+    List unreadable = []
 
     // Iterate through all locks
     locks.each { lock ->
@@ -1020,8 +1026,14 @@ void reconcileDoorCodes(Map bookings) {
         log.trace "reconcileDoorCodes: current lock bookings ${helperLogBookings(currentLockBookings)}"
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
-        def lockCodesRaw = lock.currentValue('lockCodes', true)
-        Map lockCodes = lockCodesRaw ? parseJson(lockCodesRaw) : [:]
+        // An encrypted lockCodes is read through decrypt(); one that still can't be read
+        // skips this lock only (no writes, deletes or read-empty mark), others carry on (#57)
+        Map lockCodes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+        if (lockCodes == null) {
+            log.warn "reconcileDoorCodes: lock ${lock.id} lockCodes unreadable, skipped"
+            unreadable << "${lock.id}".toString()
+            return
+        }
         helperPruneAssignments(lock.id, lockCodes)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
         log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
@@ -1144,6 +1156,7 @@ void reconcileDoorCodes(Map bookings) {
     }
 
     atomicState.codeWritesDeferred = deferredLocks
+    atomicState.lockCodesUnreadable = unreadable
     if (i == 0 && deferred == 0) {
         log.debug 'reconcileDoorCodes: No codes to reconcile'
         atomicState.reconcileRetries = 0
@@ -1570,9 +1583,13 @@ Map apiGetDevice() {
         ]}.collect { attr ->
             switch (attr.dataType) {
                 case 'JSON_OBJECT':
-                    if (attr.currentValue) {
-                        attr.currentValue = parseJson(attr.currentValue)
-                        if (attr.name == 'lockCodes' && minCodePosition > 0) {
+                    if (attr.currentValue && attr.name == 'lockCodes') {
+                        // Plain JSON only: an encrypted lockCodes is never decrypted here
+                        // nor passed through raw, it comes back as null (#57)
+                        def plain = null
+                        try { plain = parseJson(attr.currentValue.toString()) } catch (Exception notJson) { }
+                        attr.currentValue = plain instanceof Map ? plain : null
+                        if (attr.currentValue && minCodePosition > 0) {
                             log.debug('Redact Lock Codes')
                             attr.currentValue.each { key, code ->
                                 if (key.toInteger() < minCodePosition) {
@@ -1580,6 +1597,8 @@ Map apiGetDevice() {
                                 }
                             }
                         }
+                    } else if (attr.currentValue) {
+                        attr.currentValue = parseJson(attr.currentValue)
                     } else {
                         attr.currentValue = null
                     }
@@ -1879,6 +1898,24 @@ Map helperGetBookings(Map bookings) {
     }
 }
 
+// A lock's lockCodes attribute as a Map: plain JSON, or else encrypted by the driver
+// (encrypt(JSON)) and read through decrypt(). [:] when empty, null when unreadable.
+// Never log the raw or decrypted value, or an exception message that could hold it (#57).
+Map helperParseLockCodes(def raw) {
+    if (!raw) return [:]
+    def parsed = null
+    try { parsed = parseJson(raw.toString()) } catch (Exception notJson) { }
+    if (parsed instanceof Map) return parsed
+    // Not a JSON object (parseJson threw, or gave null, a Boolean or a number)
+    try {
+        String plain = decrypt(raw.toString())
+        parsed = plain ? parseJson(plain) : null
+    } catch (Exception notDecryptable) {
+        parsed = null
+    }
+    return parsed instanceof Map ? parsed : null
+}
+
 // Check for duplicate code
 boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) {
     log.debug "helperHasDuplicateCode ${lockId} ${helperLogBooking(booking)}"
@@ -1889,13 +1926,16 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
         return false
     }
 
-    String lockCodesJson = lock.currentValue('lockCodes', true);
-
-    if (!lockCodesJson) {
+    // An unreadable lockCodes (encrypted, and decrypt() can't read it) is "can't tell",
+    // like an empty one: no 409; reconcile skips that lock (#57)
+    Map lockCodes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+    if (lockCodes == null) {
+        log.warn "helperHasDuplicateCode: lock ${lockId} lockCodes unreadable, not checked"
         return false
     }
-
-    Map lockCodes = parseJson(lockCodesJson)
+    if (!lockCodes) {
+        return false
+    }
 
     String codeName = helperGetCodeName(booking)
 
