@@ -253,7 +253,11 @@ app.codeNamePrefix = 'G:'
 r = prefixRun(nameless51, tracked51, booking77())
 check('P1: nameless current code in its tracked slot: nothing to do', r.sets.isEmpty() && r.deletes.isEmpty())
 r = prefixRun([:], app.atomicState.codeAssignments, booking77())
-check('P1: lock reports no codes: tracking kept, the booking is written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+check('P1: lock reports no codes, not read empty: tracking kept, the write is deferred (#55)', assigned('51')?.confirmed == true && r.sets.isEmpty())
+app.atomicState.lockCodesReadEmpty = ['7']
+r = prefixRun([:], app.atomicState.codeAssignments, booking77())
+check('P1: lock read empty by a refresh: the booking is written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+app.atomicState.lockCodesReadEmpty = []
 r = prefixRun(['40': [name: 'Front desk', code: '10000040']], app.atomicState.codeAssignments, booking77())
 check('P1: partial lockCodes without the slot: tracking kept, no second slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
 r = prefixRun(nameless51, app.atomicState.codeAssignments, [:])
@@ -266,6 +270,93 @@ check('refresh reading the lock: a deleting entry of an empty slot is not pruned
 app.atomicState.codeRefresh = null
 app.helperPruneAssignments('7', ['40': [name: 'Front desk', code: '10000040']])
 check('after the refresh: it is pruned', assigned('51') == null)
+
+// --- #55: no writes while a lock's codes are unread or being read ---
+// Fake booking ids, guests and codes only.
+def lock8 = new FakeLock(id: '8', name: 'Back', label: 'Back')
+lock8.attrs.lockCodes = JsonOutput.toJson(['40': [name: 'Front desk', code: '10000040']])
+lock8.attrs.maxCodes = 60
+app.locks = [lock, lock8]
+app.atomicState.lockCodesReadEmpty = []
+app.atomicState.reconcileRetries = 0
+Map pastOwn = ['53': [name: 'G:ORB66-Jo', code: '20000066']]
+Map frontDesk = ['40': [name: 'Front desk', code: '10000040']]
+def booking77on = { List lockIds -> booking77().collectEntries { k, b -> [(k): b + [lockId: lockIds]] } }
+def setsOn = { String lockId -> app.scheduled.findAll { it.handler == 'trySetCode' && "${it.data.lockId}" == lockId }.collect { it.data.codePosition } }
+def deferLog = { String lockId -> app.logged.find { it.toString().startsWith("reconcileDoorCodes: lock ${lockId} ") && it.toString().contains('deferring') }?.toString() }
+def reading = { String lockId -> app.atomicState.codeRefresh = [runId: 5L, lockIds: [lockId], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0] }
+
+// Being read by a refresh: a partial list must not decide which slot is free
+reading('7')
+app.logged.clear()
+r = prefixRun(frontDesk + pastOwn, [:], booking77on(['7', '8']))
+check('#55 being read: no new code written to that lock', setsOn('7').isEmpty())
+check('#55 being read: deletes on that lock still happen', r.deletes == [53])
+check('#55 being read: other locks keep working', setsOn('8') == [50])
+check('#55 being read: log names the lock and counts the deferred writes', deferLog('7') == 'reconcileDoorCodes: lock 7 (Front) is being read by a door code refresh, deferring 1 code writes')
+check('#55 being read: a retry reconcile is scheduled', r.jobs.any { it.handler == 'reconcileDoorCodes' } && app.atomicState.codeWritesDeferred == ['7'])
+r = prefixRun(frontDesk + ourCode, tracked51, booking77(code: '20000078'))
+check('#55 being read: a changed code is not rewritten either', setsOn('7').isEmpty())
+
+// The refresh reads the lock: it is reconciled again shortly after
+lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
+app.atomicState.codeWritesDeferred = ['7']
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#55 read finished: the deferred lock is reconciled again', app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 } && app.atomicState.codeWritesDeferred == [])
+check('#55 read finished with codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
+app.atomicState.codeRefresh = null
+r = prefixRun(frontDesk, [:], booking77on(['7']))
+check('#55 after the read: the write proceeds', setsOn('7') == [50])
+
+// Empty before any read (driver change, re-pair, never reported)
+app.logged.clear()
+r = prefixRun([:], [:], booking77on(['7', '8']))
+check('#55 empty, not read: write deferred', setsOn('7').isEmpty() && deferLog('7')?.contains('has not reported its codes'))
+check('#55 empty, not read: other locks keep working', setsOn('8') == [50])
+check('#55 empty, not read: retried later', r.jobs.any { it.handler == 'reconcileDoorCodes' && it.secs } && app.atomicState.reconcileRetries > 0)
+lock.attrs.remove('lockCodes')
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#55 no lockCodes at all: write deferred, retried', setsOn('7').isEmpty() && app.scheduled.any { it.handler == 'reconcileDoorCodes' })
+
+// Read and empty: a refresh read the lock and it holds no codes at all
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeWritesDeferred = ['7']
+reading('7')
+app.scheduled.clear()
+app.codeRefreshTimeout([runId: 5L, index: 0])
+check('#55 read and empty (refresh step ended): marked read-empty, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && app.scheduled.any { it.handler == 'reconcileDoorCodes' })
+lock.attrs.lockCodes = 'not json'
+reading('7')
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#55 unreadable lockCodes at the end of a read: the refresh still moves on, read-empty dropped', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
+app.atomicState.lockCodesReadEmpty = ['7']
+app.atomicState.codeRefresh = null
+app.logged.clear()
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 read and empty: the write proceeds', setsOn('7') == [50] && deferLog('7') == null)
+r = prefixRun(ourCode, tracked51, [:])
+check('#55 read and empty: its own codes coming and going keep it read-empty', app.atomicState.lockCodesReadEmpty == ['7'])
+r = prefixRun(frontDesk, [:], [:])
+check('#55 the lock later reports another code: read-empty is dropped', app.atomicState.lockCodesReadEmpty == [])
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 empty again after that (driver change): deferred until read again', setsOn('7').isEmpty())
+
+// Retries stop at the cap, then a later read still brings the lock back
+app.atomicState.reconcileRetries = 20
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 deferred past the retry cap: retry loop stops', !r.jobs.any { it.handler == 'reconcileDoorCodes' && it.secs } && app.atomicState.codeWritesDeferred == ['7'])
+reading('7')
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#55 past the cap: the next read of the lock reconciles it', app.scheduled.any { it.handler == 'reconcileDoorCodes' })
+app.atomicState.codeRefresh = null
+app.atomicState.lockCodesReadEmpty = []
+app.atomicState.codeWritesDeferred = []
+app.atomicState.reconcileRetries = 0
+app.locks = [lock]
 
 // Placeholder names: only a driver placeholder naming the slot's own number counts as no name
 def verdict = { String name, def pos -> app.helperTrackedVerdict([bookingId: 'ORB77'], name == null ? [code: '1'] : [name: name, code: '1'], pos) }
@@ -315,7 +406,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

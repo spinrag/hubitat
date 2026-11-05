@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.9' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.10' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -351,6 +351,8 @@ void appButtonHandler(String btnName) {
             state.lastVersion = sbAppVersion
             atomicState.bookings = [:]
             atomicState.codeAssignments = [:]
+            atomicState.lockCodesReadEmpty = []
+            atomicState.codeWritesDeferred = []
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
             atomicState.lastSync = null
@@ -801,7 +803,26 @@ void codeRefreshTimeout(Map data) {
 void codeRefreshAdvance(Map data) {
     Map r = atomicState.codeRefresh
     if (!codeRefreshIsCurrent(r, data, data?.index as int)) return
+    codeRefreshLockDone(r.lockIds[data.index as int])
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
+}
+
+// A read of this lock ended (settled or out of time). Remember whether it reported no
+// codes: reconcile writes to a lock with an empty lockCodes only after such a read (#55).
+// Reconcile is run again for locks whose writes it deferred.
+void codeRefreshLockDone(String lockId) {
+    def lock = locks?.find { lock -> lock.id.toString() == lockId }
+    if (!lock) return
+    def raw = lock.currentValue('lockCodes', true)
+    List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
+    // Unreadable lockCodes (e.g. encrypted) must not stop the refresh
+    try { if (raw && !parseJson(raw)) readEmpty << lockId } catch (e) { log.debug "codeRefreshLockDone: lock ${lockId} lockCodes not readable (${e.class.simpleName})" }
+    atomicState.lockCodesReadEmpty = readEmpty
+    List deferred = atomicState.codeWritesDeferred ?: []
+    if (deferred.contains(lockId)) {
+        atomicState.codeWritesDeferred = deferred.findAll { it != lockId }
+        runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+    }
 }
 
 // unschedule() removed the running refresh's timer; put it back
@@ -920,6 +941,9 @@ void reconcileDoorCodes(Map bookings) {
     Map currentBookings = helperFindCurrentBookings(bookings)
 
     int i = 0
+    // Writes held back on locks whose codes are unread or being read (#55)
+    int deferred = 0
+    List deferredLocks = []
 
     // Iterate through all locks
     locks.each { lock ->
@@ -939,16 +963,21 @@ void reconcileDoorCodes(Map bookings) {
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
         def lockCodesRaw = lock.currentValue('lockCodes', true)
-
-        if (!lockCodesRaw) {
-            log.debug "reconcileDoorCodes: No lock codes"
-            return
-        }
-
-        Map lockCodes = parseJson(lockCodesRaw)
+        Map lockCodes = lockCodesRaw ? parseJson(lockCodesRaw) : [:]
         helperPruneAssignments(lock.id, lockCodes)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
         log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
+
+        // A free slot is only known to be free from a complete code list. An empty list
+        // (never reported, or reset by a driver change or re-pair) is trusted only after a
+        // door code refresh read the lock as empty; a list sent during a refresh can be partial.
+        String lockKey = "${lock.id}"
+        List readEmpty = atomicState.lockCodesReadEmpty ?: []
+        if (lockCodes.size() > sbCodes.size() && readEmpty.contains(lockKey)) {
+            atomicState.lockCodesReadEmpty = readEmpty.findAll { it != lockKey }
+        }
+        String holdWrites = codeRefreshReading(lock.id) ? 'is being read by a door code refresh'
+            : (!lockCodes && !readEmpty.contains(lockKey) ? 'has not reported its codes (run a door code refresh on it)' : null)
 
         // Remove all codes that are not in the current bookings
         sbCodes.each { bookingId, lockCode ->
@@ -969,8 +998,14 @@ void reconcileDoorCodes(Map bookings) {
             }
         }
 
+        int toWrite = holdWrites ? currentLockBookings.count { bookingId, booking -> !sbCodes[bookingId] || sbCodes[bookingId].code != booking.code } : 0
+        if (toWrite) {
+            log.info "reconcileDoorCodes: lock ${lock.id} (${lock.label ?: lock.name}) ${holdWrites}, deferring ${toWrite} code writes"
+            deferred += toWrite
+            deferredLocks << lockKey
+        }
         // Are there any active bookings
-        if (currentLockBookings) {
+        else if (currentLockBookings) {
             // Get all available code positions as each one has a static index
             List availableCodePositions = helperFindCodePositions(lock, lockCodes)
             int index = 0
@@ -1027,7 +1062,8 @@ void reconcileDoorCodes(Map bookings) {
         }
     }
 
-    if (i == 0) {
+    atomicState.codeWritesDeferred = deferredLocks
+    if (i == 0 && deferred == 0) {
         log.debug 'reconcileDoorCodes: No codes to reconcile'
         atomicState.reconcileRetries = 0
         scheduleEvents(bookings)
@@ -1042,7 +1078,7 @@ void reconcileDoorCodes(Map bookings) {
             atomicState.reconcileRetries = 0
             scheduleEvents(bookings)
         } else {
-            log.debug "reconcileDoorCodes: ${i} codes to reconcile (retry ${retries}/${maxRetries})"
+            log.debug "reconcileDoorCodes: ${i} codes to reconcile, ${deferred} deferred (retry ${retries}/${maxRetries})"
             atomicState.reconcileRetries = retries
             runIn(++i * 180, 'reconcileDoorCodes', [ overwrite: true ])
         }
