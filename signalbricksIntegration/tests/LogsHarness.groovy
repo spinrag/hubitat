@@ -270,6 +270,16 @@ String logsForeign = step('lock event: foreign codeChanged in a pending slot') {
 }
 check('lock event: foreign codeChanged drops the tracking, logged without name or code',
     app.atomicState.codeAssignments['1'][evPos] == null && logsForeign.contains("codeChangedHandler: changed at pos ${evPos} on lock 1 is not ") && !logsForeign.contains(FOREIGN_NAME))
+// A retry queued by a failed event, after another code took the slot: skipped, nothing logged but lock and slot
+restore()
+app.scheduled.clear()
+app.codeChangedHandler([name: 'codeChanged', value: 'failed', data: JsonOutput.toJson([codeNumber: evPos as int]), device: [id: '1']])
+Map queued = app.scheduled.find { it.handler == 'trySetCode' }?.data
+app.codeChangedHandler([name: 'codeChanged', value: 'changed', data: JsonOutput.toJson([(evPos): [name: FOREIGN_NAME, code: FOREIGN_CODE]]), device: [id: '1']])
+front.calls.clear()
+String logsSkip = step('queued retry after another code took the slot') { app.trySetCode(queued) }
+check('queued retry after another code took the slot: no setCode, skip logged with lock and slot only',
+    front.calls.isEmpty() && logsSkip.contains("trySetCode: lock 1 pos ${evPos} no longer free for this write, skipped") && !logsSkip.contains(FOREIGN_NAME))
 // Our own name with another code, 3 times in a row: one warn with the lock and slot only
 restore()
 String logsStale = step('lock event: our name with another code, 3 times') {
