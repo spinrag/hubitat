@@ -627,47 +627,94 @@ app.atomicState.codeAssignments = pending51()
 app.codeChangedHandler(encEvent('added', 'undecryptable:Y2M0'))
 check('#57 undecryptable codeChanged: nothing confirmed, no error', assigned('51')?.confirmed == false)
 
-// A set is confirmed only by data that agrees with what the app wrote (#59)
+// A set is confirmed only by data that agrees with what the app wrote (#59). Another name in
+// the slot drops the tracking (their code stays, reconcile places the booking elsewhere);
+// our own name with another code leaves the set pending
 def slotData = { Map entry -> ['51': entry] }
-def confirmsWith = { String value, String data, Map a = null ->
+def outcome = { String value, String data, Map a = null ->
     app.atomicState.codeAssignments = a ? tracked(['51': a]) : pending51()
+    app.scheduled.clear()
     app.codeChangedHandler(encEvent(value, data))
-    return assigned('51')?.confirmed == true
+    Map t = assigned('51')
+    boolean reconcileSoon = app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 }
+    return t == null ? (reconcileSoon ? 'dropped' : 'dropped, no reconcile') : (t.confirmed ? 'confirmed' : (reconcileSoon ? 'pending, reconcile' : 'pending'))
 }
-app.atomicState.codeAssignments = pending51()
+def pendingName = { String name -> [bookingId: 'ORB77', code: '20000077', codeName: name, attempt: 1, confirmed: false] }
+String plumber = JsonOutput.toJson(slotData([name: 'Plumber', code: '30000051']))
 mark()
-app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([name: 'Plumber', code: '30000051']))))
+check('#59 foreign write into a pending slot (slot map): tracking dropped, reconcile in 10 s', outcome('changed', plumber) == 'dropped')
 List foreignLogs = newLogs()
-check('#59 foreign write into a pending slot (slot map): not confirmed, still tracked', assigned('51')?.confirmed == false && assigned('51')?.code == '20000077')
-check('#59 foreign write: logged as not confirmed, without the name or code',
-    foreignLogs.contains("codeChangedHandler: changed at pos 51 on lock 7 doesn't match ORB77, not confirmed") && !foreignLogs.any { it.contains('Plumber') || it.contains('30000051') || it.contains('20000077') })
-check('#59 foreign write (encrypted slot map): not confirmed', !confirmsWith('added', encrypt('enc:ZjEK', slotData([name: 'Plumber', code: '30000051']))))
-check('#59 foreign write (codeNumber with a name): not confirmed', !confirmsWith('added', JsonOutput.toJson([codeNumber: 51, name: 'Plumber'])))
-check('#59 foreign write (encrypted codeNumber with a name): not confirmed', !confirmsWith('changed', encrypt('enc:ZjIK', [codeNumber: 51, name: 'Plumber', code: '30000051'])))
-check('#59 another booking\'s code in the slot: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB88-Di', code: '20000088']))))
-check('#59 our name with another code: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '30000051']))))
-check('#59 a foreign code with no name: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([code: '30000051']))))
-check('#59 matching name and code (codeNumber): confirmed', confirmsWith('added', JsonOutput.toJson([codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])))
-check('#59 matching name and code (encrypted codeNumber): confirmed', confirmsWith('added', encrypt('enc:bTEK', [codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])))
-check('#59 matching name and code (encrypted slot map): confirmed', confirmsWith('changed', encrypt('enc:bTIK', slotData([name: 'G:ORB77-Cy', code: '20000077']))))
-check('#59 codeNumber only: confirmed by slot as before', confirmsWith('added', JsonOutput.toJson([codeNumber: 51])))
-check('#59 slot map with no name or code: confirmed by slot as before', confirmsWith('added', JsonOutput.toJson(slotData([notify: true]))))
-check('#59 matching name, code masked: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '********']))))
-check('#59 matching code, no name (driver drops names): confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([code: '20000077']))))
-check('#59 name truncated by the driver: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77', code: '20000077']))))
-check('#59 name truncated before the booking id: confirmed',
-    confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:Cy-OR'])), [bookingId: 'ORB77', code: '20000077', codeName: 'G:Cy-ORB77', attempt: 1, confirmed: false]))
-check('#59 name with padding: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: ' G:ORB77-Cy ']))))
-check('#59 same booking under another prefix or guest name: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'GT:ORB77-Cyrus']))))
-check('#59 driver placeholder name for the slot: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'Code 51']))))
-check('#59 placeholder for another slot: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'Code 52']))))
+check('#59 foreign write: logged without the name or code',
+    foreignLogs.contains("codeChangedHandler: changed at pos 51 on lock 7 is not ORB77; tracking dropped, reconcile in 10 s") && !foreignLogs.any { it.contains('Plumber') || it.contains('30000051') || it.contains('20000077') })
+check('#59 foreign write (encrypted slot map): dropped', outcome('added', encrypt('enc:ZjEK', slotData([name: 'Plumber', code: '30000051']))) == 'dropped')
+check('#59 foreign write (codeNumber with a name): dropped', outcome('added', JsonOutput.toJson([codeNumber: 51, name: 'Plumber'])) == 'dropped')
+check('#59 foreign write (encrypted codeNumber with a name): dropped', outcome('changed', encrypt('enc:ZjIK', [codeNumber: 51, name: 'Plumber', code: '30000051'])) == 'dropped')
+check('#59 another booking\'s code in the slot: dropped', outcome('changed', JsonOutput.toJson(slotData([name: 'G:ORB88-Di', code: '20000088']))) == 'dropped')
+check('#59 a foreign code with no name: dropped', outcome('changed', JsonOutput.toJson(slotData([code: '30000051']))) == 'dropped')
+check('#59 placeholder for another slot: dropped', outcome('changed', JsonOutput.toJson(slotData([name: 'Code 52']))) == 'dropped')
+check('#59 a confirmed slot taken by another name: dropped too', outcome('changed', plumber, pendingName('G:ORB77-Cy') + [confirmed: true]) == 'dropped')
+check('#59 our name with another code (our own older write): stays pending, no reconcile', outcome('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '30000051']))) == 'pending')
+check('#59 matching name and code (codeNumber): confirmed', outcome('added', JsonOutput.toJson([codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])) == 'confirmed')
+check('#59 matching name and code (encrypted codeNumber): confirmed', outcome('added', encrypt('enc:bTEK', [codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])) == 'confirmed')
+check('#59 matching name and code (encrypted slot map): confirmed', outcome('changed', encrypt('enc:bTIK', slotData([name: 'G:ORB77-Cy', code: '20000077']))) == 'confirmed')
+check('#59 codeNumber only: confirmed by slot as before', outcome('added', JsonOutput.toJson([codeNumber: 51])) == 'confirmed')
+check('#59 slot map with no name or code: confirmed by slot as before', outcome('added', JsonOutput.toJson(slotData([notify: true]))) == 'confirmed')
+check('#59 matching name, code masked: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '********']))) == 'confirmed')
+check('#59 matching code, no name (driver drops names): confirmed', outcome('changed', JsonOutput.toJson(slotData([code: '20000077']))) == 'confirmed')
+check('#59 name truncated after the booking id: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'G:ORB77', code: '20000077']))) == 'confirmed')
+check('#59 name truncated right after ORB: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'GT:ORB'])), pendingName('GT:ORB77-Cy')) == 'confirmed')
+check('#59 guest-first name truncated after ORB: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'G:Cy-ORB'])), pendingName('G:Cy-ORB77')) == 'confirmed')
+['GT:ORB7', 'GT', 'G', 'GT:OR'].each { String n ->
+    check("#59 ${n} against GT:ORB77-Cy (not a whole ORB<id> token): not confirmed, dropped".toString(), outcome('changed', JsonOutput.toJson(slotData([name: n])), pendingName('GT:ORB77-Cy')) == 'dropped')
+}
+check('#59 name with padding: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: ' G:ORB77-Cy ']))) == 'confirmed')
+check('#59 same booking under another prefix or guest name: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'GT:ORB77-Cyrus']))) == 'confirmed')
+check('#59 driver placeholder name for the slot: confirmed', outcome('changed', JsonOutput.toJson(slotData([name: 'Code 51']))) == 'confirmed')
 app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
-app.codeChangedHandler(encEvent('deleted', JsonOutput.toJson(slotData([name: 'Plumber', code: '30000051']))))
+app.codeChangedHandler(encEvent('deleted', plumber))
 check('#59 deleted with other data: tracking cleared as before', assigned('51') == null)
 app.atomicState.codeAssignments = pending51()
 app.scheduled.clear()
 app.codeChangedHandler(encEvent('failed', JsonOutput.toJson(slotData([name: 'Plumber']))))
 check('#59 failed with other data: retried as before', app.scheduled.any { it.handler == 'trySetCode' && it.data.codePosition == 51 })
+
+// The whole path: their code stays, the booking goes to another free slot, no re-send into 51
+[['another name', [name: 'Plumber', code: '30000051']], ['another booking', [name: 'X:ORB88-Di', code: '20000088']], ['a code with no name', [code: '30000051']]].each { String label, Map theirs ->
+    Map withTheirs = ['40': [name: 'Front desk', code: '10000040'], '51': theirs]
+    lock.attrs.lockCodes = JsonOutput.toJson(withTheirs)
+    lock.setCalls.clear()
+    lock.deleted.clear()
+    app.atomicState.codeAssignments = pending51()
+    app.scheduled.clear()
+    app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData(theirs))))
+    app.verifySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1])
+    check("#59 ${label} in a pending slot: tracking dropped, reconcile in 10 s, the pending verify sends nothing".toString(),
+        assigned('51') == null && app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 } && lock.setCalls.isEmpty() && !app.scheduled.any { it.handler in ['trySetCode', 'verifySetCode'] })
+    r = prefixRun(withTheirs, app.atomicState.codeAssignments, booking77())
+    check("#59 ${label} in a pending slot: reconcile writes the booking to another free slot, slot 51 untouched".toString(),
+        r.sets.size() == 1 && r.sets[0].codePosition != 51 && r.sets[0].codePosition >= 50 && r.sets[0].codeName == 'G:ORB77-Cy' && r.deletes.isEmpty())
+}
+
+// Our own name keeps coming back with another code: one warn (lock and slot only) at the 3rd in a row
+app.atomicState.codeAssignments = pending51()
+String staleData = JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '30000051']))
+Map resend = [lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1]
+mark()
+app.codeChangedHandler(encEvent('changed', staleData))
+app.trySetCode(resend)
+app.codeChangedHandler(encEvent('changed', staleData))
+check('#59 two mismatches in a row (across a re-send): no warn yet', !newLogs().any { it.contains('in a row') } && assigned('51')?.mismatches == 2)
+app.trySetCode(resend)
+app.codeChangedHandler(encEvent('changed', staleData))
+List staleLogs = newLogs()
+check('#59 third mismatch in a row: one warn with the lock and slot only',
+    staleLogs.count { it == "codeChangedHandler: lock 7 pos 51: 3 confirmations in a row didn't match the code written; still re-sending" } == 1 && !staleLogs.findAll { it.startsWith('codeChangedHandler') }.any { it.contains('30000051') || it.contains('20000077') || it.contains('G:ORB77-Cy') })
+app.codeChangedHandler(encEvent('changed', staleData))
+check('#59 fourth mismatch: no second warn', newLogs().count { it.contains('in a row') } == 1)
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '20000077']))))
+check('#59 a matching confirmation clears the count', assigned('51')?.confirmed == true && assigned('51')?.mismatches == null)
+app.trySetCode(resend + [code: '20000078'])
+check('#59 a write of another code starts a new count', assigned('51')?.mismatches == null)
 
 // A skipped lock that a read finds readable again is reconciled shortly after
 reset55()

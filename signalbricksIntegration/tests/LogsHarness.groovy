@@ -256,18 +256,28 @@ secrets << EVENT_CIPHER
 def tracked = app.atomicState.codeAssignments['1']
 String evPos = tracked.find { k, v -> !v.deleting }?.key ?: tracked.keySet().first()
 app.ciphers[EVENT_CIPHER] = JsonOutput.toJson([(evPos): [name: 'GT:ORB88-Ann', code: CODES[0]]])
-// Another app or a person writes the pending slot (#59): not confirmed, its name and code never logged
+// Another app or a person writes the pending slot (#59): tracking dropped, their name and code never logged
 String FOREIGN_NAME = 'Plumber-Kx9q'
 String FOREIGN_CODE = '80009922'
 secrets << FOREIGN_NAME << FOREIGN_CODE
 Map pendingAll = app.atomicState.codeAssignments
-pendingAll['1'][evPos].confirmed = false
-app.atomicState.codeAssignments = pendingAll
+Map ourEntry = new JsonSlurper().parseText(JsonOutput.toJson(pendingAll['1'][evPos]))
+ourEntry.confirmed = false
+def restore = { Map all = app.atomicState.codeAssignments; all['1'][evPos] = new JsonSlurper().parseText(JsonOutput.toJson(ourEntry)); app.atomicState.codeAssignments = all }
+restore()
 String logsForeign = step('lock event: foreign codeChanged in a pending slot') {
     app.codeChangedHandler([name: 'codeChanged', value: 'changed', data: JsonOutput.toJson([(evPos): [name: FOREIGN_NAME, code: FOREIGN_CODE]]), device: [id: '1']])
 }
-check('lock event: foreign codeChanged leaves the set pending, logged without name or code',
-    app.atomicState.codeAssignments['1'][evPos].confirmed == false && logsForeign.contains("codeChangedHandler: changed at pos ${evPos} on lock 1 doesn't match ") && !logsForeign.contains(FOREIGN_NAME))
+check('lock event: foreign codeChanged drops the tracking, logged without name or code',
+    app.atomicState.codeAssignments['1'][evPos] == null && logsForeign.contains("codeChangedHandler: changed at pos ${evPos} on lock 1 is not ") && !logsForeign.contains(FOREIGN_NAME))
+// Our own name with another code, 3 times in a row: one warn with the lock and slot only
+restore()
+String logsStale = step('lock event: our name with another code, 3 times') {
+    3.times { app.codeChangedHandler([name: 'codeChanged', value: 'changed', data: JsonOutput.toJson([(evPos): [name: ourEntry.codeName, code: FOREIGN_CODE]]), device: [id: '1']]) }
+}
+check('lock event: 3 mismatches of our name warn once, without name or code',
+    app.atomicState.codeAssignments['1'][evPos].confirmed == false && logsStale.count("warn codeChangedHandler: lock 1 pos ${evPos}: 3 confirmations in a row") == 1 && !logsStale.contains(ourEntry.codeName))
+restore()
 step('lock event: encrypted codeChanged') {
     app.codeChangedHandler([name: 'codeChanged', value: 'added', data: EVENT_CIPHER, device: [id: '1']])
 }

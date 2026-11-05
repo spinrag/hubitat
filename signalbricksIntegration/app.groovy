@@ -1212,6 +1212,9 @@ void trySetCode(Map data) {
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
     if (!assignments[lockKey]) assignments[lockKey] = [:]
+    // Mismatching confirmations carry over a re-send of the same write (#59)
+    Map previous = assignments[lockKey]["${data.codePosition}"]
+    def mismatches = previous?.codeName == data.codeName && previous?.code == data.code ? previous?.mismatches : null
     assignments[lockKey]["${data.codePosition}"] = [
         bookingId: data.codeName?.find(/ORB\d+/) ?: 'unknown',
         code: data.code,
@@ -1219,6 +1222,7 @@ void trySetCode(Map data) {
         attempt: attempt,
         confirmed: false,
     ]
+    if (mismatches) assignments[lockKey]["${data.codePosition}"].mismatches = mismatches
     atomicState.codeAssignments = assignments
     log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt})"
 
@@ -1359,12 +1363,28 @@ void codeChangedHandler(e) {
             Map assignment = lockAssignments[pos]
 
             if (assignment) {
-                if ((e.value == 'added' || e.value == 'changed') && !helperEventMatchesAssignment(data, pos, assignment)) {
-                    // Another app or a person wrote this slot: the set stays pending (#59)
+                String verdict = (e.value == 'added' || e.value == 'changed') ? helperEventVerdict(data, pos, assignment) : null
+                if (verdict == 'foreign') {
+                    // Another app or a person wrote this slot: leave their code, stop tracking (and
+                    // re-sending) ours there, and let reconcile put the booking in a free slot (#59)
+                    log.info "codeChangedHandler: ${e.value} at pos ${pos} on lock ${lockId} is not ${assignment.bookingId}; tracking dropped, reconcile in 10 s"
+                    lockAssignments.remove(pos)
+                    assignments[lockId] = lockAssignments
+                    atomicState.codeAssignments = assignments
+                    runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+                } else if (verdict == 'stale') {
+                    // Our name with another code (an older write of ours): the set stays pending
+                    int mismatches = (assignment.mismatches ?: 0) + 1
                     log.info "codeChangedHandler: ${e.value} at pos ${pos} on lock ${lockId} doesn't match ${assignment.bookingId}, not confirmed"
+                    if (mismatches == sbMaxEventMismatches && helperPendingSet(assignment)) log.warn "codeChangedHandler: lock ${lockId} pos ${pos}: ${mismatches} confirmations in a row didn't match the code written; still re-sending"
+                    assignment.mismatches = mismatches
+                    lockAssignments[pos] = assignment
+                    assignments[lockId] = lockAssignments
+                    atomicState.codeAssignments = assignments
                 } else if (e.value == 'added' || e.value == 'changed') {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
                     assignment.confirmed = true
+                    assignment.remove('mismatches')
                     lockAssignments[pos] = assignment
                     assignments[lockId] = lockAssignments
                     atomicState.codeAssignments = assignments
@@ -2109,23 +2129,29 @@ String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     return bMatcher.find() && bMatcher.group(1) == nMatcher.group(1) ? 'claim' : 'otherBooking'
 }
 
-// Whether codeChanged data for a slot agrees with what this app wrote there. The slot's
-// entry is data["<slot>"] or else data itself. A name agrees when reconcile would claim it
-// (helperTrackedVerdict: the same ORB<id>, or a driver placeholder for this slot) or when
-// it is the start of the written name (drivers that truncate names). A code agrees when it
-// equals the written one; masked codes (not all digits) are ignored. Data with neither
-// agrees, as before (#59). Compared in memory only: never log the name or the code.
-boolean helperEventMatchesAssignment(Map data, String pos, Map assignment) {
+// What codeChanged data for a slot says about this app's write there (#59). The slot's
+// entry is data["<slot>"] or else data itself.
+// 'foreign': another name (another ORB<id>, or a name reconcile wouldn't claim that isn't a
+//   truncation of the written one), or a code with no name that isn't the written code.
+// 'stale': this app's name with another code (an older write of ours).
+// 'match': otherwise, also when the data has neither a name nor a code (confirm by slot).
+// A truncation counts only when it is the start of the written name and still holds the
+// whole ORB of ORB<id>: GT:ORB matches GT:ORB77-Cy, GT and GT:ORB7 don't.
+// Masked codes (not all digits) are ignored. Never log the name or the code.
+String helperEventVerdict(Map data, String pos, Map assignment) {
     def entry = data[pos] instanceof Map ? data[pos] : data
     String name = (entry.name ?: entry.codeName)?.toString()?.trim()
-    if (name) {
-        String written = (assignment.codeName ?: '').toString().trim()
-        if (helperTrackedVerdict(assignment, [name: name], pos) != 'claim' && !written.startsWith(name)) return false
-    }
     String code = entry.code?.toString()?.trim()
-    if (code ==~ /\d+/ && code != "${assignment.code ?: ''}".trim()) return false
-    return true
+    boolean otherCode = code ==~ /\d+/ && code != "${assignment.code ?: ''}".trim()
+    if (!name) return otherCode ? 'foreign' : 'match'
+    String v = helperTrackedVerdict(assignment, [name: name], pos)
+    String written = (assignment.codeName ?: '').toString().trim()
+    if (v == 'otherBooking' || (v == 'otherName' && !(name.contains('ORB') && written.startsWith(name)))) return 'foreign'
+    return otherCode ? 'stale' : 'match'
 }
+
+// Mismatching confirmations of this app's own name in a row before a warning
+int getSbMaxEventMismatches() { 3 }
 
 // A setCode not confirmed yet: verifySetCode keeps retrying it
 boolean helperPendingSet(Map assignment) {
