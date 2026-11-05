@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.11' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.12' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -1359,7 +1359,10 @@ void codeChangedHandler(e) {
             Map assignment = lockAssignments[pos]
 
             if (assignment) {
-                if (e.value == 'added' || e.value == 'changed') {
+                if ((e.value == 'added' || e.value == 'changed') && !helperEventMatchesAssignment(data, pos, assignment)) {
+                    // Another app or a person wrote this slot: the set stays pending (#59)
+                    log.info "codeChangedHandler: ${e.value} at pos ${pos} on lock ${lockId} doesn't match ${assignment.bookingId}, not confirmed"
+                } else if (e.value == 'added' || e.value == 'changed') {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
                     assignment.confirmed = true
                     lockAssignments[pos] = assignment
@@ -2104,6 +2107,24 @@ String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     if (!nMatcher.find()) return 'otherName'
     def bMatcher = ("${assignment.bookingId ?: ''}" =~ /(\d+)/)
     return bMatcher.find() && bMatcher.group(1) == nMatcher.group(1) ? 'claim' : 'otherBooking'
+}
+
+// Whether codeChanged data for a slot agrees with what this app wrote there. The slot's
+// entry is data["<slot>"] or else data itself. A name agrees when reconcile would claim it
+// (helperTrackedVerdict: the same ORB<id>, or a driver placeholder for this slot) or when
+// it is the start of the written name (drivers that truncate names). A code agrees when it
+// equals the written one; masked codes (not all digits) are ignored. Data with neither
+// agrees, as before (#59). Compared in memory only: never log the name or the code.
+boolean helperEventMatchesAssignment(Map data, String pos, Map assignment) {
+    def entry = data[pos] instanceof Map ? data[pos] : data
+    String name = (entry.name ?: entry.codeName)?.toString()?.trim()
+    if (name) {
+        String written = (assignment.codeName ?: '').toString().trim()
+        if (helperTrackedVerdict(assignment, [name: name], pos) != 'claim' && !written.startsWith(name)) return false
+    }
+    String code = entry.code?.toString()?.trim()
+    if (code ==~ /\d+/ && code != "${assignment.code ?: ''}".trim()) return false
+    return true
 }
 
 // A setCode not confirmed yet: verifySetCode keeps retrying it

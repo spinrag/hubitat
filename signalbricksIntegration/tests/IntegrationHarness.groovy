@@ -627,6 +627,48 @@ app.atomicState.codeAssignments = pending51()
 app.codeChangedHandler(encEvent('added', 'undecryptable:Y2M0'))
 check('#57 undecryptable codeChanged: nothing confirmed, no error', assigned('51')?.confirmed == false)
 
+// A set is confirmed only by data that agrees with what the app wrote (#59)
+def slotData = { Map entry -> ['51': entry] }
+def confirmsWith = { String value, String data, Map a = null ->
+    app.atomicState.codeAssignments = a ? tracked(['51': a]) : pending51()
+    app.codeChangedHandler(encEvent(value, data))
+    return assigned('51')?.confirmed == true
+}
+app.atomicState.codeAssignments = pending51()
+mark()
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([name: 'Plumber', code: '30000051']))))
+List foreignLogs = newLogs()
+check('#59 foreign write into a pending slot (slot map): not confirmed, still tracked', assigned('51')?.confirmed == false && assigned('51')?.code == '20000077')
+check('#59 foreign write: logged as not confirmed, without the name or code',
+    foreignLogs.contains("codeChangedHandler: changed at pos 51 on lock 7 doesn't match ORB77, not confirmed") && !foreignLogs.any { it.contains('Plumber') || it.contains('30000051') || it.contains('20000077') })
+check('#59 foreign write (encrypted slot map): not confirmed', !confirmsWith('added', encrypt('enc:ZjEK', slotData([name: 'Plumber', code: '30000051']))))
+check('#59 foreign write (codeNumber with a name): not confirmed', !confirmsWith('added', JsonOutput.toJson([codeNumber: 51, name: 'Plumber'])))
+check('#59 foreign write (encrypted codeNumber with a name): not confirmed', !confirmsWith('changed', encrypt('enc:ZjIK', [codeNumber: 51, name: 'Plumber', code: '30000051'])))
+check('#59 another booking\'s code in the slot: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB88-Di', code: '20000088']))))
+check('#59 our name with another code: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '30000051']))))
+check('#59 a foreign code with no name: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([code: '30000051']))))
+check('#59 matching name and code (codeNumber): confirmed', confirmsWith('added', JsonOutput.toJson([codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])))
+check('#59 matching name and code (encrypted codeNumber): confirmed', confirmsWith('added', encrypt('enc:bTEK', [codeNumber: 51, name: 'G:ORB77-Cy', code: '20000077'])))
+check('#59 matching name and code (encrypted slot map): confirmed', confirmsWith('changed', encrypt('enc:bTIK', slotData([name: 'G:ORB77-Cy', code: '20000077']))))
+check('#59 codeNumber only: confirmed by slot as before', confirmsWith('added', JsonOutput.toJson([codeNumber: 51])))
+check('#59 slot map with no name or code: confirmed by slot as before', confirmsWith('added', JsonOutput.toJson(slotData([notify: true]))))
+check('#59 matching name, code masked: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '********']))))
+check('#59 matching code, no name (driver drops names): confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([code: '20000077']))))
+check('#59 name truncated by the driver: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:ORB77', code: '20000077']))))
+check('#59 name truncated before the booking id: confirmed',
+    confirmsWith('changed', JsonOutput.toJson(slotData([name: 'G:Cy-OR'])), [bookingId: 'ORB77', code: '20000077', codeName: 'G:Cy-ORB77', attempt: 1, confirmed: false]))
+check('#59 name with padding: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: ' G:ORB77-Cy ']))))
+check('#59 same booking under another prefix or guest name: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'GT:ORB77-Cyrus']))))
+check('#59 driver placeholder name for the slot: confirmed', confirmsWith('changed', JsonOutput.toJson(slotData([name: 'Code 51']))))
+check('#59 placeholder for another slot: not confirmed', !confirmsWith('changed', JsonOutput.toJson(slotData([name: 'Code 52']))))
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
+app.codeChangedHandler(encEvent('deleted', JsonOutput.toJson(slotData([name: 'Plumber', code: '30000051']))))
+check('#59 deleted with other data: tracking cleared as before', assigned('51') == null)
+app.atomicState.codeAssignments = pending51()
+app.scheduled.clear()
+app.codeChangedHandler(encEvent('failed', JsonOutput.toJson(slotData([name: 'Plumber']))))
+check('#59 failed with other data: retried as before', app.scheduled.any { it.handler == 'trySetCode' && it.data.codePosition == 51 })
+
 // A skipped lock that a read finds readable again is reconciled shortly after
 reset55()
 app.atomicState.lockCodesUnreadable = ['7']
