@@ -54,6 +54,8 @@ class FakeLock {
     void deleteCode(def pos) { deleted << pos }
     List setCalls = []
     void setCode(def pos, def code, def name) { setCalls << pos }
+    int getCodesCalls = 0
+    void getCodes() { getCodesCalls++ }
 }
 
 def cfg = new CompilerConfiguration()
@@ -252,12 +254,15 @@ app.codeNamePrefix = 'G:'
 app.codeNamePrefix = 'G:'
 r = prefixRun(nameless51, tracked51, booking77())
 check('P1: nameless current code in its tracked slot: nothing to do', r.sets.isEmpty() && r.deletes.isEmpty())
-r = prefixRun([:], app.atomicState.codeAssignments, booking77())
-check('P1: lock reports no codes, not read empty: tracking kept, the write is deferred (#55)', assigned('51')?.confirmed == true && r.sets.isEmpty())
-app.atomicState.lockCodesReadEmpty = ['7']
-r = prefixRun([:], app.atomicState.codeAssignments, booking77())
-check('P1: lock read empty by a refresh: the booking is written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
 app.atomicState.lockCodesReadEmpty = []
+r = prefixRun([:], app.atomicState.codeAssignments, booking77())
+check('P1: lock reports no codes (not read yet): tracking kept, the booking is written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+app.atomicState.codeRefresh = [runId: 1L, lockIds: ['7'], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0]
+r = prefixRun(['40': [name: 'Front desk', code: '10000040']], app.atomicState.codeAssignments, booking77())
+check('P1: lock being read, partial list without the slot: written only to its own slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
+app.atomicState.codeRefresh = null
+app.atomicState.lockCodesReadEmpty = []
+app.atomicState.codeWritesDeferred = [:]
 r = prefixRun(['40': [name: 'Front desk', code: '10000040']], app.atomicState.codeAssignments, booking77())
 check('P1: partial lockCodes without the slot: tracking kept, no second slot', assigned('51')?.confirmed == true && r.sets.collect { it.codePosition } == [51])
 r = prefixRun(nameless51, app.atomicState.codeAssignments, [:])
@@ -271,91 +276,148 @@ app.atomicState.codeRefresh = null
 app.helperPruneAssignments('7', ['40': [name: 'Front desk', code: '10000040']])
 check('after the refresh: it is pruned', assigned('51') == null)
 
-// --- #55: no writes while a lock's codes are unread or being read ---
+// --- #55: no first-free writes or rewrites while a lock's codes are unread or being read ---
 // Fake booking ids, guests and codes only.
 def lock8 = new FakeLock(id: '8', name: 'Back', label: 'Back')
 lock8.attrs.lockCodes = JsonOutput.toJson(['40': [name: 'Front desk', code: '10000040']])
 lock8.attrs.maxCodes = 60
 app.locks = [lock, lock8]
-app.atomicState.lockCodesReadEmpty = []
-app.atomicState.reconcileRetries = 0
+def reset55 = {
+    app.atomicState.lockCodesReadEmpty = []
+    app.atomicState.codeWritesDeferred = [:]
+    app.atomicState.codeAutoReadAt = [:]
+    app.atomicState.codeRefresh = null
+    app.atomicState.reconcileRetries = 0
+    lock.getCodesCalls = 0
+}
+reset55()
 Map pastOwn = ['53': [name: 'G:ORB66-Jo', code: '20000066']]
 Map frontDesk = ['40': [name: 'Front desk', code: '10000040']]
 def booking77on = { List lockIds -> booking77().collectEntries { k, b -> [(k): b + [lockId: lockIds]] } }
 def setsOn = { String lockId -> app.scheduled.findAll { it.handler == 'trySetCode' && "${it.data.lockId}" == lockId }.collect { it.data.codePosition } }
-def deferLog = { String lockId -> app.logged.find { it.toString().startsWith("reconcileDoorCodes: lock ${lockId} ") && it.toString().contains('deferring') }?.toString() }
+int logMark = 0
+def mark = { logMark = app.logged.size() }
+def newLogs = { app.logged.drop(logMark).collect { it.toString() } }
+def deferLog = { String lockId -> newLogs().find { it.startsWith("reconcileDoorCodes: lock ${lockId} ") && it.contains('deferring') } }
 def reading = { String lockId -> app.atomicState.codeRefresh = [runId: 5L, lockIds: [lockId], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0] }
+def reconciles = { app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs } }
 
 // Being read by a refresh: a partial list must not decide which slot is free
 reading('7')
-app.logged.clear()
+mark()
 r = prefixRun(frontDesk + pastOwn, [:], booking77on(['7', '8']))
-check('#55 being read: no new code written to that lock', setsOn('7').isEmpty())
+check('#55 being read: no first-free write on that lock', setsOn('7').isEmpty())
 check('#55 being read: deletes on that lock still happen', r.deletes == [53])
 check('#55 being read: other locks keep working', setsOn('8') == [50])
 check('#55 being read: log names the lock and counts the deferred writes', deferLog('7') == 'reconcileDoorCodes: lock 7 (Front) is being read by a door code refresh, deferring 1 code writes')
-check('#55 being read: a retry reconcile is scheduled', r.jobs.any { it.handler == 'reconcileDoorCodes' } && app.atomicState.codeWritesDeferred == ['7'])
+check('#55 being read: a retry reconcile is scheduled, no second read started', reconciles() && app.atomicState.codeWritesDeferred == ['7': 1] && app.atomicState.codeRefresh.runId == 5L && lock.getCodesCalls == 0)
 r = prefixRun(frontDesk + ourCode, tracked51, booking77(code: '20000078'))
 check('#55 being read: a changed code is not rewritten either', setsOn('7').isEmpty())
+app.paragraphs.clear()
+app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
+app.pages()
+check('#55 page: the waiting lock is shown', app.paragraphs.any { it.contains('Front: 1 code(s) waiting for a door code read') })
+app.settings = [:]
 
 // The refresh reads the lock: it is reconciled again shortly after
 lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
-app.atomicState.codeWritesDeferred = ['7']
 app.scheduled.clear()
+app.codeRefreshOnLockCodes([deviceId: '7'])
 app.codeRefreshSettled([runId: 5L, index: 0])
-check('#55 read finished: the deferred lock is reconciled again', app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 } && app.atomicState.codeWritesDeferred == [])
-check('#55 read finished with codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
+check('#55 read finished: the deferred lock is reconciled again', app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 } && app.atomicState.codeWritesDeferred == [:])
+check('#55 read finished with other codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
 app.atomicState.codeRefresh = null
 r = prefixRun(frontDesk, [:], booking77on(['7']))
 check('#55 after the read: the write proceeds', setsOn('7') == [50])
 
-// Empty before any read (driver change, re-pair, never reported)
-app.logged.clear()
-r = prefixRun([:], [:], booking77on(['7', '8']))
-check('#55 empty, not read: write deferred', setsOn('7').isEmpty() && deferLog('7')?.contains('has not reported its codes'))
-check('#55 empty, not read: other locks keep working', setsOn('8') == [50])
-check('#55 empty, not read: retried later', r.jobs.any { it.handler == 'reconcileDoorCodes' && it.secs } && app.atomicState.reconcileRetries > 0)
-lock.attrs.remove('lockCodes')
-app.scheduled.clear()
-app.reconcileDoorCodes(booking77on(['7']))
-check('#55 no lockCodes at all: write deferred, retried', setsOn('7').isEmpty() && app.scheduled.any { it.handler == 'reconcileDoorCodes' })
-
-// Read and empty: a refresh read the lock and it holds no codes at all
-lock.attrs.lockCodes = '{}'
-app.atomicState.codeWritesDeferred = ['7']
-reading('7')
-app.scheduled.clear()
-app.codeRefreshTimeout([runId: 5L, index: 0])
-check('#55 read and empty (refresh step ended): marked read-empty, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && app.scheduled.any { it.handler == 'reconcileDoorCodes' })
-lock.attrs.lockCodes = 'not json'
-reading('7')
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
-check('#55 unreadable lockCodes at the end of a read: the refresh still moves on, read-empty dropped', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
-app.atomicState.lockCodesReadEmpty = ['7']
-app.atomicState.codeRefresh = null
-app.logged.clear()
-r = prefixRun([:], [:], booking77on(['7']))
-check('#55 read and empty: the write proceeds', setsOn('7') == [50] && deferLog('7') == null)
+// Upgrade, then checkout and the next check-in on a lock holding only this app's codes
+reset55()
+mark()
+r = prefixRun(ourCode, tracked51, booking77())
+check('#55 SB-only lock after the upgrade: a list of only this app\'s codes marks it', app.atomicState.lockCodesReadEmpty == ['7'])
 r = prefixRun(ourCode, tracked51, [:])
-check('#55 read and empty: its own codes coming and going keep it read-empty', app.atomicState.lockCodesReadEmpty == ['7'])
+check('#55 SB-only lock: checkout deletes the code', r.deletes == [51])
+r = prefixRun([:], tracked51, booking88)
+check('#55 SB-only lock: the next check-in is written with no operator and no read', setsOn('7') == [50] && deferLog('7') == null && lock.getCodesCalls == 0)
+
+// A new or factory-reset lock with no codes: the app reads it, then writes
+reset55()
+mark()
+r = prefixRun([:], [:], booking77on(['7', '8']))
+check('#55 empty, not read: first-free write deferred', setsOn('7').isEmpty() && deferLog('7') == 'reconcileDoorCodes: lock 7 (Front) has not reported its codes, deferring 1 code writes')
+check('#55 empty, not read: other locks keep working', setsOn('8') == [50])
+check('#55 empty, not read: retried later', reconciles() && app.atomicState.reconcileRetries > 0)
+def run55 = app.atomicState.codeRefresh
+check('#55 empty, not read: a read of that lock only is started', run55?.lockIds == ['7'] && app.atomicState.codeAutoReadAt?.containsKey('7') && newLogs().contains('reconcileDoorCodes: reading the codes of 1 lock(s) whose code writes are waiting'))
+app.codeRefreshNext([runId: run55.runId, index: 0])
+check('#55 auto read: getCodes sent to the lock', lock.getCodesCalls == 1)
+app.codeRefreshOnLockCodes([deviceId: '7'])
+app.scheduled.clear()
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('#55 auto read answered with no codes: marked read-empty, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && reconciles())
+app.atomicState.codeRefresh = null
+mark()
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 read and empty: the write lands', setsOn('7') == [50] && deferLog('7') == null)
 r = prefixRun(frontDesk, [:], [:])
 check('#55 the lock later reports another code: read-empty is dropped', app.atomicState.lockCodesReadEmpty == [])
+app.atomicState.codeRefresh = [runId: 9L, lockIds: ['8'], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0]
 r = prefixRun([:], [:], booking77on(['7']))
-check('#55 empty again after that (driver change): deferred until read again', setsOn('7').isEmpty())
+check('#55 empty again (driver change): deferred, no read while another lock is read', setsOn('7').isEmpty() && app.atomicState.codeRefresh.runId == 9L)
 
-// Retries stop at the cap, then a later read still brings the lock back
-app.atomicState.reconcileRetries = 20
+// A read step that times out without any answer leaves the lock unmarked
+reset55()
 r = prefixRun([:], [:], booking77on(['7']))
-check('#55 deferred past the retry cap: retry loop stops', !r.jobs.any { it.handler == 'reconcileDoorCodes' && it.secs } && app.atomicState.codeWritesDeferred == ['7'])
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('#55 read timed out with no answer: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.codeChangedHandler(codeEvent('changed', 60))
+check('#55 a codeChanged from the lock being read counts as an answer', app.atomicState.codeRefresh.answered == true)
+
+// A driver that never fills in lockCodes: auto reads at most once per 6 h
+reset55()
+lock.attrs.remove('lockCodes')
+app.reconcileDoorCodes(booking77on(['7']))
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.codeRefreshOnLockCodes([deviceId: '7'])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+app.codeRefreshNext([runId: run55.runId, index: 1])
+check('#55 no lockCodes: one auto read, then not marked', lock.getCodesCalls == 1 && app.atomicState.codeRefresh == null && app.atomicState.lockCodesReadEmpty == [])
+app.reconcileDoorCodes(booking77on(['7']))
+app.reconcileDoorCodes(booking77on(['7']))
+check('#55 no lockCodes: no second auto read within 6 h, still deferred', app.atomicState.codeRefresh == null && app.atomicState.codeWritesDeferred == ['7': 1] && setsOn('7').isEmpty())
+app.atomicState.codeAutoReadAt = ['7': System.currentTimeMillis() - 6 * 3600_000L - 1000]
+app.reconcileDoorCodes(booking77on(['7']))
+check('#55 no lockCodes: read again after 6 h', app.atomicState.codeRefresh?.lockIds == ['7'])
+
+// Retries stop at the cap; a later read of the lock still brings it back
+reset55()
+lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
 reading('7')
+app.atomicState.reconcileRetries = 20
+r = prefixRun(frontDesk, [:], booking77on(['7']))
+check('#55 deferred past the retry cap: retry loop stops', !reconciles() && app.atomicState.codeWritesDeferred == ['7': 1])
 app.scheduled.clear()
 app.codeRefreshSettled([runId: 5L, index: 0])
-check('#55 past the cap: the next read of the lock reconciles it', app.scheduled.any { it.handler == 'reconcileDoorCodes' })
-app.atomicState.codeRefresh = null
-app.atomicState.lockCodesReadEmpty = []
-app.atomicState.codeWritesDeferred = []
-app.atomicState.reconcileRetries = 0
+check('#55 past the cap: the next read of the lock reconciles it', reconciles())
+
+// Unreadable lockCodes at the end of a read
+lock.attrs.lockCodes = 'not json'
+reading('7')
+app.atomicState.codeRefresh.answered = true
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#55 unreadable lockCodes at the end of a read: the refresh still moves on, not marked', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
+
+// Optional hardening: a first-free pick never lands on another current booking's tracked empty slot
+reset55()
+app.atomicState.lockCodesReadEmpty = ['7']
+r = prefixRun([:], ['7': ['50': [bookingId: 'ORB88', code: '20000088', codeName: 'G:ORB88-Di', attempt: 1, confirmed: true]]], booking77() + booking88)
+check('#55 tracked slot of a current booking is not given to another booking', r.sets.collect { [it.codePosition, it.codeName] } as Set == [[50, 'G:ORB88-Di'], [51, 'G:ORB77-Cy']] as Set)
+reset55()
 app.locks = [lock]
 
 // Placeholder names: only a driver placeholder naming the slot's own number counts as no name
