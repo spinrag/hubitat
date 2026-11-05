@@ -418,6 +418,10 @@ app.atomicState.lockCodesReadEmpty = ['7']
 r = prefixRun([:], ['7': ['50': [bookingId: 'ORB88', code: '20000088', codeName: 'G:ORB88-Di', attempt: 1, confirmed: true]]], booking77() + booking88)
 check('#55 tracked slot of a current booking is not given to another booking', r.sets.collect { [it.codePosition, it.codeName] } as Set == [[50, 'G:ORB88-Di'], [51, 'G:ORB77-Cy']] as Set)
 reset55()
+app.atomicState.lockCodesReadEmpty = []
+r = prefixRun([:], tracked51, [77: booking77()['77'] + [id: 77]])
+check('#55 integer booking ids (from atomicState): still written only to the own tracked slot', r.sets.collect { it.codePosition } == [51])
+reset55()
 app.locks = [lock]
 
 // Placeholder names: only a driver placeholder naming the slot's own number counts as no name

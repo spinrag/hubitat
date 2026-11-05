@@ -1048,7 +1048,7 @@ void reconcileDoorCodes(Map bookings) {
             List availableCodePositions = helperFindCodePositions(lock, lockCodes)
             // Empty slots tracked for a current booking are never a first-free pick for another
             Map lockAssignments = (atomicState.codeAssignments ?: [:])[lockKey] ?: [:]
-            List currentIds = currentLockBookings.keySet().collect { "${it}" }
+            List currentIds = currentLockBookings.keySet().collect { it.toString() }
             List trackedFree = availableCodePositions.findAll { p ->
                 lockAssignments.any { pos, a -> !a.deleting && "${pos}" == "${p}" && currentIds.contains((a.bookingId ?: '').toString().find(/\d+/)) }
             }
