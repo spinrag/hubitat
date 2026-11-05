@@ -431,6 +431,41 @@ app.atomicState.codeAutoReadAt = ['7': System.currentTimeMillis() - 6 * 3600_000
 app.reconcileDoorCodes(booking77on(['7']))
 check('#55 no lockCodes: read again after 6 h', app.atomicState.codeRefresh?.lockIds == ['7'])
 
+// The retry loop gives up; the auto read timer still brings the lock back
+reset55()
+lock.attrs.lockCodes = '{}'
+lock.lastActivity = null
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+run55 = app.atomicState.codeRefresh
+def autoTimer = app.scheduled.findAll { it.handler == 'codeAutoReadRetry' }
+check('#55 auto read timer: one timer, about 6 h after the read', lock.getCodesCalls == 0 && autoTimer.size() == 1 && autoTimer[0].secs > 6 * 3600 - 60 && autoTimer[0].secs <= 6 * 3600)
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+app.codeRefreshNext([runId: run55.runId, index: 1])
+app.atomicState.reconcileRetries = 20
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#55 auto read timer: retry loop gave up, timer still set, no second read yet', !reconciles() && app.scheduled.any { it.handler == 'codeAutoReadRetry' } && lock.getCodesCalls == 1 && app.atomicState.codeRefresh == null)
+app.atomicState.codeAutoReadAt = ['7': System.currentTimeMillis() - 6 * 3600_000L - 1000]
+app.atomicState.bookings = booking77on(['7'])
+app.codeAutoReadRetry()
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+check('#55 auto read timer fires: the second auto read starts', run55?.lockIds == ['7'] && lock.getCodesCalls == 2)
+app.codeRefreshOnLockCodes([deviceId: '7'])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+app.atomicState.codeRefresh = null
+r = prefixRun([:], [:], booking77on(['7']))
+check('#55 auto read timer: the lock answered empty and the write lands', app.atomicState.lockCodesReadEmpty == ['7'] && setsOn('7') == [50])
+app.atomicState.codeRefresh = [runId: 9L, lockIds: ['8'], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0]
+app.atomicState.lockCodesReadEmpty = []
+app.atomicState.codeAutoReadAt = [:]
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#55 auto read timer: not sooner than 15 minutes while another lock is read', app.scheduled.find { it.handler == 'codeAutoReadRetry' }?.secs == 900)
+app.atomicState.bookings = [:]
+
 // Retries stop at the cap; a later read of the lock still brings it back
 reset55()
 lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)

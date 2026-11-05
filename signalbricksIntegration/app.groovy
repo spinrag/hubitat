@@ -856,15 +856,26 @@ void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
 int getCodeAutoReadSec() { 6 * 3600 }
 
 void codeAutoRead(List lockIds) {
-    Map r = atomicState.codeRefresh
-    if (!lockIds || (r && !codeRefreshStalled(r))) return
+    if (!lockIds) return
     Map readAt = atomicState.codeAutoReadAt ?: [:]
-    List due = lockIds.findAll { id -> now() - ((readAt[id] ?: 0) as long) >= codeAutoReadSec * 1000L }
-    if (!due) return
-    due.each { id -> readAt[id] = now() }
-    atomicState.codeAutoReadAt = readAt
-    log.info "reconcileDoorCodes: reading the codes of ${due.size()} lock(s) whose code writes are waiting"
-    startCodeRefresh(null, due)
+    Map r = atomicState.codeRefresh
+    if (!r || codeRefreshStalled(r)) {
+        List due = lockIds.findAll { id -> now() - ((readAt[id] ?: 0) as long) >= codeAutoReadSec * 1000L }
+        if (due) {
+            due.each { id -> readAt[id] = now() }
+            atomicState.codeAutoReadAt = readAt
+            log.info "reconcileDoorCodes: reading the codes of ${due.size()} lock(s) whose code writes are waiting"
+            startCodeRefresh(null, due)
+        }
+    }
+    // The next auto read runs on a timer (one, replaced each time), not only with the next
+    // sync, check-in or checkout; not sooner than 15 minutes
+    long nextMs = lockIds.collect { id -> ((readAt[id] ?: 0) as long) + codeAutoReadSec * 1000L - now() }.min()
+    runIn(Math.max((int) (nextMs / 1000), 900), 'codeAutoReadRetry', [overwrite: true])
+}
+
+void codeAutoReadRetry() {
+    reconcileDoorCodes()
 }
 
 // unschedule() removed the running refresh's timer; put it back
@@ -1133,7 +1144,6 @@ void reconcileDoorCodes(Map bookings) {
     }
 
     atomicState.codeWritesDeferred = deferredLocks
-    codeAutoRead(unreadLocks)
     if (i == 0 && deferred == 0) {
         log.debug 'reconcileDoorCodes: No codes to reconcile'
         atomicState.reconcileRetries = 0
@@ -1154,6 +1164,8 @@ void reconcileDoorCodes(Map bookings) {
             runIn(++i * 180, 'reconcileDoorCodes', [ overwrite: true ])
         }
     }
+    // After scheduleEvents, whose unschedule() would remove the auto read timer
+    codeAutoRead(unreadLocks)
 }
 
 // Maximum delay between trySetCode retries (seconds). Backoff grows linearly
