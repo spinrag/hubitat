@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.9' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.10' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -351,6 +351,9 @@ void appButtonHandler(String btnName) {
             state.lastVersion = sbAppVersion
             atomicState.bookings = [:]
             atomicState.codeAssignments = [:]
+            atomicState.lockCodesReadEmpty = []
+            atomicState.codeWritesDeferred = [:]
+            atomicState.codeAutoReadAt = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
             atomicState.lastSync = null
@@ -703,8 +706,8 @@ int getCodeRefreshStaleSec() { 300 }
 int codeRefreshFloorSec(int slots) { Math.max((int) (slots * 2.6), 60) }
 int codeRefreshBudgetSec(int slots) { Math.min(Math.max(slots * 3, 120), 1200) }
 
-// Start reading door codes from all selected locks (or only lockId), one at a time
-void startCodeRefresh(String lockId = null) {
+// Start reading door codes from all selected locks (or only lockId, or onlyLockIds), one at a time
+void startCodeRefresh(String lockId = null, List onlyLockIds = null) {
     Map r = atomicState.codeRefresh
     if (r && !codeRefreshStalled(r)) {
         log.info "Door code refresh already running (${codeRefreshProgress(r)}), not restarting"
@@ -713,6 +716,7 @@ void startCodeRefresh(String lockId = null) {
 
     List lockIds = (locks ?: []).collect { lock -> lock.id.toString() }
     if (lockId) lockIds = lockIds.findAll { id -> id == lockId }
+    if (onlyLockIds != null) lockIds = lockIds.findAll { id -> onlyLockIds.contains(id) }
     if (!lockIds) {
         atomicState.codeRefresh = null
         log.info 'Door code refresh: no locks to read'
@@ -760,6 +764,7 @@ void codeRefreshNext(Map data) {
     r.stepAt = now()
     r.budgetSec = codeRefreshBudgetSec(slots)
     r.floorSec = codeRefreshFloorSec(slots)
+    r.answered = false
     atomicState.codeRefresh = r
 
     if (!lock) {
@@ -780,6 +785,7 @@ void codeRefreshOnLockCodes(e) {
     if (!r || (r.index as int) < 0) return
     int index = r.index as int
     if (index >= r.lockIds.size() || r.lockIds[index] != e.deviceId?.toString()) return
+    codeRefreshAnswered()
     // Some drivers send lockCodes while still walking the slots; ignore early ones
     if (now() - (r.stepAt as long) < (r.floorSec as long) * 1000L) return
 
@@ -801,7 +807,75 @@ void codeRefreshTimeout(Map data) {
 void codeRefreshAdvance(Map data) {
     Map r = atomicState.codeRefresh
     if (!codeRefreshIsCurrent(r, data, data?.index as int)) return
+    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true, r.stepAt as long)
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
+}
+
+// The lock being read sent lockCodes or codeChanged during this step
+void codeRefreshAnswered() {
+    // Re-read so only the flag is set on the current step, never an older copy written back
+    Map r = atomicState.codeRefresh
+    if (!r || r.answered) return
+    r.answered = true
+    atomicState.codeRefresh = r
+}
+
+// A read of this lock ended (settled or out of time). Remember whether it answered and
+// reported no codes: reconcile writes to a lock with an empty lockCodes only after such a
+// read (#55). A lock that never answered stays unmarked. Reconcile is run again for locks
+// whose writes it deferred.
+void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
+    def lock = locks?.find { lock -> lock.id.toString() == lockId }
+    if (!lock) return
+    // An empty lock re-reporting {} sends no event (the value is unchanged), but the lock
+    // still talked to the hub during the step; an offline lock shows no such activity
+    if (!answered) {
+        try {
+            def last = lock.getLastActivity()
+            long at = last instanceof Date ? last.time : (last instanceof Number ? last.longValue() : 0L)
+            answered = at >= stepAt
+        } catch (e) {
+            log.debug "codeRefreshLockDone: lock ${lockId} last activity not available (${e.class.simpleName})"
+        }
+    }
+    def raw = lock.currentValue('lockCodes', true)
+    List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
+    // Unreadable lockCodes (e.g. encrypted) must not stop the refresh
+    try { if (answered && raw && !parseJson(raw)) readEmpty << lockId } catch (e) { log.debug "codeRefreshLockDone: lock ${lockId} lockCodes not readable (${e.class.simpleName})" }
+    atomicState.lockCodesReadEmpty = readEmpty
+    Map deferred = atomicState.codeWritesDeferred ?: [:]
+    if (deferred.containsKey(lockId)) {
+        deferred.remove(lockId)
+        atomicState.codeWritesDeferred = deferred
+        runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+    }
+}
+
+// Read locks whose writes wait for their codes, unless a refresh is running; each lock at
+// most once per codeAutoReadSec, so a driver that never reports lockCodes isn't flooded (#55)
+int getCodeAutoReadSec() { 6 * 3600 }
+
+void codeAutoRead(List lockIds) {
+    if (!lockIds) return
+    Map readAt = atomicState.codeAutoReadAt ?: [:]
+    Map r = atomicState.codeRefresh
+    if (!r || codeRefreshStalled(r)) {
+        List due = lockIds.findAll { id -> now() - ((readAt[id] ?: 0) as long) >= codeAutoReadSec * 1000L }
+        if (due) {
+            due.each { id -> readAt[id] = now() }
+            atomicState.codeAutoReadAt = readAt
+            log.info "reconcileDoorCodes: reading the codes of ${due.size()} lock(s) whose code writes are waiting"
+            startCodeRefresh(null, due)
+        }
+    }
+    // The next auto read runs on a timer (one, replaced each time), not only with the next
+    // sync, check-in or checkout; not sooner than 15 minutes
+    long nextMs = lockIds.collect { id -> ((readAt[id] ?: 0) as long) + codeAutoReadSec * 1000L - now() }.min()
+    runIn(Math.max((int) (nextMs / 1000), 900), 'codeAutoReadRetry', [overwrite: true])
+}
+
+void codeAutoReadRetry() {
+    reconcileDoorCodes()
 }
 
 // unschedule() removed the running refresh's timer; put it back
@@ -884,6 +958,10 @@ List codeRefreshStatus() {
     if (last) {
         lines << "<b>Last refresh finished:</b> ${new Date(last.finishedAt as long)} (${last.locks} lock(s))"
     }
+    (atomicState.codeWritesDeferred ?: [:]).each { lockId, n ->
+        def lock = locks?.find { lock -> lock.id.toString() == lockId }
+        lines << "<b>Waiting:</b> ${lock ? (lock.label ?: lock.name) : "lock ${lockId}"}: ${n} code(s) waiting for a door code read"
+    }
     return lines
 }
 
@@ -920,6 +998,10 @@ void reconcileDoorCodes(Map bookings) {
     Map currentBookings = helperFindCurrentBookings(bookings)
 
     int i = 0
+    // Writes held back on locks whose codes are unread or being read (#55)
+    int deferred = 0
+    Map deferredLocks = [:]
+    List unreadLocks = []
 
     // Iterate through all locks
     locks.each { lock ->
@@ -939,16 +1021,28 @@ void reconcileDoorCodes(Map bookings) {
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
         def lockCodesRaw = lock.currentValue('lockCodes', true)
-
-        if (!lockCodesRaw) {
-            log.debug "reconcileDoorCodes: No lock codes"
-            return
-        }
-
-        Map lockCodes = parseJson(lockCodesRaw)
+        Map lockCodes = lockCodesRaw ? parseJson(lockCodesRaw) : [:]
         helperPruneAssignments(lock.id, lockCodes)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
         log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
+
+        // A free slot is only known to be free from a complete code list. An empty list
+        // (never reported, or reset by a driver change or re-pair) is trusted only after a
+        // door code refresh read the lock as empty; a list sent during a refresh can be partial.
+        // A full list holding only this app's codes marks the lock too, so a lock with only
+        // this app's codes keeps getting codes after its last one is deleted at checkout.
+        String lockKey = "${lock.id}"
+        boolean reading = codeRefreshReading(lock.id)
+        List readEmpty = atomicState.lockCodesReadEmpty ?: []
+        if (lockCodes.size() > sbCodes.size() && readEmpty.contains(lockKey)) {
+            readEmpty = readEmpty.findAll { it != lockKey }
+            atomicState.lockCodesReadEmpty = readEmpty
+        } else if (!reading && lockCodes && lockCodes.size() == sbCodes.size() && !readEmpty.contains(lockKey)) {
+            readEmpty = readEmpty + [lockKey]
+            atomicState.lockCodesReadEmpty = readEmpty
+        }
+        String holdWrites = reading ? 'is being read by a door code refresh'
+            : (!lockCodes && !readEmpty.contains(lockKey) ? 'has not reported its codes' : null)
 
         // Remove all codes that are not in the current bookings
         sbCodes.each { bookingId, lockCode ->
@@ -969,10 +1063,20 @@ void reconcileDoorCodes(Map bookings) {
             }
         }
 
+        // Writes held back on this lock; a booking's own tracked slot is still written
+        int held = 0
+
         // Are there any active bookings
         if (currentLockBookings) {
             // Get all available code positions as each one has a static index
             List availableCodePositions = helperFindCodePositions(lock, lockCodes)
+            // Empty slots tracked for a current booking are never a first-free pick for another
+            Map lockAssignments = (atomicState.codeAssignments ?: [:])[lockKey] ?: [:]
+            List currentIds = currentLockBookings.keySet().collect { it.toString() }
+            List trackedFree = availableCodePositions.findAll { p ->
+                lockAssignments.any { pos, a -> !a.deleting && "${pos}" == "${p}" && currentIds.contains((a.bookingId ?: '').toString().find(/\d+/)) }
+            }
+            availableCodePositions.removeAll(trackedFree)
             int index = 0
 
             currentLockBookings.each { bookingId, booking ->
@@ -988,10 +1092,11 @@ void reconcileDoorCodes(Map bookings) {
                     // missing from a partial lockCodes report) is reused: never a second slot
                     def nextPosition
                     Integer ownPos = helperTrackedEmptySlot(lock.id, bookingId, lockCodes)
-                    int at = ownPos != null ? availableCodePositions.indexOf(ownPos) : -1
-                    if (at >= index) {
-                        availableCodePositions.remove(at)
+                    if (ownPos != null && trackedFree.contains(ownPos)) {
                         nextPosition = ownPos
+                    } else if (holdWrites) {
+                        held++
+                        return // a first-free pick needs a complete code list
                     } else {
                         nextPosition = availableCodePositions[index]
                         if (nextPosition == null) {
@@ -1009,6 +1114,10 @@ void reconcileDoorCodes(Map bookings) {
                 }
                 // Is the booking's code different from the current code 
                 else if (sbCodes[bookingId].code != booking.code) {
+                    if (holdWrites) {
+                        held++
+                        return
+                    }
                     int codePosition
 
                     // setCode has to be called with an integer
@@ -1025,9 +1134,17 @@ void reconcileDoorCodes(Map bookings) {
                 }
             }
         }
+
+        if (held) {
+            log.info "reconcileDoorCodes: lock ${lock.id} (${lock.label ?: lock.name}) ${holdWrites}, deferring ${held} code writes"
+            deferred += held
+            deferredLocks[lockKey] = held
+            if (!reading) unreadLocks << lockKey
+        }
     }
 
-    if (i == 0) {
+    atomicState.codeWritesDeferred = deferredLocks
+    if (i == 0 && deferred == 0) {
         log.debug 'reconcileDoorCodes: No codes to reconcile'
         atomicState.reconcileRetries = 0
         scheduleEvents(bookings)
@@ -1042,11 +1159,13 @@ void reconcileDoorCodes(Map bookings) {
             atomicState.reconcileRetries = 0
             scheduleEvents(bookings)
         } else {
-            log.debug "reconcileDoorCodes: ${i} codes to reconcile (retry ${retries}/${maxRetries})"
+            log.debug "reconcileDoorCodes: ${i} codes to reconcile, ${deferred} deferred (retry ${retries}/${maxRetries})"
             atomicState.reconcileRetries = retries
             runIn(++i * 180, 'reconcileDoorCodes', [ overwrite: true ])
         }
     }
+    // After scheduleEvents, whose unschedule() would remove the auto read timer
+    codeAutoRead(unreadLocks)
 }
 
 // Maximum delay between trySetCode retries (seconds). Backoff grows linearly
@@ -1205,6 +1324,7 @@ void lockCodesHandler(e) {
 }
 
 void codeChangedHandler(e) {
+    if (codeRefreshReading(e.device?.id)) codeRefreshAnswered()
     // Verify our tracked assignments against what the lock confirmed
     try {
         Map data = e.data ? parseJson(e.data) : null
