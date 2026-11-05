@@ -42,6 +42,15 @@ abstract class HubitatStub extends Script {
     void sendLocationEvent(Map m) { locationEvents << m }
     void unsubscribe() {}
     def parseJson(String s) { new JsonSlurper().parseText(s) }
+    // Hubitat's decrypt(): ciphers maps a fake encrypted value to its plain text; 'undecryptable'
+    // throws with the value in the message (it must never be logged); anything else gives null
+    Map ciphers = [:]
+    List decrypted = []
+    String decrypt(String s) {
+        decrypted << s
+        if (s.startsWith('undecryptable')) throw new IllegalStateException("cannot decrypt ${s}")
+        return ciphers[s]
+    }
     String createAccessToken() { 'tok-fake' }
     long now() { System.currentTimeMillis() }
 }
@@ -494,6 +503,164 @@ reset55()
 app.atomicState.lockCodesReadEmpty = []
 r = prefixRun([:], tracked51, [77: booking77()['77'] + [id: 77]])
 check('#55 integer booking ids (from atomicState): still written only to the own tracked slot', r.sets.collect { it.codePosition } == [51])
+reset55()
+
+// --- #57: encrypted lockCodes (encrypt(JSON) by some Z-Wave drivers) ---
+// Fake values only: the "encrypted" strings are made up, decrypt() is a stub.
+String enc = 'enc:Zm9vYmFyMDAx'
+def encrypt = { String key, Map plain -> app.ciphers[key] = JsonOutput.toJson(plain); key }
+app.decrypted.clear()
+check('#57 parse: plain JSON is read without decrypt()', app.helperParseLockCodes(JsonOutput.toJson(frontDesk)) == frontDesk && app.decrypted.isEmpty())
+check('#57 parse: empty or missing is [:]', app.helperParseLockCodes(null) == [:] && app.helperParseLockCodes('') == [:] && app.helperParseLockCodes('{}') == [:] && app.decrypted.isEmpty())
+check('#57 parse: an encrypted value is read through decrypt()', app.helperParseLockCodes(encrypt(enc, frontDesk)) == frontDesk && app.decrypted == [enc])
+['null', 'true', 'false', '42', '-7.5'].each { raw ->
+    app.decrypted.clear()
+    app.ciphers.clear()
+    check("#57 parse: '${raw}' (parses to a non-object) is read through decrypt()".toString(), app.helperParseLockCodes(encrypt(raw, frontDesk)) == frontDesk && app.decrypted == [raw])
+    app.ciphers.clear()
+    check("#57 parse: '${raw}' that decrypt() can't read is unreadable (null)".toString(), app.helperParseLockCodes(raw) == null)
+}
+app.ciphers.clear()
+check('#57 parse: decrypt() returning null, throwing, or a non-object is unreadable (null)',
+    app.helperParseLockCodes('enc:none') == null && app.helperParseLockCodes('undecryptable:X1') == null &&
+    app.helperParseLockCodes(encrypt('enc:list', [:]).with { app.ciphers[it] = '[1,2]'; it }) == null && app.helperParseLockCodes(encrypt('enc:num', [:]).with { app.ciphers[it] = '42'; it }) == null)
+check('#57 parse: a JSON array is not a code list (null)', app.helperParseLockCodes('[1,2]') == null)
+
+// Reconcile reads an encrypted lock like any other
+app.ciphers.clear()
+lock8.attrs.lockCodes = JsonOutput.toJson(frontDesk)
+app.locks = [lock, lock8]
+reset55()
+lock.attrs.lockCodes = encrypt(enc, frontDesk + pastOwn)
+app.atomicState.codeAssignments = [:]
+app.scheduled.clear()
+mark()
+app.reconcileDoorCodes(booking77on(['7', '8']))
+check('#57 encrypted lock: reconciled (stale code deleted, booking written to the first free slot)',
+    app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition } == [53] && setsOn('7') == [50] && setsOn('8') == [50])
+check('#57 encrypted lock: not on the unreadable list', app.atomicState.lockCodesUnreadable == [])
+
+// An undecryptable lock is skipped; the other locks still reconcile
+reset55()
+lock.attrs.lockCodes = 'undecryptable:Q2lwaGVy'
+app.atomicState.codeAssignments = tracked(['53': [bookingId: 'ORB66', code: '20000066', codeName: 'G:ORB66-Jo', attempt: 1, confirmed: true]])
+app.scheduled.clear()
+mark()
+app.reconcileDoorCodes(booking77on(['7', '8']))
+check('#57 undecryptable lock: no write, delete or prune on it', setsOn('7').isEmpty() && !app.scheduled.any { it.handler == 'tryDeleteCode' } && assigned('53') != null)
+check('#57 undecryptable lock: the other lock is still reconciled', setsOn('8') == [50])
+check('#57 undecryptable lock: one warn line naming the lock id only', newLogs().findAll { it.contains('lockCodes unreadable') } == ['reconcileDoorCodes: lock 7 lockCodes unreadable, skipped'])
+check('#57 undecryptable lock: not marked read-empty, not deferred, no auto read',
+    app.atomicState.lockCodesReadEmpty == [] && app.atomicState.codeWritesDeferred == [:] && app.atomicState.codeRefresh == null && lock.getCodesCalls == 0)
+check('#57 undecryptable lock: listed as unreadable', app.atomicState.lockCodesUnreadable == ['7'])
+app.paragraphs.clear()
+app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
+app.pages()
+check('#57 page: the unreadable lock is shown under Waiting', app.paragraphs.any { it.contains("<b>Waiting:</b> Front: its lockCodes can't be read") })
+app.settings = [:]
+// Was marked read-empty before: still skipped, the mark is not used to write into a free slot
+app.atomicState.lockCodesReadEmpty = ['7']
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#57 undecryptable lock marked empty earlier: still no write', setsOn('7').isEmpty())
+// Readable again: back to normal and off the list
+reset55()
+lock.attrs.lockCodes = encrypt(enc, frontDesk)
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#57 readable again: reconciled, off the unreadable list', setsOn('7') == [50] && app.atomicState.lockCodesUnreadable == [])
+
+// A read that ends on an undecryptable lock: not empty, so not marked; an encrypted {} is
+reset55()
+lock.attrs.lockCodes = 'undecryptable:RW1wdHk'
+reading('7')
+app.atomicState.codeRefresh.answered = true
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#57 read ends with undecryptable lockCodes: refresh moves on, not marked read-empty', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
+lock.attrs.lockCodes = encrypt('enc:e30', [:])
+reading('7')
+app.atomicState.codeRefresh.answered = true
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#57 read ends with an encrypted empty list: marked read-empty', app.atomicState.lockCodesReadEmpty == ['7'])
+lock.attrs.lockCodes = encrypt(enc, frontDesk)
+reading('7')
+app.atomicState.codeRefresh.answered = true
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#57 read ends with encrypted codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
+reset55()
+
+// Duplicate check reads encrypted lockCodes; an unreadable one is "can't tell"
+lock.attrs.lockCodes = encrypt('enc:ZHVw', ['53': [name: 'G:ORB88-Di', code: '20000077']])
+check('#57 duplicate check: an encrypted list is checked', app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88))
+lock.attrs.lockCodes = 'undecryptable:ZHVw'
+mark()
+check('#57 duplicate check: undecryptable is no duplicate, warned with the lock id only',
+    !app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88) && newLogs().contains('helperHasDuplicateCode: lock 7 lockCodes unreadable, not checked'))
+
+// Bookings page: an encrypted lock's codes are matched, an undecryptable one is reported
+lock.attrs.lockCodes = encrypt(enc, named52)
+app.atomicState.bookings = booking77()
+Map bv = app.bookingsView()
+check('#57 bookings page: encrypted lock read', bv.bookings.any { it.contains('Front: slot 52') } && bv.summary.contains('1 codes on locks'))
+lock.attrs.lockCodes = 'undecryptable:Qms'
+bv = app.bookingsView()
+check('#57 bookings page: undecryptable lock reported as unreadable', bv.notes.any { it.contains('Front:</b> its lockCodes could not be read') })
+app.atomicState.bookings = [:]
+
+// codeChanged event data encrypted like lockCodes: confirmations still land
+def pending51 = { tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: false]]) }
+def encEvent = { String value, String cipher -> [device: [id: '7'], value: value, data: cipher, name: 'codeChanged'] }
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('added', encrypt('enc:Y2MxCg', [codeNumber: 51])))
+check('#57 encrypted codeChanged (codeNumber): the set is confirmed', assigned('51')?.confirmed == true)
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('changed', encrypt('enc:Y2MyCg', ['51': [name: 'G:ORB77-Cy', code: '20000077']])))
+check('#57 encrypted codeChanged (slot map): the set is confirmed', assigned('51')?.confirmed == true)
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(['51': [name: 'G:ORB77-Cy', code: '20000077']])))
+check('#57 plain codeChanged slot map: the set is confirmed', assigned('51')?.confirmed == true)
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]])
+app.codeChangedHandler(encEvent('deleted', encrypt('enc:Y2MzCg', [codeNumber: 51])))
+check('#57 encrypted codeChanged (deleted): tracking cleared', assigned('51') == null)
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('added', 'undecryptable:Y2M0'))
+check('#57 undecryptable codeChanged: nothing confirmed, no error', assigned('51')?.confirmed == false)
+
+// A skipped lock that a read finds readable again is reconciled shortly after
+reset55()
+app.atomicState.lockCodesUnreadable = ['7']
+lock.attrs.lockCodes = 'undecryptable:UmVh'
+reading('7')
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#57 read ends still unreadable: stays listed, no extra reconcile', app.atomicState.lockCodesUnreadable == ['7'] && !reconciles())
+lock.attrs.lockCodes = encrypt(enc, frontDesk)
+reading('7')
+app.scheduled.clear()
+app.codeRefreshSettled([runId: 5L, index: 0])
+check('#57 read ends readable again: off the list, reconciled 10 s later', app.atomicState.lockCodesUnreadable == [] && app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 })
+reset55()
+
+// Only an unreadable lock has work: the log doesn't claim there is nothing to do
+app.locks = [lock]
+lock.attrs.lockCodes = 'undecryptable:Tm9uZQ'
+mark()
+app.reconcileDoorCodes(booking77on(['7']))
+check('#57 only an unreadable lock: the log says it was skipped', newLogs().contains('reconcileDoorCodes: No codes to reconcile on the readable locks; 1 lock(s) skipped (lockCodes unreadable)') && !newLogs().contains('reconcileDoorCodes: No codes to reconcile'))
+
+// Lock labels are escaped on the Waiting lines
+lock.label = '<i>Front</i>'
+app.atomicState.codeWritesDeferred = ['7': 1]
+List status = app.codeRefreshStatus()
+check('#57 Waiting lines escape the lock label', status.any { it.contains('&lt;i&gt;Front&lt;/i&gt;: its lockCodes') } && status.any { it.contains('&lt;i&gt;Front&lt;/i&gt;: 1 code(s)') } && !status.any { it.contains('<i>') })
+lock.label = 'Front'
+app.atomicState.codeWritesDeferred = [:]
+app.atomicState.lockCodesUnreadable = []
+app.locks = [lock, lock8]
+check('#57 no encrypted value or decrypt error in any log line', !app.logged.any { l -> ['enc:', 'undecryptable', 'cannot decrypt'].any { l.toString().contains(it) } })
+app.ciphers.clear()
+app.decrypted.clear()
 reset55()
 app.locks = [lock]
 

@@ -53,6 +53,12 @@ abstract class HubitatStub extends Script {
     void unsubscribe() {}
     void httpPostJson(Map p, Closure c) { posts << p; c([data: [ok: true]]) }
     def parseJson(String s) { new JsonSlurper().parseText(s) }
+    // Hubitat's decrypt() stub: fake ciphertexts only; an unknown one throws with the value in the message
+    Map ciphers = [:]
+    String decrypt(String s) {
+        if (ciphers.containsKey(s)) return ciphers[s]
+        throw new IllegalStateException("cannot decrypt ${s}")
+    }
     String createAccessToken() { 'fake-access-token-0001' }
     Date toDateTime(String s) { new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ").parse(s) }
     def propertyMissing(String name) {
@@ -66,7 +72,8 @@ class FakeLock {
     Map attrs = [:]
     List calls = []
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
-    def getSupportedAttributes() { [[name: 'lockCodes', dataType: 'JSON_OBJECT', values: null], [name: 'maxCodes', dataType: 'NUMBER', values: null]] }
+    String lockCodesType = 'JSON_OBJECT'
+    def getSupportedAttributes() { [[name: 'lockCodes', dataType: lockCodesType, values: null], [name: 'maxCodes', dataType: 'NUMBER', values: null]] }
     def getSupportedCommands() { ['setCode', 'deleteCode', 'lock'].collect { [name: it, arguments: [], parameters: []] } }
     def getCapabilities() { [[name: 'LockCodes']] }
     void setCode(def pos, def code, def name) { calls << [setCode: pos] }
@@ -209,6 +216,65 @@ step('DELETE /sync/<id>/<lock> and /sync/<id>') {
     app.request = [JSON: [lockId: '1']]
     app.apiDeleteBooking()
 }
+
+// Encrypted lockCodes (#57): read through decrypt() by reconcile and the duplicate check,
+// never decrypted or passed through by GET /devices/<id>; no code, ciphertext or decrypt error logged
+String CIPHER = 'fake-cipher-text-0003'
+String BAD_CIPHER = 'fake-cipher-text-0004'
+secrets.addAll([CIPHER, BAD_CIPHER])
+app.ciphers[CIPHER] = front.attrs.lockCodes
+front.attrs.lockCodes = CIPHER
+app.request = [JSON: ['88': [id: '88', guest: 'Ann', code: CODES[0], lockId: ['1'], checkIn: t - h, checkOut: t + h]]]
+app.apiSync()
+step('reconcile, encrypted lockCodes') {
+    app.scheduled.clear()
+    app.reconcileDoorCodes()
+}
+check('reconcile, encrypted lockCodes: the lock is reconciled', app.scheduled.any { it.handler == 'tryDeleteCode' })
+step('duplicate code check, encrypted lockCodes') {
+    Map bookings = app.helperGetBookings(app.atomicState.bookings)
+    app.helperHasDuplicateCode('1', bookings['88'], bookings)
+}
+Map dev = null
+step('GET /devices/<id>, encrypted lockCodes') {
+    app.params = [deviceId: '1', access_token: TOKEN]
+    dev = app.apiGetDevice()
+}
+check('GET /devices/<id>, encrypted lockCodes: 200 with lockCodes null, no code or ciphertext in the response',
+    dev?.status == 200 && new JsonSlurper().parseText(dev.data).attributes.find { it.name == 'lockCodes' }.currentValue == null && !secrets.any { dev.data.contains(it) })
+front.lockCodesType = 'STRING'
+step('GET /devices/<id>, encrypted lockCodes declared as STRING') {
+    app.params = [deviceId: '1', access_token: TOKEN]
+    dev = app.apiGetDevice()
+}
+check('GET /devices/<id>, encrypted lockCodes declared as STRING: still null, no ciphertext in the response',
+    dev?.status == 200 && new JsonSlurper().parseText(dev.data).attributes.find { it.name == 'lockCodes' }.currentValue == null && !secrets.any { dev.data.contains(it) })
+front.lockCodesType = 'JSON_OBJECT'
+// codeChanged event data encrypted like lockCodes: the set is confirmed, nothing leaks
+String EVENT_CIPHER = 'fake-cipher-text-0005'
+secrets << EVENT_CIPHER
+def tracked = app.atomicState.codeAssignments['1']
+String evPos = tracked.find { k, v -> !v.deleting }?.key ?: tracked.keySet().first()
+app.ciphers[EVENT_CIPHER] = JsonOutput.toJson([(evPos): [name: 'GT:ORB88-Ann', code: CODES[0]]])
+step('lock event: encrypted codeChanged') {
+    app.codeChangedHandler([name: 'codeChanged', value: 'added', data: EVENT_CIPHER, device: [id: '1']])
+}
+check('lock event: encrypted codeChanged confirms the tracked set', app.atomicState.codeAssignments['1'][evPos].confirmed == true)
+front.attrs.lockCodes = BAD_CIPHER
+String logsBadCipher = step('reconcile, undecryptable lockCodes') {
+    app.scheduled.clear()
+    app.reconcileDoorCodes()
+}
+check('reconcile, undecryptable lockCodes: one warn with the lock id', logsBadCipher.contains('warn reconcileDoorCodes: lock 1 lockCodes unreadable, skipped') && !logsBadCipher.contains('cannot decrypt'))
+step('duplicate code check, undecryptable lockCodes') {
+    Map bookings = app.helperGetBookings(app.atomicState.bookings)
+    app.helperHasDuplicateCode('1', bookings['88'], bookings)
+}
+step('GET /devices/<id>, undecryptable lockCodes') {
+    app.params = [deviceId: '1', access_token: TOKEN]
+    dev = app.apiGetDevice()
+}
+check('GET /devices/<id>, undecryptable lockCodes: lockCodes null, not a 500', dev?.status == 200 && new JsonSlurper().parseText(dev.data).attributes.find { it.name == 'lockCodes' }.currentValue == null)
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

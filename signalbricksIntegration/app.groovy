@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.10' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.11' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -172,11 +172,9 @@ Map bookingsView() {
         Map l = [name: bookingsEsc(lock.label ?: lock.name), codes: null, problem: 'no codes reported']
         def raw = lock.currentValue('lockCodes', true)
         if (raw) {
-            try {
-                l.codes = helperOnlySbCodes(parseJson(raw), lock.id, true)
-            } catch (e) {
-                l.problem = 'codes unreadable'
-            }
+            Map lockCodes = helperParseLockCodes(raw)
+            if (lockCodes == null) l.problem = 'codes unreadable'
+            else l.codes = helperOnlySbCodes(lockCodes, lock.id, true)
         }
         onLock[lock.id.toString()] = l
     }
@@ -353,6 +351,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeAssignments = [:]
             atomicState.lockCodesReadEmpty = []
             atomicState.codeWritesDeferred = [:]
+            atomicState.lockCodesUnreadable = []
             atomicState.codeAutoReadAt = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
@@ -840,9 +839,16 @@ void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
     }
     def raw = lock.currentValue('lockCodes', true)
     List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
-    // Unreadable lockCodes (e.g. encrypted) must not stop the refresh
-    try { if (answered && raw && !parseJson(raw)) readEmpty << lockId } catch (e) { log.debug "codeRefreshLockDone: lock ${lockId} lockCodes not readable (${e.class.simpleName})" }
+    // Unreadable lockCodes (null) is not empty: the lock stays unmarked (#57)
+    Map lockCodes = helperParseLockCodes(raw)
+    if (answered && raw && lockCodes != null && lockCodes.isEmpty()) readEmpty << lockId
     atomicState.lockCodesReadEmpty = readEmpty
+    // Readable again after reconcile skipped it: reconcile soon, not at the next sync (#57)
+    List unreadable = atomicState.lockCodesUnreadable ?: []
+    if (lockCodes != null && unreadable.contains(lockId)) {
+        atomicState.lockCodesUnreadable = unreadable.findAll { it != lockId }
+        runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+    }
     Map deferred = atomicState.codeWritesDeferred ?: [:]
     if (deferred.containsKey(lockId)) {
         deferred.remove(lockId)
@@ -960,7 +966,11 @@ List codeRefreshStatus() {
     }
     (atomicState.codeWritesDeferred ?: [:]).each { lockId, n ->
         def lock = locks?.find { lock -> lock.id.toString() == lockId }
-        lines << "<b>Waiting:</b> ${lock ? (lock.label ?: lock.name) : "lock ${lockId}"}: ${n} code(s) waiting for a door code read"
+        lines << "<b>Waiting:</b> ${bookingsEsc(lock ? (lock.label ?: lock.name) : "lock ${lockId}")}: ${n} code(s) waiting for a door code read"
+    }
+    (atomicState.lockCodesUnreadable ?: []).each { lockId ->
+        def lock = locks?.find { lock -> lock.id.toString() == lockId }
+        lines << "<b>Waiting:</b> ${bookingsEsc(lock ? (lock.label ?: lock.name) : "lock ${lockId}")}: its lockCodes can't be read (not even with decrypt), so its codes are not reconciled"
     }
     return lines
 }
@@ -1002,6 +1012,8 @@ void reconcileDoorCodes(Map bookings) {
     int deferred = 0
     Map deferredLocks = [:]
     List unreadLocks = []
+    // Locks whose lockCodes can't be read even with decrypt(): skipped (#57)
+    List unreadable = []
 
     // Iterate through all locks
     locks.each { lock ->
@@ -1020,8 +1032,14 @@ void reconcileDoorCodes(Map bookings) {
         log.trace "reconcileDoorCodes: current lock bookings ${helperLogBookings(currentLockBookings)}"
 
         // Get the lock's current codes, as we don't remove non-SignalBricks codes
-        def lockCodesRaw = lock.currentValue('lockCodes', true)
-        Map lockCodes = lockCodesRaw ? parseJson(lockCodesRaw) : [:]
+        // An encrypted lockCodes is read through decrypt(); one that still can't be read
+        // skips this lock only (no writes, deletes or read-empty mark), others carry on (#57)
+        Map lockCodes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+        if (lockCodes == null) {
+            log.warn "reconcileDoorCodes: lock ${lock.id} lockCodes unreadable, skipped"
+            unreadable << "${lock.id}".toString()
+            return
+        }
         helperPruneAssignments(lock.id, lockCodes)
         Map sbCodes = helperOnlySbCodes(lockCodes, lock.id)
         log.trace "reconcileDoorCodes: ${lockCodes.size()} codes on the lock, ${sbCodes.size()} of this app's (bookings ${sbCodes.keySet().join(', ')})"
@@ -1144,8 +1162,9 @@ void reconcileDoorCodes(Map bookings) {
     }
 
     atomicState.codeWritesDeferred = deferredLocks
+    atomicState.lockCodesUnreadable = unreadable
     if (i == 0 && deferred == 0) {
-        log.debug 'reconcileDoorCodes: No codes to reconcile'
+        log.debug unreadable ? "reconcileDoorCodes: No codes to reconcile on the readable locks; ${unreadable.size()} lock(s) skipped (lockCodes unreadable)" : 'reconcileDoorCodes: No codes to reconcile'
         atomicState.reconcileRetries = 0
         scheduleEvents(bookings)
     } else {
@@ -1327,10 +1346,14 @@ void codeChangedHandler(e) {
     if (codeRefreshReading(e.device?.id)) codeRefreshAnswered()
     // Verify our tracked assignments against what the lock confirmed
     try {
-        Map data = e.data ? parseJson(e.data) : null
-        if (data?.codeNumber) {
+        // Encrypted like lockCodes on drivers with lock code encryption on (#57). The slot is
+        // codeNumber, or else the only key of a slot map ({"<slot>": {name, code}})
+        Map data = e.data ? helperParseLockCodes(e.data) : null
+        def codeNumber = data?.codeNumber
+        if (codeNumber == null && data?.size() == 1 && "${data.keySet()[0]}" ==~ /\d+/) codeNumber = "${data.keySet()[0]}".toInteger()
+        if (codeNumber) {
             String lockId = "${e.device.id}"
-            String pos = "${data.codeNumber}"
+            String pos = "${codeNumber}"
             Map assignments = atomicState.codeAssignments ?: [:]
             Map lockAssignments = assignments[lockId] ?: [:]
             Map assignment = lockAssignments[pos]
@@ -1350,7 +1373,7 @@ void codeChangedHandler(e) {
                     // Trigger an immediate retry rather than waiting for verifySetCode
                     Map retryData = [
                         lockId: lockId,
-                        codePosition: data.codeNumber instanceof Number ? data.codeNumber : pos.toInteger(),
+                        codePosition: codeNumber instanceof Number ? codeNumber : pos.toInteger(),
                         code: assignment.code,
                         codeName: assignment.codeName,
                         attempt: attempt,
@@ -1568,18 +1591,24 @@ Map apiGetDevice() {
             values: attr.values,
             currentValue: lock.currentValue(attr.name),
         ]}.collect { attr ->
+            // lockCodes whatever its declared type: a plain JSON object only. An encrypted
+            // (or any other) value is never decrypted here nor passed through: null (#57)
+            if (attr.name == 'lockCodes') {
+                attr.currentValue = attr.currentValue ? helperJsonMap(attr.currentValue.toString()) : null
+                if (attr.currentValue && minCodePosition > 0) {
+                    log.debug('Redact Lock Codes')
+                    attr.currentValue.each { key, code ->
+                        if (key.toInteger() < minCodePosition) {
+                            code.code = '<redacted>'
+                        }
+                    }
+                }
+                return attr
+            }
             switch (attr.dataType) {
                 case 'JSON_OBJECT':
                     if (attr.currentValue) {
                         attr.currentValue = parseJson(attr.currentValue)
-                        if (attr.name == 'lockCodes' && minCodePosition > 0) {
-                            log.debug('Redact Lock Codes')
-                            attr.currentValue.each { key, code ->
-                                if (key.toInteger() < minCodePosition) {
-                                    code.code = '<redacted>'
-                                }
-                            }
-                        }
                     } else {
                         attr.currentValue = null
                     }
@@ -1879,6 +1908,34 @@ Map helperGetBookings(Map bookings) {
     }
 }
 
+// lockCodes (or codeChanged event data) as a slot map. Some drivers store it encrypted
+// (encrypt(JSON)): text that isn't a JSON object, including text that parses to null, a
+// Boolean or a number, goes through decrypt(). [:] when empty, null when unreadable.
+// The text, the decrypted text and exception messages hold codes: never log them (#57).
+Map helperParseLockCodes(def value) {
+    String text = value?.toString()
+    if (!text) return [:]
+    Map codes = helperJsonMap(text)
+    if (codes != null) return codes
+    String clear
+    try {
+        clear = decrypt(text)
+    } catch (Exception e) {
+        return null
+    }
+    return clear ? helperJsonMap(clear) : null
+}
+
+// Text as a JSON object, or null when it isn't JSON or isn't an object
+Map helperJsonMap(String text) {
+    try {
+        def v = parseJson(text)
+        return v instanceof Map ? (Map) v : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
 // Check for duplicate code
 boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) {
     log.debug "helperHasDuplicateCode ${lockId} ${helperLogBooking(booking)}"
@@ -1889,13 +1946,16 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
         return false
     }
 
-    String lockCodesJson = lock.currentValue('lockCodes', true);
-
-    if (!lockCodesJson) {
+    // An unreadable lockCodes (encrypted, and decrypt() can't read it) is "can't tell",
+    // like an empty one: no 409; reconcile skips that lock (#57)
+    Map lockCodes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+    if (lockCodes == null) {
+        log.warn "helperHasDuplicateCode: lock ${lockId} lockCodes unreadable, not checked"
         return false
     }
-
-    Map lockCodes = parseJson(lockCodesJson)
+    if (!lockCodes) {
+        return false
+    }
 
     String codeName = helperGetCodeName(booking)
 
