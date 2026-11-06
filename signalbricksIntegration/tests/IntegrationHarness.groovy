@@ -1091,6 +1091,10 @@ check('#64 naming: ORB<digits> stripped from the guest string, id at start',
 app.idAtEnd = true
 check('#64 naming: ORB<digits> stripped from the guest string, id at end',
     app.helperGetCodeName([id: '77', guest: 'ORB5-Cy']) == 'G:Cy-ORB77' && app.helperGetCodeName([id: '77', guest: 'orb5']) == 'G:ORB77')
+check('#64 naming: orb<digits> inside a word is stripped too (Corb12 -> C)', app.helperGetCodeName([id: '77', guest: 'Corb12']) == 'G:C-ORB77')
+app.idAtEnd = false
+check('#64 naming: orb<digits> inside a word, id at start', app.helperGetCodeName([id: '77', guest: 'Corb12']) == 'G:ORB77-C')
+app.idAtEnd = true
 check('#64 naming: other guest strings unchanged', app.helperGetCodeName([id: '77', guest: 'Orbison Ann']) == 'G:Orbison Ann-ORB77' && app.helperGetCodeName([id: '77', guest: 'Cy']) == 'G:Cy-ORB77')
 app.idAtEnd = false
 r = prefixRun([:], [:], booking77(guest: 'Cy ORB5'))
