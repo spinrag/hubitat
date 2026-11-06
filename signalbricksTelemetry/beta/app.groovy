@@ -106,7 +106,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.4'
+@Field static final String APP_VERSION = '1.6.5'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -324,10 +324,17 @@ Map mainPage() {
             input(name: 'lockManagementEnabled', type: 'bool', title: 'Enable lock code management', defaultValue: false, submitOnChange: true)
             if (lockManagementEnabled) {
                 input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Locks SignalBricks may manage codes on', multiple: true, required: false, submitOnChange: true)
+                // Hubitat apps only see devices picked in an input, so Select all picks from the Devices locks (#66)
+                input(name: 'btnSelectAllCodeLocks', type: 'button', title: 'Select all')
+                input(name: 'btnClearCodeLocks', type: 'button', title: 'Clear')
+                paragraph '<small>Select all adds every lock selected under <b>Devices</b> that supports codes. Locks added later are not added until you click it again.</small>'
                 input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may manage (admin + managed codes; keep it below the booking apps' minimum code position)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
                 if (codeLocks) {
                     paragraph '<b>Full lock control (optional).</b> On the locks chosen here, and only once SignalBricks also turns full control on for them, SignalBricks may reach codes above the ceiling that it registered by slot and name (codes an admin adopted in SignalBricks). It never writes into empty slots above the ceiling, and never touches booking codes (names with <code>ORB</code> followed by a digit in any letter case, <code>ORB</code> starting a word, or starting with <code>G:</code> or <code>GT:</code>) or codes without a name. Leave empty to keep everything above the ceiling behind the approvals below.'
                     input(name: 'fullControlLocks', type: 'enum', title: 'Locks SignalBricks may fully control', options: codeLocks.collectEntries { [(it.id.toString()): escapeHtml(it.displayName?.toString())] }, multiple: true, required: false, submitOnChange: true)
+                    input(name: 'btnSelectAllFullControl', type: 'button', title: 'Select all')
+                    input(name: 'btnClearFullControl', type: 'button', title: 'Clear')
+                    paragraph '<small>Select all chooses every lock above. Locks added later are not added until you click it again.</small>'
                 }
                 Map pending = pendingAdoptedOptions()
                 if (pending) {
@@ -545,6 +552,20 @@ void appButtonHandler(String btn) {
             state.remove('fingerprintKeyPending')
             log.info 'SignalBricks Telemetry: new fingerprint key rejected in the app'
         }
+    } else if (btn == 'btnSelectAllCodeLocks') {
+        // One-shot (#66): the picks so far plus every Devices lock that supports codes
+        List ids = ((codeLocks ?: []) + (locks ?: []).findAll { it.hasCapability('LockCodes') }).collect { it.id.toString() }.unique()
+        if (ids) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: ids])
+    } else if (btn == 'btnClearCodeLocks') {
+        app.removeSetting('codeLocks')
+    } else if (btn == 'btnSelectAllFullControl') {
+        List ids = (codeLocks ?: []).collect { it.id.toString() }
+        if (ids) {
+            app.updateSetting('fullControlLocks', [type: 'enum', value: ids])
+            log.info "SignalBricks Telemetry: full lock control allowed on all ${ids.size()} locks selected for lock code management"
+        }
+    } else if (btn == 'btnClearFullControl') {
+        app.removeSetting('fullControlLocks')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         // Any open Reconnect link carried the old token, so it is dead now
