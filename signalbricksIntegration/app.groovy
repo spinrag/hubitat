@@ -600,6 +600,8 @@ void scheduleEvents(Map bookings) {
     // ...and a pending SignalBricks registration retry (#34), and an open Reconnect link's expiry (#46)
     sbRegisterRetryRearm()
     sbConnectLinkRearm()
+    // ...and the retries of code writes the locks haven't confirmed
+    verifySetCodeRearm()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -1171,11 +1173,11 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
                 // Is the booking's code different from the current code (compared as text, #63)
                 else if (helperCodeText(sbCodes[bookingId].code) != helperCodeText(booking.code)) {
                     // The lock hides the code (********) or reports none: unknown, the name matches.
-                    // Rewritten only when this slot has no record of the booking's current code
-                    // (untracked, or its code changed), or when the operator asks
+                    // Rewritten only when this slot has no confirmed record of the booking's current
+                    // code (untracked, unconfirmed, or its code changed), or when the operator asks
                     if (!rewriteUnknown && !helperCodeKnown(sbCodes[bookingId].code)) {
                         Map a = lockAssignments["${sbCodes[bookingId].key}"]
-                        if (a && !a.deleting && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && helperCodeText(a.code) == helperCodeText(booking.code)) return
+                        if (a && !a.deleting && a.confirmed != false && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && helperCodeText(a.code) == helperCodeText(booking.code)) return
                     }
                     if (holdWrites) {
                         held++
@@ -1356,8 +1358,28 @@ void verifySetCode(Map data) {
         return
     }
 
+    // A newer send of this slot has its own verify: only the latest one retries
+    if (data.attempt != null && a.attempt != null && "${a.attempt}" != "${data.attempt}") {
+        log.debug "verifySetCode: lock ${data.lockId} pos ${data.codePosition} sent again since, this retry stops"
+        return
+    }
+
     log.warn "verifySetCode: not confirmed for lock ${data.lockId} pos ${data.codePosition} after attempt ${a.attempt} — retrying"
     trySetCode(data)
+}
+
+// An app-wide unschedule() removed the verifySetCode timers: put one back for each tracked
+// write the lock hasn't confirmed, so it keeps being re-sent
+void verifySetCodeRearm() {
+    (atomicState.codeAssignments ?: [:]).each { lockId, lockAssignments ->
+        if (!(lockAssignments instanceof Map)) return
+        lockAssignments.each { pos, a ->
+            if (!(a instanceof Map) || !helperPendingSet(a) || !"${pos}".isInteger()) return
+            int attempt = (a.attempt ?: 0) as int
+            runIn(Math.min(60 + (attempt * 30), sbMaxRetryDelaySec), 'verifySetCode', [ overwrite: false, data: [
+                lockId: lockId, codePosition: "${pos}".toInteger(), code: a.code, codeName: a.codeName, attempt: attempt ]])
+        }
+    }
 }
 
 void tryDeleteCode(Map data) {
@@ -1645,6 +1667,7 @@ Map apiUnregister() {
         sbRegisterRetryRearm()
         sbConnectLinkRearm()
         sbScheduleAppInfo()
+        verifySetCodeRearm()
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {
@@ -2372,7 +2395,7 @@ String helperEventCode(Map data, String pos) {
 // confirm, never to claim a slot, so a wrong match costs a missed re-send at most
 boolean helperSameCode(String reported, String written) {
     if (reported == written) return true
-    return written.startsWith('0') && reported.length() < written.length() && written.replaceFirst(/^0+/, '') == reported
+    return written.startsWith('0') && reported.length() < written.length() && (written.replaceFirst(/^0+/, '') ?: '0') == reported
 }
 
 // Mismatching confirmations of this app's own name in a row before a warning

@@ -1039,6 +1039,7 @@ check('1.4.16 duplicate: booking code a number, lock code text', dup(['20': [nam
 check('1.4.16 duplicate: surrounding spaces still a duplicate', dup(['20': [name: 'Front desk', code: ' 20000077 ']]))
 check('1.4.16 duplicate: another current booking\'s slot, code as a number', dup(['53': [name: 'G:ORB88-Di', code: 20000077]]))
 check('1.4.16 duplicate: a code that only lost its leading zero is a duplicate', dup(['20': [name: 'Front desk', code: 1234567]], booking77(code: '01234567')))
+check('1.4.16 duplicate: an all-zero PIN reported as 0 is a duplicate', dup(['20': [name: 'Front desk', code: 0]], booking77(code: '0000')) && app.helperSameCode('0', '0000') && !app.helperSameCode('', '0000'))
 check('1.4.16 duplicate: a longer code is not (0 added, not dropped)', !dup(['20': [name: 'Front desk', code: '01234567']], booking77(code: '1234567')))
 check('1.4.16 duplicate: a different number is not', !dup(['20': [name: 'Front desk', code: 20000079]]) && !dup(['20': [name: 'Front desk', code: 101234567]], booking77(code: '01234567')))
 check('1.4.16 duplicate: a hidden or missing code is not ("can\'t tell")', !dup(['20': [name: 'Front desk', code: '********']]) && !dup(['20': [name: 'Front desk']]) && !dup(['20': [name: 'Front desk', code: '']]))
@@ -1062,7 +1063,7 @@ Map hidden51 = ['51': [name: 'G:ORB77-Cy', code: '********']]
 r = prefixRun(hidden51, tracked77, booking77(guest: 'VIP Cy'))
 check('1.4.16 hidden code, guest name changed: no rewrite', r.sets.isEmpty())
 r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [confirmed: false]]], booking77())
-check('1.4.16 hidden code, write not confirmed yet: its own retry re-sends it, reconcile doesn\'t', r.sets.isEmpty())
+check('1.4.16 hidden code, write not confirmed yet: reconcile re-sends it into its slot', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].code == '20000077')
 r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [code: '20000070']]], booking77())
 check('1.4.16 hidden code, booking code changed: rewritten once into its slot with the new code',
     r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].code == '20000077' && r.sets[0].codeName == 'G:ORB77-Cy')
@@ -1086,6 +1087,40 @@ check('1.4.16 untracked slot, hidden code: the lock confirms it', app.atomicStat
 r = prefixRun(hidden51, app.atomicState.codeAssignments, booking77())
 r2 = prefixRun(hidden51, app.atomicState.codeAssignments, booking77())
 check('1.4.16 untracked slot, hidden code: no rewrite on the next runs', r.sets.isEmpty() && r2.sets.isEmpty())
+// A write the lock never confirms (event lost) is re-sent, also after an app-wide unschedule()
+lock.attrs.lockCodes = JsonOutput.toJson(hidden51)
+app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(['7': ['51': tracked77['7']['51'] + [code: '20000070']]]))
+app.scheduled.clear()
+app.reconcileDoorCodes(booking77())
+def sent = app.scheduled.find { it.handler == 'trySetCode' }
+app.scheduled.remove(sent)
+lock.setCalls.clear()
+app.trySetCode(sent.data)
+check('1.4.16 lost confirmation: the write is sent, unconfirmed, with its verify scheduled',
+    lock.setCalls == [51] && app.atomicState.codeAssignments['7']['51'].confirmed == false && app.scheduled.any { it.handler == 'verifySetCode' })
+app.reconcileDoorCodes(booking77())
+check('1.4.16 lost confirmation: the next reconcile (nothing cleared) re-sends it into its slot',
+    app.scheduled.count { it.handler == 'trySetCode' && it.data.codePosition == 51 && it.data.code == '20000077' } == 1)
+// scheduleEvents' real unschedule() clears every timer; the pending verify comes back
+app.scheduleEvents(booking77())
+def rearmed = app.scheduled.findAll { it.handler == 'verifySetCode' }
+check('scheduleEvents: unschedule() then the unconfirmed write\'s verify is re-armed (one, latest attempt)',
+    !app.scheduled.any { it.handler == 'trySetCode' } && rearmed.size() == 1 && rearmed[0].data.codePosition == 51 && rearmed[0].data.code == '20000077' && rearmed[0].data.attempt == 1)
+lock.setCalls.clear()
+app.verifySetCode(rearmed[0].data)
+check('scheduleEvents: the re-armed verify re-sends the write', lock.setCalls == [51] && app.atomicState.codeAssignments['7']['51'].attempt == 2)
+lock.setCalls.clear()
+app.verifySetCode(rearmed[0].data)
+check('verifySetCode: an older attempt\'s verify stops once the slot was sent again', lock.setCalls.isEmpty())
+app.codeChangedHandler([device: [id: '7'], value: 'changed', data: JsonOutput.toJson(['51': [name: 'G:ORB77-Cy', code: '********']])])
+app.scheduleEvents(booking77())
+check('scheduleEvents: a confirmed write gets no verify', app.atomicState.codeAssignments['7']['51'].confirmed == true && !app.scheduled.any { it.handler == 'verifySetCode' })
+app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(['7': ['51': tracked77['7']['51'] + [confirmed: false, attempt: 3], '52': tracked77['7']['51'] + [confirmed: false, deleting: true]]]))
+app.scheduleEvents(booking77())
+rearmed = app.scheduled.findAll { it.handler == 'verifySetCode' }
+check('scheduleEvents: only unconfirmed writes are re-armed (not deletes), with their backoff', rearmed.size() == 1 && rearmed[0].data.codePosition == 51 && rearmed[0].data.attempt == 3 && rearmed[0].secs == 150)
+app.apiUnregister()
+check('unregister: unschedule() then the unconfirmed write\'s verify is re-armed', app.scheduled.count { it.handler == 'verifySetCode' && it.data.codePosition == 51 } == 1)
 // The operator asks: Debug -> Reconcile Door Codes rewrites it
 lock.attrs.lockCodes = JsonOutput.toJson(hidden51)
 app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(tracked77))
@@ -1099,7 +1134,7 @@ r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '20000079']], tracked77, booking
 check('1.4.16 a different readable code on a tracked slot is still rewritten', r.sets.size() == 1 && r.sets[0].codePosition == 51)
 r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '********']], tracked77, [:])
 check('1.4.16 hidden code after checkout: still deleted', r.deletes == [51])
-check('1.4.16 no warning for hidden or missing codes', app.warned.isEmpty())
+check('1.4.16 no warning for hidden or missing codes (only the re-send of a write not confirmed)', app.warned.every { it.startsWith('verifySetCode: not confirmed for lock 7 pos 51') } && app.warned.size() == 1)
 check('1.4.16 logs: no code', !newLogs().any { l -> ['20000077', '20000070', '20000079', '1234567'].any { l.contains(it) } })
 lock.attrs.lockCodes = '{}'
 app.atomicState.codeAssignments = [:]
