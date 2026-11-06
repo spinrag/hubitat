@@ -42,17 +42,16 @@ Updates an **existing** Cloudflare A or AAAA record with your current public IP.
 ---
 
 ### 🔹 [SignalBricks Integration](signalbricksIntegration/README.md) — *app*
-Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Zigbee locks. Runs alongside the OwnerRez app. Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
+Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Zigbee locks. Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCommunity/OwnerRez) app, rebranded and substantially reworked.
 
-- Codes are named `<prefix>ORB<booking id>-<guest>` and are on the lock from before check-in to after checkout
-- Both apps need different, non-empty code name prefixes (e.g. OwnerRez `G:`, SignalBricks Integration `GT:`)
-- Manages codes named with its prefix + `ORB<booking id>`, plus slots it assigned earlier; writes new codes only into empty slots from its minimum code position up
+- A booking's code is on the lock from before check-in to after checkout
+- Manages only codes named with its own code name prefix, and writes new codes only into empty slots from its minimum code position up
+- Can share locks with other lock-code apps that use their own prefix
 - Don't run Hubitat's Lock Code Manager on the same locks
-- Per-code retry-until-confirmed, with a reconcile loop for missed confirmations
+- Retries each code write until the lock confirms it
 - Door code refresh (re-reading the codes from the locks) is off by default and reads one lock at a time, weekly, daily or on demand
-- Small access-token gated REST API (`/sync`, `/devices`, `/info`, …) used by the dispatcher (not included in this repo)
-- **Reconnect to SignalBricks** opens a sign-in link for 10 minutes; whether it is used or not, the app then replaces its access token and registers the new one
-- Announces its version and slot settings on the hub (a hub-local location event, no network call) for SignalBricks Telemetry's daily report
+- One-click **Connect to SignalBricks** (OAuth), no tokens to copy
+- Announces its version and slot settings on the hub for SignalBricks Telemetry's daily report
 
 📂 [`signalbricksIntegration`](signalbricksIntegration/)
 
@@ -66,7 +65,7 @@ Sends read-only lock, contact, temperature, humidity and battery events to Signa
 - One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste. **Reconnect** works with lock code management on: its link lasts 10 minutes, then the token is replaced and registered again
 - Telemetry never subscribes to `lockCodes`, never controls devices, and doesn't send PINs unless you turn on *Include door codes* (1.3.5+, off by default; SignalBricks then keeps only a keyed hash, and only if your organization's admin also allows it)
 - Non-blocking `asynchttpPost` delivery
-- Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, with hub-side slot enforcement
+- Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, limited to the locks and slots you allow
 - **Daily hub report**: app versions and slot settings, hub firmware and uptime, and lock health (battery, jammed, number of occupied slots; never codes or code names)
 
 📂 [`signalbricksTelemetry`](signalbricksTelemetry/)
@@ -125,6 +124,8 @@ Contributions and feedback are welcome!
 
 - 🐛 Open an issue for bug reports or feature requests
 - 📬 Submit pull requests for enhancements or compatibility extensions
+- 📝 Read [CONTRIBUTING.md](CONTRIBUTING.md) first
+- 🔒 Report security problems privately, never in a public issue: see [SECURITY.md](SECURITY.md)
 
 ---
 

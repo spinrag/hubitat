@@ -113,7 +113,7 @@ app.state = [:]; app.atomicState = new JsonStateMap(); app.settings = [locks: ['
 // 99 an orphan, 77 on a lock it isn't assigned to, plus codes that aren't the app's
 Map frontCodes = [
     '20': [name: 'Front desk', code: '97531864'],
-    '30': [name: 'G:ORB77-Bob', code: '11223344'], // the OwnerRez app's prefix
+    '30': [name: 'G:ORB77-Bob', code: '11223344'], // another booking app's prefix
     '50': [name: 'GT:ORB88-Ann', code: '24681357'],
     '51': [name: 'GT:ORB99-Old', code: '13572468'],
     '52': [name: 'GT:ORB77-Bob', code: '86420975'], // 77 is not assigned to Front

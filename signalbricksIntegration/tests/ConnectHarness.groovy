@@ -38,7 +38,7 @@ abstract class HubitatStub extends Script {
     // Responses for the next httpPost calls, by path suffix: status or a Map body (200)
     Map replies = [:]
     def app = [id: 42]
-    def location = [name: 'Ross Farm House', hub: [name: 'Main Hub', localIP: '192.168.1.10'], timeZone: TimeZone.getTimeZone('UTC')]
+    def location = [name: 'Example Org', hub: [name: 'Main Hub', localIP: '192.168.1.10'], timeZone: TimeZone.getTimeZone('UTC')]
     void definition(Map m) {}
     void mappings(Closure c) {}
     void preferences(Closure c) { pages = c }
@@ -139,15 +139,15 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.14' && q.location == 'Ross Farm House')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.14' && q.location == 'Example Org')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
 
 // --- Callback: exchange, replace the token, register ---
 app.replies = [
-    '/oauth/hubitat-integration/token': [access_token: CREDENTIAL, token_type: 'Bearer', organization_name: 'Ross Farm House', hub_name: 'Main'],
-    '/oauth/hubitat-integration/register': [status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'],
+    '/oauth/hubitat-integration/token': [access_token: CREDENTIAL, token_type: 'Bearer', organization_name: 'Example Org', hub_name: 'Main'],
+    '/oauth/hubitat-integration/register': [status: 'connected', organization_name: 'Example Org', hub_name: 'Main', slug: 'main'],
 ]
 secrets << CREDENTIAL << 'fake-auth-code-1'
 app.params = [code: 'fake-auth-code-1', access_token: firstToken]
@@ -166,11 +166,11 @@ check('register: hub uid, app id, version, hub name, URLs and the new token', re
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
-app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Ross Farm House', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Ross Farm House' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.14')
+app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Example Org', hub_name: 'Main', slug: 'main'])], null)
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Example Org' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.14')
 
 page = mainPage()
-check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Ross Farm House &rarr; Main') && oneStatus(page))
+check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Example Org &rarr; Main') && oneStatus(page))
 app.paragraphs.clear(); app.hrefs.clear(); app.debug()
 String debugPage = (app.paragraphs + app.hrefs.collect { "${it.title} ${it.url}" }).join('\n')
 check('debug page: no access token while connected', !debugPage.contains(app.state.accessToken) && !debugPage.contains('access_token=') && debugPage.contains('Hidden while connected'))
@@ -200,7 +200,7 @@ secrets << app.state.sbPkceVerifier
 app.http.clear()
 String CREDENTIAL_2 = CREDENTIAL.replace('00', '11')
 secrets << CREDENTIAL_2
-app.replies['/oauth/hubitat-integration/token'] = [access_token: CREDENTIAL_2, organization_name: 'Ross Farm House', hub_name: 'Main']
+app.replies['/oauth/hubitat-integration/token'] = [access_token: CREDENTIAL_2, organization_name: 'Example Org', hub_name: 'Main']
 app.params = [code: 'fake-auth-code-2']
 app.oauthCallback()
 check('reconnect: token rotated and registered with the new credential',
@@ -281,7 +281,7 @@ app.state.remove('sbLastError')
 secrets << app.state.accessToken
 
 // --- Disconnect: revoke, forget, replace the token ---
-app.replies['/oauth/hubitat-integration/token'] = [access_token: CREDENTIAL, organization_name: 'Ross Farm House', hub_name: 'Main']
+app.replies['/oauth/hubitat-integration/token'] = [access_token: CREDENTIAL, organization_name: 'Example Org', hub_name: 'Main']
 app.state.sbPkceVerifier = 'd' * 96
 app.params = [code: 'fake-auth-code-6']
 app.oauthCallback()
@@ -377,7 +377,7 @@ check('retry: no registration once retries are exhausted', app.http.isEmpty())
 app.sbRegister()
 app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
 fireRetry()
-app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
+app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Example Org', hub_name: 'Main'])], null)
 check('retry: 200 stops the retries and connects', !retryJob() && !app.state.sbRegisterRetry && app.state.sbConnected && !mainPage().contains('Registration retries'))
 app.sbRegisterCallback([status: 500, data: null], null)
 app.sbRegisterCallback([status: 409, data: '{"error":"hub_bound_elsewhere"}'], null)
@@ -408,7 +408,7 @@ app.request = [JSON: [:]]
 app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
-app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Ross Farm House', hub_name: 'Main'])], null)
+app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Example Org', hub_name: 'Main'])], null)
 check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.14' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---

@@ -116,7 +116,7 @@ def check = { String label, boolean ok -> println((ok ? 'PASS ' : 'FAIL ') + lab
 def body = { Map r -> r.data ? new JsonSlurper().parseText(r.data) : null }
 
 // Fake codes only. Layout: admin 1-10, managed 11-20, ceiling 25, maxCodes 40.
-// Booking codes (SignalBricks Integration GT:, OwnerRez fork G:, lower-case,
+// Booking codes (SignalBricks Integration GT:, another booking app's G:, lower-case,
 // unnamed) sit both inside the ranges (a booking app with minCodePosition 0)
 // and above the ceiling.
 Map initial = [

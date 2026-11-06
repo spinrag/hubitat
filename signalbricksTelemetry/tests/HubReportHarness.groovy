@@ -217,7 +217,7 @@ app.clock = 1_793_311_200_000L
 announce([schemaVersion: 1, appId: '388', name: 'SignalBricks Integration', version: '1.4.6', minCodePosition: 50, codeNamePrefix: 'GT: '])
 Map infos = app.state.appInfos
 check('collect: one entry per app id', infos.keySet() == ['412', '388'] as Set)
-check('collect: fork entry has exactly the contract keys + lastSeenAt', infos['412'].keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'manageDoorCodes', 'lastSeenAt'])
+check('collect: other booking app entry has exactly the contract keys + lastSeenAt', infos['412'].keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'manageDoorCodes', 'lastSeenAt'])
 check('collect: extra keys (code, lockCodes, guest, token) dropped', !allKeys(infos).any { it in ['code', 'lockCodes', 'guest', 'token'] } && !JsonOutput.toJson(infos).contains(CODES[0]) && !JsonOutput.toJson(infos).contains(INGEST))
 check('collect: lastSeenAt is when Telemetry got it', infos['412'].lastSeenAt == 1_793_314_800_000L && infos['388'].lastSeenAt == 1_793_311_200_000L)
 app.clock = 1_793_316_000_000L
@@ -260,7 +260,7 @@ check("daily: body validates against the schema (${validateReport(r)})", validat
 check('daily: top-level field names match the doc example exactly', r.keySet() == docReport.keySet())
 check('daily: telemetry field names match the doc', r.telemetry.keySet() == docReport.telemetry.keySet())
 check('daily: hub field names match the doc (no model)', r.hub.keySet() == docReport.hub.keySet() && !r.hub.containsKey('model'))
-check('daily: fork app field names match the doc', r.apps.find { it.appId == '412' }.keySet() == docReport.apps[0].keySet())
+check('daily: other booking app field names match the doc', r.apps.find { it.appId == '412' }.keySet() == docReport.apps[0].keySet())
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
