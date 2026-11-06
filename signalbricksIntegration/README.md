@@ -142,6 +142,8 @@ You don't need to open the app and click **Done** after an update; the existing 
 
 **After updating to 1.4.13 or 1.4.14:** open the **Bookings** page and, on the lock's device page, delete by hand any codes it lists as copies of a booking's code and any slot it says *names two bookings*.
 
+**After updating to 1.4.15:** when SignalBricks no longer accepts the hub's connection, the app replaces its access token and shows **Connect to SignalBricks** again.
+
 ## Troubleshooting
 
 - **No codes are generated for a booking.** Check the log for `no free code position`: the lock has no empty slot between **Minimum Code Position** and its `maxCodes`. Lower the minimum or free slots, and check that the lock is selected in the app.
