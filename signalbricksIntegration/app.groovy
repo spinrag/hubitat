@@ -1270,7 +1270,7 @@ void trySetCode(Map data) {
     Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
     boolean stale
     if (data.attempt != null) {
-        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}"
+        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}" || !helperRetryWanted(data, tracked)
     } else {
         Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
         def lockCode = codes == null ? null : (codes[data.codePosition] ?: codes["${data.codePosition}"])
@@ -1364,8 +1364,53 @@ void verifySetCode(Map data) {
         return
     }
 
+    if (!helperRetryWanted(data, a)) return
+
     log.warn "verifySetCode: not confirmed for lock ${data.lockId} pos ${data.codePosition} after attempt ${a.attempt} — retrying"
     trySetCode(data)
+}
+
+// Whether a retry of an unconfirmed write is still wanted. No, and the retry stops, when the
+// lock is no longer selected or the slot's booking is no longer current on it. On a readable
+// lock, what it reports in the slot decides like a codeChanged event (#59): the code written
+// (not masked) confirms the write; another name or booking drops the tracking (foreign), and
+// reconcile puts the booking in a free slot. Never log the code or the name
+boolean helperRetryWanted(Map data, Map a) {
+    String lockKey = "${data.lockId}"
+    String pos = "${data.codePosition}"
+    def lock = locks.find { "${it.id}" == lockKey }
+    String bid = "${a.bookingId ?: ''}".find(/\d+/)
+    Map current = helperFindCurrentBookings(helperGetBookings(atomicState.bookings ?: [:]))
+    if (!lock || !bid || !current.values().any { b -> "${b.id}" == bid && b.lockId.any { "${it}" == lockKey } }) {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos}: ${a.bookingId} is no longer current on this lock, retry stopped"
+        return false
+    }
+
+    Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+    def lockCode = codes ? (codes[pos] ?: codes[data.codePosition]) : null
+    if (!(lockCode instanceof Map)) return true
+    Map slot = [(pos): lockCode]
+    String v = helperEventVerdict(slot, pos, a)
+    boolean confirm = v == 'match' && helperEventCode(slot, pos) != null
+    if (!confirm && v != 'foreign') return true
+
+    Map assignments = atomicState.codeAssignments ?: [:]
+    Map lockAssignments = assignments[lockKey] ?: [:]
+    if (confirm) {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos} reports the code written for ${a.bookingId}: confirmed"
+        a.confirmed = true
+        a.remove('mismatches')
+        lockAssignments[pos] = a
+    } else {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos} holds another code than ${a.bookingId}; tracking dropped, reconcile in 10 s"
+        lockAssignments.remove(pos)
+        Map displaced = atomicState.codeDisplaced ?: [:]
+        atomicState.codeDisplaced = displaced + [(lockKey): ((displaced[lockKey] ?: []) + [bid]).unique()]
+        runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+    }
+    assignments[lockKey] = lockAssignments
+    atomicState.codeAssignments = assignments
+    return false
 }
 
 // An app-wide unschedule() removed the verifySetCode timers: put one back for each tracked
