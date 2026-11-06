@@ -5,7 +5,7 @@
 	"packages": [
 		{
 			"name": "Cloudflare DNS Updater",
-			"description": "Updates an existing Cloudflare A or AAAA record with the hub's current public IP using a scoped API token. Update-only — never creates new records.",
+			"description": "Dynamic DNS (DDNS): updates an existing Cloudflare A or AAAA record with the hub's current public IP using a scoped API token. Update-only — never creates new records.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/cloudflareDnsUpdater/packageManifest.json",
 			"category": "Utility",
 			"tags": ["Cloud", "Tools & Utilities"]
@@ -19,7 +19,7 @@
 		},
 		{
 			"name": "DNS Made Easy Updater",
-			"description": "Updates a DNS Made Easy A record with your public IP using Hubitat.",
+			"description": "Dynamic DNS (DDNS): updates a DNS Made Easy A record with your public IP using Hubitat.",
 			"location": "https://raw.githubusercontent.com/spinrag/hubitat/main/dnsMadeEasyUpdater/packageManifest.json",
 			"category": "Utility",
 			"tags": ["Cloud", "Tools & Utilities"]

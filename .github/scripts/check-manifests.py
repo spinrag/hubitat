@@ -142,7 +142,10 @@ for path in manifests:
         errors.append(f"{path}: malformed minimumHEVersion {m['minimumHEVersion']!r}")
     if m.get("dateReleased"):
         try:
-            datetime.date.fromisoformat(m["dateReleased"])
+            # strptime alone accepts unpadded 2025-6-9
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", m["dateReleased"]):
+                raise ValueError
+            datetime.datetime.strptime(m["dateReleased"], "%Y-%m-%d")
         except (TypeError, ValueError):
             errors.append(f"{path}: dateReleased {m['dateReleased']!r} is not YYYY-MM-DD")
     if not m.get("apps") and not m.get("drivers"):
