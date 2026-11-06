@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.12' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.13' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -353,6 +353,7 @@ void appButtonHandler(String btnName) {
             atomicState.codeWritesDeferred = [:]
             atomicState.lockCodesUnreadable = []
             atomicState.codeDisplaced = [:]
+            atomicState.codeShortWarned = [:]
             atomicState.codeAutoReadAt = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
@@ -1084,6 +1085,9 @@ void reconcileDoorCodes(Map bookings) {
 
         // Writes held back on this lock; a booking's own tracked slot is still written
         int held = 0
+        // Slots that report a booking's code without its leading zeros, and those already warned
+        List shortSlots = []
+        List shortWarned = (atomicState.codeShortWarned ?: [:])[lockKey] ?: []
 
         // Are there any active bookings
         if (currentLockBookings) {
@@ -1150,6 +1154,15 @@ void reconcileDoorCodes(Map bookings) {
                         codePosition = sbCodes[bookingId].key
                     }
 
+                    // The lock reports the code without its leading zeros: rewriting it may not
+                    // help, so say so once while it lasts, not on every run (#61)
+                    String lockCode = "${sbCodes[bookingId].code ?: ''}".trim()
+                    String bookingCode = "${booking.code ?: ''}".trim()
+                    if (lockCode != bookingCode && helperSameCode(lockCode, bookingCode)) {
+                        shortSlots << "${codePosition}".toString()
+                        if (!shortWarned.contains("${codePosition}".toString())) log.warn "reconcileDoorCodes: lock ${lock.id} pos ${codePosition} keeps reporting the code without its leading zeros; rewriting it (the lock may hold the shorter code)"
+                    }
+
                     // Re-set the code
                     log.debug "reconcileDoorCodes: re-running trySetCode ${codePosition} ${helperLogBooking(booking)}"
 
@@ -1157,6 +1170,9 @@ void reconcileDoorCodes(Map bookings) {
                 }
             }
         }
+
+        // Kept while writes are held back (no rewrite ran); dropped once the lock reports the whole code
+        if (!holdWrites && (shortSlots as Set) != (shortWarned as Set)) atomicState.codeShortWarned = (atomicState.codeShortWarned ?: [:]) + [(lockKey): shortSlots]
 
         if (held) {
             log.info "reconcileDoorCodes: lock ${lock.id} (${lock.label ?: lock.name}) ${holdWrites}, deferring ${held} code writes"
@@ -1221,7 +1237,7 @@ void trySetCode(Map data) {
         def lockCode = codes == null ? null : (codes[data.codePosition] ?: codes["${data.codePosition}"])
         String bookingId = data.codeName?.find(/ORB\d+/) ?: ''
         String v = helperTrackedVerdict([bookingId: bookingId], lockCode, data.codePosition)
-        boolean ours = bookingId && lockCode?.name?.toString()?.find(/ORB\d+/) == bookingId
+        boolean ours = bookingId && lockCode?.name?.toString()?.toUpperCase()?.find(/ORB\d+/) == bookingId
         stale = codes == null || v in ['otherName', 'otherBooking'] || (data.free && lockCode && !ours)
     }
     if (stale) {
@@ -1247,7 +1263,8 @@ void trySetCode(Map data) {
     if (!assignments[lockKey]) assignments[lockKey] = [:]
     // Mismatching confirmations carry over a re-send of the same write (#59)
     Map previous = assignments[lockKey]["${data.codePosition}"]
-    def mismatches = previous?.codeName == data.codeName && previous?.code == data.code ? previous?.mismatches : null
+    boolean sameWrite = previous?.codeName == data.codeName && previous?.code == data.code
+    def mismatches = sameWrite ? previous?.mismatches : null
     assignments[lockKey]["${data.codePosition}"] = [
         bookingId: data.codeName?.find(/ORB\d+/) ?: 'unknown',
         code: data.code,
@@ -1256,6 +1273,8 @@ void trySetCode(Map data) {
         confirmed: false,
     ]
     if (mismatches) assignments[lockKey]["${data.codePosition}"].mismatches = mismatches
+    // The leading-zero warning is given once per write, also across re-sends (#61)
+    if (sameWrite && previous?.shortWarned) assignments[lockKey]["${data.codePosition}"].shortWarned = true
     atomicState.codeAssignments = assignments
     log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt})"
 
@@ -1423,6 +1442,14 @@ void codeChangedHandler(e) {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
                     assignment.confirmed = true
                     assignment.remove('mismatches')
+                    // Confirmed only by the leading-zero tolerance: the lock may hold the shorter code (#61)
+                    String reported = helperEventCode(data, pos)
+                    if (reported != null && reported != "${assignment.code ?: ''}".trim()) {
+                        if (!assignment.shortWarned) log.warn "codeChangedHandler: lock ${lockId} pos ${pos} reported the code written without its leading zeros; the lock may hold the shorter code"
+                        assignment.shortWarned = true
+                    } else if (reported != null) {
+                        assignment.remove('shortWarned')
+                    }
                     lockAssignments[pos] = assignment
                     assignments[lockId] = lockAssignments
                     atomicState.codeAssignments = assignments
@@ -2025,12 +2052,13 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             return false
         }
 
-        if (existing.name?.contains('ORB')) {
+        if (existing.name?.toUpperCase()?.contains('ORB')) {
             // Extract the booking id with a regex (hyphen-safe) instead of splitting
             // on '-', which threw when the guest name contained a hyphen (the id
             // landed past parts[1], so substring(indexOf('ORB')) == substring(-1)).
             // SignalBricks keys bookings by BARE digits, so capture group 1.
-            def m = (existing.name =~ /ORB(\d+)/)
+            // Ignoring case, like reconcile (#61)
+            def m = (existing.name =~ /(?i)ORB(\d+)/)
             if (m.find()) {
                 String bookingId = m.group(1)
                 // The booking's own code under an older name (prefix or guest name changed)
@@ -2154,6 +2182,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
 // What the lock shows in a slot this app tracks: 'empty', 'claim' (no name, a driver
 // placeholder naming this slot's number such as "Code 54" or "User #54" in slot 54, or
 // the same ORB<id>), 'otherBooking' (another ORB<id>) or 'otherName' (any other name).
+// ORB matches ignoring case, like helperEventVerdict: some drivers lower-case names (#61).
 // Only ever applied to tracked slots: a "Code #1" in a slot the app never assigned is untouched.
 String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     if (!lockCode) return 'empty'
@@ -2161,7 +2190,7 @@ String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     if (!name || !name.trim()) return 'claim'
     def p = (name =~ /(?i)^\s*(?:(?:user\s*)?code|user|slot|pin|position|lock\s*code)?\s*(?:#|no\.?)?\s*(\d+)\s*$/)
     if (p.find() && pos.toString().trim().isInteger() && p.group(1).toInteger() == pos.toString().trim().toInteger()) return 'claim'
-    def nMatcher = (lockCode.name =~ /ORB(\d+)/)
+    def nMatcher = (name =~ /(?i)ORB(\d+)/)
     if (!nMatcher.find()) return 'otherName'
     def bMatcher = ("${assignment.bookingId ?: ''}" =~ /(\d+)/)
     return bMatcher.find() && bMatcher.group(1) == nMatcher.group(1) ? 'claim' : 'otherBooking'
@@ -2180,16 +2209,28 @@ String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
 // name and still holds the whole ORB of ORB<id>: GT:ORB matches GT:ORB77-Cy, GT and GT:ORB7
 // don't. Masked codes (not all digits) are ignored. Never log the name or the code.
 String helperEventVerdict(Map data, String pos, Map assignment) {
-    def entry = data[pos] instanceof Map ? data[pos] : data
+    def entry = helperEventEntry(data, pos)
     String name = (entry.name ?: entry.codeName)?.toString()?.trim()?.toUpperCase()
-    String code = entry.code?.toString()?.trim()
-    boolean reported = code ==~ /\d+/
+    String code = helperEventCode(data, pos)
+    boolean reported = code != null
     if (reported && helperSameCode(code, "${assignment.code ?: ''}".trim())) return 'match'
     if (!name) return reported ? 'stale' : 'match'
     String v = helperTrackedVerdict(assignment, [name: name], pos)
     String written = (assignment.codeName ?: '').toString().trim().toUpperCase()
     if (v == 'otherBooking' || (v == 'otherName' && !(name.contains('ORB') && written.startsWith(name)))) return 'foreign'
     return reported ? 'stale' : 'match'
+}
+
+// The slot's entry in codeChanged data: data["<slot>"], or else data itself
+Map helperEventEntry(Map data, String pos) {
+    return data[pos] instanceof Map ? data[pos] : data
+}
+
+// The code a codeChanged event reports for the slot (digits only), or null when it reports
+// none or a masked one. Never log it
+String helperEventCode(Map data, String pos) {
+    String code = helperEventEntry(data, pos).code?.toString()?.trim()
+    return code ==~ /\d+/ ? code : null
 }
 
 // A reported code against the one written. A driver that reports the code as a number

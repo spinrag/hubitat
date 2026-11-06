@@ -803,6 +803,105 @@ app.reconcileDoorCodes(booking77())
 check('#59 no free slot for a booking never displaced: no lost-its-slot warn', !newLogs().any { it.contains('lost its slot') } && newLogs().any { it.startsWith('reconcileDoorCodes: no free code position') })
 lock.attrs.maxCodes = 60
 
+// ORB<id> matches ignoring case in tracked slots too, like the event verdict (#61)
+check('#61 tracked verdict: a lower-cased same ORB<id> is claimed', app.helperTrackedVerdict([bookingId: 'ORB77'], [name: 'g:orb77-cy'], '51') == 'claim')
+check('#61 tracked verdict: a lower-cased other ORB<id> is another booking', app.helperTrackedVerdict([bookingId: 'ORB77'], [name: 'g:orb88-di'], '51') == 'otherBooking')
+check('#61 tracked verdict: other names are still other names', ['plumber', 'forb', 'g:or77', 'Front desk'].every { app.helperTrackedVerdict([bookingId: 'ORB77'], [name: it], '51') == 'otherName' })
+Map lower51 = ['51': [name: 'g:orb77-cy', code: '20000077']]
+Map trackedLower = ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]]
+r = prefixRun(lower51, trackedLower, booking77())
+check('#61 reconcile: a tracked slot with a lower-cased name stays the booking\'s (no second slot, no rewrite)', r.sets.isEmpty() && r.deletes.isEmpty() && assigned('51')?.bookingId == 'ORB77')
+r = prefixRun(lower51, trackedLower, [:])
+check('#61 reconcile: a tracked slot with a lower-cased name is removed after checkout', r.deletes == [51])
+r = prefixRun(lower51, trackedLower, booking77(code: '20000078'))
+check('#61 reconcile: a new code for the booking goes into its lower-cased tracked slot', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.deletes.isEmpty())
+r = prefixRun(['51': [name: 'g:orb88-di', code: '20000088']], trackedLower, booking77())
+check('#61 reconcile: a lower-cased other booking in the tracked slot is not claimed (tracking dropped, slot untouched)', assigned('51') == null && !r.deletes.contains(51) && r.sets.size() == 1 && r.sets[0].codePosition != 51)
+r = prefixRun(['51': [name: 'plumber', code: '30000051']], trackedLower, booking77())
+check('#61 reconcile: a lower-cased other name in the tracked slot is not claimed', assigned('51') == null && !r.deletes.contains(51) && r.sets[0]?.codePosition != 51)
+r = prefixRun(lower51, [:], [:])
+check('#61 reconcile: an untracked lower-cased name is still not claimed by name (left on the lock)', r.deletes.isEmpty())
+// Prune keeps a confirmed tracked slot with a lower-cased name, drops other names
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true],
+    '52': [bookingId: 'ORB88', code: '20000088', codeName: 'G:ORB88-Di', attempt: 1, confirmed: true]])
+app.helperPruneAssignments('7', ['51': [name: 'G:ORB77-CY'.toLowerCase()], '52': [name: 'g:orb99-zed']])
+check('#61 prune: a lower-cased same ORB<id> keeps its tracking, a lower-cased other one is dropped', assigned('51') != null && assigned('52') == null)
+// The check before a queued write accepts the lock's lower-cased name for this booking
+lock.attrs.maxCodes = 60
+lock.attrs.lockCodes = JsonOutput.toJson(lower51)
+app.atomicState.codeAssignments = tracked(trackedLower['7'])
+lock.setCalls.clear()
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000078', codeName: 'G:ORB77-Cy'])
+check('#61 guard: a scheduled rewrite into a lower-cased slot of this booking is sent', lock.setCalls == [51] && assigned('51')?.code == '20000078')
+lock.setCalls.clear()
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000078', codeName: 'G:ORB77-Cy', free: true])
+check('#61 guard: a new-slot write into a slot showing this booking lower-cased is sent', lock.setCalls == [51])
+['g:orb88-di', 'plumber'].each { String n ->
+    lock.attrs.lockCodes = JsonOutput.toJson(['51': [name: n, code: '30000051']])
+    lock.setCalls.clear()
+    app.trySetCode([lockId: '7', codePosition: 51, code: '20000078', codeName: 'G:ORB77-Cy'])
+    app.trySetCode([lockId: '7', codePosition: 51, code: '20000078', codeName: 'G:ORB77-Cy', free: true])
+    check("#61 guard: a scheduled write is still skipped over ${n}".toString(), lock.setCalls.isEmpty())
+}
+// The duplicate check: the booking's own lower-cased code is not a duplicate, another booking's still is
+lock.attrs.lockCodes = JsonOutput.toJson(lower51)
+check('#61 duplicate check: own lower-cased code is not a duplicate', !app.helperHasDuplicateCode('7', booking77()['77'], booking77()))
+lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'g:orb88-di', code: '20000077']])
+check('#61 duplicate check: the same PIN on another current booking, lower-cased, still is', app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88))
+
+// A confirmation that matched only by the leading-zero tolerance: one warn per write, lock and slot only
+String zeroMsg = 'codeChangedHandler: lock 7 pos 51 reported the code written without its leading zeros; the lock may hold the shorter code'
+Map zeroWrite = [lockId: '7', codePosition: 51, code: '01234567', codeName: 'G:ORB77-Cy', attempt: 1]
+String shortData = JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: 1234567]))
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = tracked(['51': [bookingId: 'ORB77', code: '01234567', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: false]])
+mark()
+app.warned.clear()
+app.codeChangedHandler(encEvent('changed', shortData))
+check('#61 leading zeros dropped: confirmed, one warn with the lock and slot only', assigned('51')?.confirmed == true && app.warned == [zeroMsg])
+app.codeChangedHandler(encEvent('changed', shortData))
+app.trySetCode(zeroWrite)
+check('#61 leading zeros dropped: a re-send of the same write keeps the warned mark', assigned('51')?.shortWarned == true && assigned('51')?.confirmed == false)
+app.codeChangedHandler(encEvent('added', shortData))
+check('#61 leading zeros dropped again (same event, a re-send): no second warn', app.warned.count { it == zeroMsg } == 1)
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy']))))
+check('#61 a confirmation without a code leaves the mark', assigned('51')?.shortWarned == true)
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([name: 'G:ORB77-Cy', code: '01234567']))))
+check('#61 the whole code reported: no warn, mark cleared', app.warned.count { it == zeroMsg } == 1 && assigned('51')?.shortWarned == null)
+app.codeChangedHandler(encEvent('changed', shortData))
+check('#61 shortened again after the whole code: warns again once', app.warned.count { it == zeroMsg } == 2)
+lock.attrs.lockCodes = '{}'
+app.trySetCode([lockId: '7', codePosition: 51, code: '01234568', codeName: 'G:ORB77-Cy'])
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([code: 1234568]))))
+check('#61 a write of another code warns on its own', app.warned.count { it == zeroMsg } == 3)
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([code: '20000077']))))
+app.atomicState.codeAssignments = pending51()
+app.codeChangedHandler(encEvent('changed', JsonOutput.toJson(slotData([code: 20000077]))))
+check('#61 the whole code, as text or a number: no leading-zero warn', app.warned.count { it == zeroMsg } == 3 && assigned('51')?.shortWarned == null)
+check('#61 leading-zero confirmation logs: no code', !newLogs().any { it.contains('1234567') || it.contains('1234568') })
+
+// Reconcile keeps finding the shorter code on the lock: it rewrites each run, warns once while it lasts
+String zeroRecMsg = 'reconcileDoorCodes: lock 7 pos 51 keeps reporting the code without its leading zeros; rewriting it (the lock may hold the shorter code)'
+Map zeroTracked = ['7': ['51': [bookingId: 'ORB77', code: '01234567', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]]
+Map shortOnLock = ['51': [name: 'G:ORB77-Cy', code: 1234567]]
+app.atomicState.codeShortWarned = [:]
+mark()
+app.warned.clear()
+r = prefixRun(shortOnLock, zeroTracked, booking77(code: '01234567'))
+def r2 = prefixRun(shortOnLock, zeroTracked, booking77(code: '01234567'))
+check('#61 reconcile, shorter code on the lock: rewritten each run, one warn with the lock and slot only',
+    r.sets.size() == 1 && r.sets[0].codePosition == 51 && r2.sets.size() == 1 && app.warned == [zeroRecMsg])
+prefixRun(['51': [name: 'G:ORB77-Cy', code: '01234567']], zeroTracked, booking77(code: '01234567'))
+check('#61 reconcile, whole code on the lock: no warn, mark cleared', app.warned.size() == 1 && (app.atomicState.codeShortWarned['7'] ?: []).isEmpty())
+prefixRun(shortOnLock, zeroTracked, booking77(code: '01234567'))
+check('#61 reconcile, shorter code again later: warns again once', app.warned.count { it == zeroRecMsg } == 2)
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '30000051']], zeroTracked, booking77(code: '01234567'))
+check('#61 reconcile, another code in the booking\'s slot: rewritten without a leading-zero warn', r.sets.size() == 1 && app.warned.count { it == zeroRecMsg } == 2)
+check('#61 reconcile leading-zero logs: no code', !newLogs().any { it.contains('1234567') || it.contains('30000051') })
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeShortWarned = [:]
+
 // A skipped lock that a read finds readable again is reconciled shortly after
 reset55()
 app.atomicState.lockCodesUnreadable = ['7']
@@ -888,7 +987,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
