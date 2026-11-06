@@ -149,7 +149,7 @@ Already-connected hubs need only an app update:
 
 1. Update **SignalBricks Telemetry** to the latest version (HPM **Update**).
 2. Open the app. Under **Lock code management (optional)**, turn on **Enable lock code management**.
-3. Select the locks SignalBricks may manage codes on. This list is separate from the telemetry locks.
+3. Select the locks SignalBricks may manage codes on. This list is separate from the telemetry locks. Since 1.6.5, **Select all** adds every lock selected under **Devices** that supports codes, and **Clear** empties the list. Locks you add later are never added automatically: click **Select all** again.
 4. Check **Highest slot SignalBricks may manage** (default 25). Keep it below every booking app's **Minimum code position**.
 5. Click **Done**. Reopen the app and check **Registration: registered …**.
 6. Nothing can be written yet: SignalBricks first sends the slot rules during lock onboarding in the portal. If it asks to manage existing codes above the ceiling, they are listed in the app under **Approve these slots**. Approve only codes you recognise as admin or managed codes.
@@ -166,8 +166,8 @@ The hub decides which slots may be touched, using the settings you choose in the
 - SignalBricks can only reach the locks you selected for lock code management, and on each of them only the slots its onboarding set up, at or below **Highest slot SignalBricks may manage**.
 - Existing codes above that ceiling stay out of reach until you approve them under **Approve these slots**.
 - A new fingerprint key from SignalBricks is used only once you approve it in the app (1.6.3).
-- **Locks SignalBricks may fully control** is a separate, per-lock opt-in in the app.
-- Booking codes are always refused.
+- **Locks SignalBricks may fully control** is a separate, per-lock opt-in in the app. Its **Select all** (1.6.5) chooses the locks selected for lock code management at that moment; locks added later need another click.
+- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:` or `GT:` (1.6.4).
 - Codes are never logged, and never sent as telemetry or in results.
 
 ### Locks with encrypted codes

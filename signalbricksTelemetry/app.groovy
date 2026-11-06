@@ -20,9 +20,9 @@
  * reveal one code at a time. The hub enforces which slots may be touched:
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
  * but only up to a ceiling set in this app's UI; adopted slots above it need
- * the operator's approval in the UI. Slots whose name contains an upper-case
- * "ORB" followed by a digit anywhere (booking codes) are always refused, and
- * created names must carry SBA:/SBM: and never such an "ORB".
+ * the operator's approval in the UI. Slots with booking-code names are always
+ * refused, in any letter case, and created names must carry SBA:/SBM: and
+ * never look like a booking code.
  * So neither the platform nor anyone holding its token can reach booking
  * codes. Codes are never logged or put in events.
  *
@@ -106,7 +106,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.3'
+@Field static final String APP_VERSION = '1.6.5'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -320,14 +320,21 @@ Map mainPage() {
         }
 
         section('<b>Lock code management (optional)</b>') {
-            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks selected here. Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (names with <code>ORB</code> followed by a digit) are always refused. Codes are never logged or sent as telemetry.'
+            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks selected here. Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (names with <code>ORB</code> followed by a digit in any letter case, <code>ORB</code> starting a word, or starting with <code>G:</code> or <code>GT:</code>) are always refused. Codes are never logged or sent as telemetry.'
             input(name: 'lockManagementEnabled', type: 'bool', title: 'Enable lock code management', defaultValue: false, submitOnChange: true)
             if (lockManagementEnabled) {
                 input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Locks SignalBricks may manage codes on', multiple: true, required: false, submitOnChange: true)
+                // Hubitat apps only see devices picked in an input, so Select all picks from the Devices locks (#66)
+                input(name: 'btnSelectAllCodeLocks', type: 'button', title: 'Select all')
+                input(name: 'btnClearCodeLocks', type: 'button', title: 'Clear')
+                paragraph '<small>Select all adds every lock selected under <b>Devices</b> that supports codes. Locks added later are not added until you click it again.</small>'
                 input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may manage (admin + managed codes; keep it below the booking apps' minimum code position)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
                 if (codeLocks) {
-                    paragraph '<b>Full lock control (optional).</b> On the locks chosen here, and only once SignalBricks also turns full control on for them, SignalBricks may reach codes above the ceiling that it registered by slot and name (codes an admin adopted in SignalBricks). It never writes into empty slots above the ceiling, and never touches booking codes (names with <code>ORB</code> followed by a digit, or starting with <code>G:</code> or <code>GT:</code>) or codes without a name. Leave empty to keep everything above the ceiling behind the approvals below.'
+                    paragraph '<b>Full lock control (optional).</b> On the locks chosen here, and only once SignalBricks also turns full control on for them, SignalBricks may reach codes above the ceiling that it registered by slot and name (codes an admin adopted in SignalBricks). It never writes into empty slots above the ceiling, and never touches booking codes (names with <code>ORB</code> followed by a digit in any letter case, <code>ORB</code> starting a word, or starting with <code>G:</code> or <code>GT:</code>) or codes without a name. Leave empty to keep everything above the ceiling behind the approvals below.'
                     input(name: 'fullControlLocks', type: 'enum', title: 'Locks SignalBricks may fully control', options: codeLocks.collectEntries { [(it.id.toString()): escapeHtml(it.displayName?.toString())] }, multiple: true, required: false, submitOnChange: true)
+                    input(name: 'btnSelectAllFullControl', type: 'button', title: 'Select all')
+                    input(name: 'btnClearFullControl', type: 'button', title: 'Clear')
+                    paragraph '<small>Select all chooses every lock above. Locks added later are not added until you click it again.</small>'
                 }
                 Map pending = pendingAdoptedOptions()
                 if (pending) {
@@ -545,6 +552,20 @@ void appButtonHandler(String btn) {
             state.remove('fingerprintKeyPending')
             log.info 'SignalBricks Telemetry: new fingerprint key rejected in the app'
         }
+    } else if (btn == 'btnSelectAllCodeLocks') {
+        // One-shot (#66): the picks so far plus every Devices lock that supports codes
+        List ids = ((codeLocks ?: []) + (locks ?: []).findAll { it.hasCapability('LockCodes') }).collect { it.id.toString() }.unique()
+        if (ids) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: ids])
+    } else if (btn == 'btnClearCodeLocks') {
+        app.removeSetting('codeLocks')
+    } else if (btn == 'btnSelectAllFullControl') {
+        List ids = (codeLocks ?: []).collect { it.id.toString() }
+        if (ids) {
+            app.updateSetting('fullControlLocks', [type: 'enum', value: ids])
+            log.info "SignalBricks Telemetry: full lock control allowed on all ${ids.size()} locks selected for lock code management"
+        }
+    } else if (btn == 'btnClearFullControl') {
+        app.removeSetting('fullControlLocks')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         // Any open Reconnect link carried the old token, so it is dead now
@@ -1554,13 +1575,18 @@ Boolean isBookingName(String name) {
 // word (the pre-1.3.4 guard), or a name starting with the booking apps' G: or
 // GT: prefix (any case, spaces allowed before the colon). An unnamed slot
 // isn't a booking name, but it can never be registered (it could be a booking
-// code on a driver that drops names), so it is never reached either. The
-// older paths (SBA:/SBM: ranges, adopted slots) keep isBookingName.
+// code on a driver that drops names), so it is never reached either.
 @Field static final java.util.regex.Pattern STRICT_BOOKING_NAME = ~/(?i:orb\d)|(^|[\s-])ORB|^\s*(?i:gt?)\s*:/
 @Field static final java.util.regex.Pattern CLASS_PREFIX_NAME = ~/^\s*(?i:sb[am])\s*:/
 
 Boolean isStrictBookingName(String name) {
     return name != null && STRICT_BOOKING_NAME.matcher(name).find()
+}
+
+// Both rules. Every path that protects an existing code, and every name
+// SignalBricks writes, uses this (some drivers report names lower-cased).
+Boolean isAnyBookingName(String name) {
+    return isBookingName(name) || isStrictBookingName(name)
 }
 
 // A name the hub may hold as a registered slot's `name` (what the lock shows):
@@ -1572,7 +1598,7 @@ String registeredNameError(def raw) {
     if (!name || name.length() > MAX_NAME_LENGTH || !(name ==~ /[\x20-\x7E]+/) || name != name.trim()) {
         return "must be 1-${MAX_NAME_LENGTH} printable ASCII characters without leading or trailing spaces"
     }
-    if (isBookingName(name) || isStrictBookingName(name)) return 'looks like a booking code name'
+    if (isAnyBookingName(name)) return 'looks like a booking code name'
     return null
 }
 
@@ -1747,7 +1773,7 @@ Map pendingAdoptedOptions() {
         def entry = codes?.get(parts[1])
         String name = entry instanceof Map ? entry.name?.toString() : null
         String label = "${lock.displayName}: slot ${parts[1]}${name ? " (${escapeHtml(name)})" : ' (empty)'}"
-        if (isBookingName(name) || isStrictBookingName(name)) label += ' - booking code, always refused'
+        if (isAnyBookingName(name)) label += ' - booking code, always refused'
         options[key] = label
     }
     return options
@@ -1916,7 +1942,7 @@ Map apiListSlots() {
         Integer slot = k.toString().toInteger()
         String name = v instanceof Map ? v.name?.toString() : null
         Boolean set = v instanceof Map ? (v.code != null && v.code.toString() != '') : false
-        String cls = isBookingName(name) ? null : slotClass(lock.id.toString(), slot)
+        String cls = isAnyBookingName(name) ? null : slotClass(lock.id.toString(), slot)
         // Registered slots (#684) are reported as adopted (older SignalBricks
         // versions know no other value) plus registered: true, and only while
         // the hub would let SignalBricks touch them.
@@ -1957,7 +1983,7 @@ Map lockFingerprints(lock, byte[] key) {
         String code = v.code?.toString()
         if (!code) return
         Integer slot = k.toString().toInteger()
-        if (isBookingName(v.name?.toString())) return
+        if (isAnyBookingName(v.name?.toString())) return
         if (slot < 1 || (survey ? slot > ceiling : !slotClass(lockId, slot))) return
         // A registered slot (#684) only while it holds its registered name.
         if (!survey && slotClass(lockId, slot) == 'registered' &&
@@ -2025,7 +2051,7 @@ Map refuse(String error, int status, String message = null) {
 // Common checks for write/delete/reveal. Returns [lock, slot, slotClass,
 // codes, currentName] or [response, error]. Refuses:
 //   - slots outside admin/managed/approved-adopted (and above the ceiling)
-//   - any slot whose current name is a booking code (isBookingName)
+//   - any slot whose current name is a booking code (isAnyBookingName)
 //   - in the admin/managed ranges, a slot holding a code without that
 //     range's SBA:/SBM: marker (existing codes must be adopted first);
 //     an empty slot may be written (`allowEmpty`), not deleted or revealed.
@@ -2043,7 +2069,7 @@ Map resolveAllowedSlot(def lockIdRaw, def slotRaw, Boolean allowEmpty) {
     def entry = codes[slot.toString()]
     String currentName = entry instanceof Map ? entry.name?.toString() : null
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
-    if (isBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
+    if (isAnyBookingName(currentName)) return refuse('booking_code', 403, 'slot holds a booking code')
     if (cls == 'registered') {
         Map refusal = registeredSlotRefusal(lock.id.toString(), slot, currentName, occupied, allowEmpty, codes)
         if (refusal) return refusal
@@ -2088,7 +2114,7 @@ Boolean bookingCodeAtOrUnderCeiling(Map codes) {
     Integer ceiling = managedCeiling()
     return (codes ?: [:]).any { k, v ->
         k.toString() ==~ /\d{1,4}/ && k.toString().toInteger() <= ceiling && v instanceof Map &&
-            v.code != null && v.code.toString() != '' && (isBookingName(v.name?.toString()) || isStrictBookingName(v.name?.toString()))
+            v.code != null && v.code.toString() != '' && isAnyBookingName(v.name?.toString())
     }
 }
 
@@ -2108,8 +2134,8 @@ Map resolveSet(def lockIdRaw, def slotRaw, String name) {
     }
     // Never create a name the booking guard would read as a booking code
     // (which signalbricksIntegration would also claim).
-    if (isBookingName(name)) {
-        return refuse('name_not_allowed', 403, 'names must not contain ORB followed by a digit')
+    if (isAnyBookingName(name)) {
+        return refuse('name_not_allowed', 403, 'name looks like a booking code name')
     }
     Map r = resolveAllowedSlot(lockIdRaw, slotRaw, true)
     if (r.response) return r
@@ -2792,7 +2818,7 @@ void reportCodeResult(Map p, String result, String reason) {
         }
     }
     String name = p.name?.toString()
-    if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isBookingName(name)) {
+    if (name && (name.startsWith(ADMIN_NAME_PREFIX) || name.startsWith(MANAGED_NAME_PREFIX)) && !isAnyBookingName(name)) {
         data.name = name
     }
     Map payload = [
