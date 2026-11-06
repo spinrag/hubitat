@@ -960,6 +960,42 @@ r = prefixRun(new JsonSlurper().parseText(lock.attrs.lockCodes), app.atomicState
 check('#61 N1 reconcile: the listed slots are neither claimed nor deleted', !r.deletes.contains(52) && !r.deletes.contains(53))
 app.atomicState.bookings = [:]
 
+// An exact-name copy beside the booking's tracked slot is listed too (#61 re-review N1)
+def copyNotes = { Map lockCodes, Map assignments ->
+    lock.attrs.lockCodes = JsonOutput.toJson(lockCodes)
+    app.atomicState.codeAssignments = tracked(assignments)
+    app.atomicState.bookings = booking77()
+    mark()
+    List notes = app.bookingsView().notes.findAll { it.contains('another copy') }
+    app.atomicState.bookings = [:]
+    return notes
+}
+Map lowerTracked51 = ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]
+Map copyCodes = ['51': [name: 'g:orb77-cy', code: '20000077'], '60': [name: 'G:ORB77-Cy', code: '20000077']]
+List cn = copyNotes(copyCodes, lowerTracked51)
+check('#61 copy: tracked gt:orb77-cy in 51, exact G:ORB77-Cy in 60: slot 60 listed as another copy, tracked slot named',
+    cn.size() == 1 && cn[0].contains('slot 60 (G:ORB77-Cy) is another copy of ORB77\'s code; the app tracks slot 51'))
+check('#61 copy: no code on the page line, nothing logged', !cn.any { it.contains('20000077') || it.contains('77&') } && newLogs().isEmpty())
+r = prefixRun(copyCodes, ['7': lowerTracked51], booking77())
+check('#61 copy: during the stay reconcile neither writes nor deletes either slot', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(copyCodes, ['7': lowerTracked51], [:])
+check('#61 copy: at checkout only the tracked slot is deleted', r.deletes == [51])
+app.tryDeleteCode(r.jobs.find { it.handler == 'tryDeleteCode' }.data)
+r = prefixRun(['60': [name: 'G:ORB77-Cy', code: '20000077']], app.atomicState.codeAssignments, [:])
+check('#61 copy: once the lock shows slot 51 empty, the next reconcile removes the copy (as the page says)', r.deletes == [60])
+app.settings = [previousCodeNamePrefix: 'GT:']
+cn = copyNotes(['51': [name: 'GT:ORB77-Cy', code: '20000077'], '31': [name: 'G:ORB77-Cy', code: '20000077']],
+    ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'GT:ORB77-Cy', attempt: 1, confirmed: true]])
+check('#61 copy: tracked old-prefix GT:ORB77-Cy in 51, exact new-prefix copy in 31: slot 31 listed, tracked slot named',
+    cn.size() == 1 && cn[0].contains('slot 31 (G:ORB77-Cy) is another copy of ORB77\'s code; the app tracks slot 51'))
+app.settings = [:]
+cn = copyNotes(['51': [name: 'G:ORB77-Cy', code: '20000077']], lowerTracked51)
+check('#61 copy: the tracked slot alone is never listed', cn.isEmpty())
+cn = copyNotes(['31': [name: 'G:ORB77-Cy', code: '20000077']], [:])
+check('#61 copy: an untracked exact name reconcile claims is not listed', cn.isEmpty())
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = [:]
+
 // Leading-zero dedup: no key kept for a lock with nothing to warn about, or a lock no longer selected (#61 review N2)
 app.atomicState.codeShortWarned = ['7': ['51'], '99': ['5']]
 prefixRun(['51': [name: 'G:ORB77-Cy', code: '01234567']], ['7': ['51': [bookingId: 'ORB77', code: '01234567', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]], booking77(code: '01234567'))

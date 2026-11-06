@@ -176,7 +176,7 @@ Map bookingsView() {
             if (lockCodes == null) l.problem = 'codes unreadable'
             else {
                 l.codes = helperOnlySbCodes(lockCodes, lock.id, true)
-                l.strays = helperStrayCaseCodes(lockCodes, lock.id, l.codes)
+                l.strays = helperStrayCodes(lockCodes, lock.id, l.codes)
             }
         }
         onLock[lock.id.toString()] = l
@@ -240,6 +240,11 @@ Map bookingsView() {
     // claimed or deleted automatically, so the operator checks them
     onLock.each { lockId, l ->
         (l.strays ?: []).each { st ->
+            if (st.trackedKey) {
+                v.notes << "<b>${l.name}:</b> slot ${bookingsEsc(st.key)} (${bookingsEsc(st.name)}) is another copy of ORB${bookingsEsc(st.bookingId)}'s code; the app tracks slot ${bookingsEsc(st.trackedKey)}. " +
+                    "Reconcile leaves this copy alone while slot ${bookingsEsc(st.trackedKey)} holds the booking's code, and removes it only once that slot's code is gone after checkout. If the copy isn't needed, delete it on the lock's device page."
+                return
+            }
             v.notes << "<b>${l.name}:</b> slot ${bookingsEsc(st.key)} (${bookingsEsc(st.name)}) looks like this app's code for ORB${bookingsEsc(st.bookingId)} in another case, but the app doesn't track that slot, so reconcile never removes it. " +
                 'If it is a leftover copy (a driver that changes code names to lower case, before 1.4.13 or after Reset State), delete it on the lock\'s device page.'
         }
@@ -2200,11 +2205,16 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
     return result
 }
 
-// Slots this app doesn't track whose name is this app's prefix (or previous prefix) +
-// ORB<id> only when case is ignored: copies of a booking's code left by a driver that
-// lower-cases names (1.4.12 and earlier, or after Reset State). Reconcile never claims or
-// deletes them; the Bookings page lists them (#61). [key, name, bookingId] each, no code
-List helperStrayCaseCodes(Map codes, def lockId, Map claimed) {
+// Slots this app doesn't track or claim that hold what looks like its code, for the Bookings
+// page (#61). [key, name, bookingId, trackedKey] each, never the code. Never claimed or deleted:
+// - a name that is this app's prefix (or previous prefix) + ORB<id> only when case is ignored:
+//   a copy left by a driver that lower-cases names (1.4.12 and earlier, or after Reset State),
+//   which reconcile never claims or deletes;
+// - an exact name of a booking whose tracked slot (trackedKey) wins in reconcile's name pass,
+//   e.g. tracked gt:orb77-cy or an old-prefix GT:ORB77-Cy beside an untracked G:ORB77-Cy:
+//   reconcile leaves it while the tracked slot holds the code, removes it only after that
+//   slot's code is gone, and it isn't an orphan either
+List helperStrayCodes(Map codes, def lockId, Map claimed) {
     List prefixes = [codeNamePrefix ?: '', previousPrefixInUse()].findAll { it }
     Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
     List claimedKeys = (claimed ?: [:]).values().collect { "${it.key}".toString() }
@@ -2212,9 +2222,14 @@ List helperStrayCaseCodes(Map codes, def lockId, Map claimed) {
     codes.each { key, code ->
         String name = code instanceof Map ? code.name?.toString() : null
         if (!name || lockAssignments["${key}"] || claimedKeys.contains("${key}".toString())) return
-        // A name reconcile matches as it is (another slot of a booking whose tracked slot wins) isn't one
+        // A name reconcile's name pass matches as it is: listed only when the booking's tracked slot wins
         String exact = prefixes.findAll { name.startsWith(it) }.max { it.length() }
-        if ((!prefixes || exact != null) && helperCodeNameId(name.substring((exact ?: '').length()))) return
+        String exactId = !prefixes || exact != null ? helperCodeNameId(name.substring((exact ?: '').length())) : null
+        if (exactId) {
+            def trackedKey = claimed?.get(exactId)?.key
+            if (trackedKey != null && "${trackedKey}" != "${key}") strays << [key: "${key}".toString(), name: name, bookingId: exactId, trackedKey: "${trackedKey}".toString()]
+            return
+        }
         String own = prefixes ? prefixes.findAll { name.toUpperCase().startsWith(it.toUpperCase()) }.max { it.length() } : ''
         if (own == null) return
         String id = helperCodeNameId(name.substring(own.length()), true)
