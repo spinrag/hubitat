@@ -97,6 +97,8 @@ class FakeApp {
 
 class FakeLock {
     String id; String displayName; String name; String label
+    List caps = ['Lock', 'LockCodes']
+    Boolean hasCapability(String c) { caps.contains(c) }
     Map attrs = [:]
     List calls = []
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
@@ -129,7 +131,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.6.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.3')
+check('version is 1.6.5', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.5')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -144,7 +146,7 @@ app.state.connectedAt = '2026-10-01 12:00'
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 app.state.lockMgmtRegisteredAt = '2026-10-01 12:00'
-app.state.registeredVersion = '1.6.3'
+app.state.registeredVersion = '1.6.5'
 String KEY = ((1..32).collect { it as byte } as byte[]).encodeBase64().toString()
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY, locks: ['7': [adopted: [40]]]]]
 check('setup: slot rules and fingerprint key accepted', app.apiSetLockConfig().status == 200 && app.state.fingerprintKey == KEY)
@@ -497,6 +499,19 @@ String logs = app.logged.join('\n')
 check('logs: no access token, ingestion token, fingerprint key, code or auth code',
     !tokens.any { it && logs.contains(it) } && !logs.contains(INGEST) && !logs.contains(INGEST_2) && !logs.contains(KEY) && !logs.contains('12345678') && !logs.contains('fake-auth-code'))
 check('logs: the link was logged as opened, without a token', app.logged.any { it.contains('Reconnect link opened for 10 minutes') })
+
+// The booking rule on the page names every form the hub refuses (1.6.5)
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+String rulePage = mainPage()
+check('page: booking rule in any letter case, ORB starting a word, G:/GT:', app.paragraphs.findAll { it.contains('starting a word, or starting with <code>G:</code> or <code>GT:</code>') }.size() >= 1 &&
+    rulePage.contains('followed by a digit in any letter case'))
+
+// Select all / Clear buttons beside both lists (#66)
+app.codeLocks = [new FakeLock(id: '50', displayName: 'Sel', name: 'Sel', label: 'Sel')]
+String selPage = mainPage()
+check('page: Select all and Clear for both lists, the lists still shown', ['btnSelectAllCodeLocks', 'btnClearCodeLocks', 'btnSelectAllFullControl', 'btnClearFullControl'].every { app.inputs[it]?.type == 'button' } &&
+    app.inputs.codeLocks != null && app.inputs.fullControlLocks != null && selPage.contains('not added until you click it again'))
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
