@@ -167,7 +167,7 @@ The hub decides which slots may be touched, using the settings you choose in the
 - Existing codes above that ceiling stay out of reach until you approve them under **Approve these slots**.
 - A new fingerprint key from SignalBricks is used only once you approve it in the app (1.6.3).
 - **Locks SignalBricks may fully control** is a separate, per-lock opt-in in the app.
-- Booking codes are always refused.
+- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:` or `GT:` (1.6.4).
 - Codes are never logged, and never sent as telemetry or in results.
 
 ### Locks with encrypted codes

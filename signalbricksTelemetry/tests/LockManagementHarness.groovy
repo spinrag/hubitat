@@ -174,12 +174,12 @@ app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: Orbit']]
 check('write name Orbit allowed', app.apiSetCode().status == 202)
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: ORB1']]
 check('write name with " ORB" refused', app.apiSetCode().status == 403)
-['SBA: FORBES', 'SBA: orb123'].each { n ->
+['SBA: FORBES'].each { n ->
     app.request = [JSON: [slot: 2, code: '12345678', name: n]]
     check("write name '${n}' allowed", app.apiSetCode().status == 202)
 }
 // signalbricksIntegration claims ORB<digits> anywhere: refuse it in written names
-[[2, 'SBA:ORB12'], [2, 'SBA: Guest-ORB12'], [12, 'SBM:x-ORB5']].each { slot, n ->
+[[2, 'SBA:ORB12'], [2, 'SBA: Guest-ORB12'], [12, 'SBM:x-ORB5'], [2, 'SBA: orb123'], [12, 'SBM: x-Orb5']].each { slot, n ->
     app.request = [JSON: [slot: slot, code: '12345678', name: n]]
     check("write name '${n}' refused", app.apiSetCode().status == 403)
 }
@@ -201,11 +201,11 @@ check('guard: Re-Orbit not booking', !app.isBookingName('Re-Orbit'))
 ['ORBIT', 'Corbin', 'ORB', 'ORB-Guest', 'orb123', 'Orb1', 'SBA: ORBIT'].each { n ->
     check("guard: '${n}' not booking", !app.isBookingName(n))
 }
-['SBA: ORBIT', 'SBA: Corbin'].each { n ->
+['SBA: Corbin'].each { n ->
     app.request = [JSON: [slot: 2, code: '12345678', name: n]]
     check("write name '${n}' allowed", app.apiSetCode().status == 202)
 }
-['SBA: GT:ORB123-x', 'SBA: G:ORB1-x', 'SBA: Name -ORB123'].each { n ->
+['SBA: GT:ORB123-x', 'SBA: G:ORB1-x', 'SBA: Name -ORB123', 'SBA: ORBIT'].each { n ->
     app.request = [JSON: [slot: 2, code: '12345678', name: n]]
     check("write name '${n}' refused", app.apiSetCode().status == 403)
 }
@@ -286,7 +286,13 @@ check('Guest -ORB12345 refused', app.apiDeleteCode().status == 403)
         { app.request = [JSON: [slot: 5, code: '12345678', name: 'SBA: x']]; app.apiSetCode().status == 403 }())
     n
 }
-['SBA: ORBIT', 'SBA: Corbin'].inject('Name -ORB123') { prev, n ->
+['SBA: ORBIT'].inject('Name -ORB123') { prev, n ->
+    lock.attrs.lockCodes = lock.attrs.lockCodes.replace("\"name\":\"${prev}\"", "\"name\":\"${n}\"")
+    app.state.revealTimes = []
+    check("current name '${n}' refused (fails closed, as on registered slots)", app.apiRevealCode().status == 403)
+    n
+}
+['SBA: Corbin'].inject('SBA: ORBIT') { prev, n ->
     lock.attrs.lockCodes = lock.attrs.lockCodes.replace("\"name\":\"${prev}\"", "\"name\":\"${n}\"")
     app.state.revealTimes = []
     check("current name '${n}' not a booking code (reveal allowed)", app.apiRevealCode().status == 200)
@@ -1269,7 +1275,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.6.3'
+String VERSION = '1.6.4'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1505,6 +1511,88 @@ app.subscribeToEvents()
 check('codes off: never lockCodes', !app.subscriptions.contains('lockCodes'))
 app.locks = null
 app.debugLogging = false
+
+// --- Booking codes in any letter case (spinrag/hubitat-internal#2) ---
+// Some drivers report code names lower-cased. Made-up codes only.
+['gt:orb77-cy', 'g:orb88-di', 'Gt:Cy-orb99', 'guest-orb12345', 'GT:ORB123-x', 'Guest -ORB12345'].each { nm ->
+    check("any-case guard: '${nm}' booking", app.isAnyBookingName(nm))
+}
+['Corbin', 'Orbit', 'Forbes', 'SBA: Forbes', 'SBA: Corbin', 'Old Code', null].each { nm ->
+    check("any-case guard: '${nm}' not booking", !app.isAnyBookingName(nm))
+}
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.maxManagedSlot = null
+app.approvedAdoptedSlots = null
+app.fullControlLocks = null
+['revealTimes', 'writeTimes', 'retryTimes', 'fingerprintTimes', 'fingerprintBatchTimes', 'pendingCodeChanges', 'lockConfig', 'fingerprintKey', 'fingerprintKeyPending'].each { app.state.remove(it) }
+app.logged.clear(); app.posts.clear()
+Map ciCodes = [
+    '3': [name: 'gt:orb77-cy', code: '70700003'],     // admin range
+    '4': [name: 'SBA: Forbes', code: '70700004'],
+    '12': [name: 'g:orb88-di', code: '70700012'],     // managed range
+    '14': [name: 'Gt:Cy-orb99', code: '70700014'],
+    '15': [name: 'guest-orb12345', code: '70700015'],
+    '16': [name: 'Corbin', code: '70700016'],
+    '17': [name: 'Orbit', code: '70700017'],
+    '20': [name: 'gt:orb21-ad', code: '70700020'],    // adopted, under the ceiling
+    '21': [name: 'Old Code', code: '70700021'],       // adopted, under the ceiling
+    '30': [name: 'g:orb30-ab', code: '70700030'],     // adopted above the ceiling, approved below
+]
+def ciLock = new FakeLock(id: '20', displayName: 'Case', name: 'Case', label: 'Case')
+ciLock.attrs.maxCodes = 250
+ciLock.attrs.lockCodes = groovy.json.JsonOutput.toJson(ciCodes)
+def ciSurvey = new FakeLock(id: '21', displayName: 'CaseSurvey', name: 'CaseSurvey', label: 'CaseSurvey')
+ciSurvey.attrs.lockCodes = groovy.json.JsonOutput.toJson(ciCodes)
+app.codeLocks = [ciLock, ciSurvey]
+List ciResponses = []
+def ci = { String handler, Map params, Map json = null -> app.params = params; app.request = [JSON: json]; def r = app."${handler}"(); ciResponses << r; r }
+def ciCfg = ci('apiSetLockConfig', [:], [admin: [from: 1, to: 10], managed: [from: 11, to: 19], locks: ['20': [adopted: [20, 21, 22, 23, 30]], '21': [surveyOnly: true]], fingerprintKey: KEY])
+check('any-case: setup accepted', ciCfg.status == 200 && body(ciCfg).pendingApproval == ['20:30'])
+check('any-case: approval list flags the lower-cased booking code', app.pendingAdoptedOptions()['20:30'].contains('booking code, always refused'))
+app.approvedAdoptedSlots = ['20:30']
+
+Map ciSlots = body(ci('apiListSlots', [lockId: '20'])).slots.collectEntries { [(it.slot): it.allowedAs] }
+check('any-case /slots: lower-cased booking codes not allowed (range, adopted, approved)', [3, 12, 14, 15, 20, 30].every { ciSlots[it] == null })
+check('any-case /slots: other names keep their class', ciSlots[4] == 'admin' && ciSlots[16] == 'managed' && ciSlots[17] == 'managed' && ciSlots[21] == 'adopted')
+
+check('any-case fingerprints: lower-cased booking codes left out', body(ci('apiListFingerprints', [lockId: '20'])).slots*.slot == [4, 16, 17, 21])
+Map ciBatch = body(ci('apiListFingerprintsBatch', [:])).locks.collectEntries { [(it.id): it.slots*.slot] }
+check('any-case batch fingerprints: left out, survey-only lock too', ciBatch == ['20': [4, 16, 17, 21], '21': [4, 16, 17, 21]])
+
+// Adopted under the ceiling, and approved above it: refused, no lock command
+[20, 30].each { slot ->
+    app.state.revealTimes = []; app.state.writeTimes = []
+    def rv = ci('apiRevealCode', [lockId: '20', slot: "${slot}"])
+    def ciDel = ci('apiDeleteCode', [lockId: '20', slot: "${slot}"])
+    def set = ci('apiSetCode', [lockId: '20'], [slot: slot, code: '12121212', name: 'Adopted New'])
+    check("any-case adopted slot ${slot}: reveal, delete and set -> 403 booking_code", [rv, ciDel, set].every { it.status == 403 && body(it).error == 'booking_code' })
+}
+check('any-case: no lock command sent', ciLock.calls.isEmpty())
+def rel = ci('apiRelocateCode', [lockId: '20', slot: '20'], [name: 'SBA: Moved', toSlot: 5])
+check('any-case relocate: lower-cased booking source -> 403 booking_code', rel.status == 403 && body(rel).error == 'booking_code' && ciLock.calls.isEmpty())
+
+// Retry: a failed set whose slot now shows a lower-cased booking code is refused
+app.state.writeTimes = []
+check('any-case retry setup: set on an empty adopted slot', ci('apiSetCode', [lockId: '20'], [slot: 22, code: '80802222', name: 'Adopted New']).status == 202)
+app.state.pendingCodeChanges['20:22'].status = 'failed'
+ciLock.attrs.lockCodes = groovy.json.JsonOutput.toJson(ciCodes + ['22': [name: 'g:orb22-zz', code: '80802299']])
+int ciSends = ciLock.calls.size()
+def ciRetry = ci('apiRetryCode', [lockId: '20', slot: '22'])
+check('any-case retry: -> 403 booking_code, nothing re-sent', ciRetry.status == 403 && body(ciRetry).error == 'booking_code' && ciLock.calls.size() == ciSends)
+
+// Names SignalBricks writes never look like a booking code, in any case
+app.state.writeTimes = []
+[[5, 'SBA: orb123'], [13, 'SBM: x-Orb5'], [23, 'orb5 guest'], [23, 'G: Gardener']].each { slot, nm ->
+    def r = ci('apiSetCode', [lockId: '20'], [slot: slot, code: '12121212', name: nm])
+    check("any-case written name '${nm}' -> 403 name_not_allowed", r.status == 403 && body(r).error == 'name_not_allowed')
+}
+check('any-case: an ordinary adopted name is still written', ci('apiSetCode', [lockId: '20'], [slot: 23, code: '12121212', name: 'Corbin Adopted']).status == 202)
+
+String ciAll = (ciResponses.collect { it.data } + app.logged.collect { it.toString() } + app.posts.collect { it.params.body }).join('\n')
+check('any-case: no code in any response, log or post', !(ciCodes.values()*.code + ['80802222', '80802299', '12121212']).any { ciAll.contains(it) })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
