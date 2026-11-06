@@ -880,6 +880,57 @@ call('apiSetCode')
 putSlot(18, 'SBM: Zero', 1818)
 tick()
 check('numeric lockCodes value confirms a leading-zero code', results()[-1].value == 'confirmed' && results()[-1].d.slot == 18)
+
+// Names confirm ignoring case: some drivers change a name's case
+app.state.writeTimes = []
+lock3.dropCommands = 99
+app.state.remove('pendingCodeChanges')
+[['sbm: case', '91917171'], ['SBM: CASE', '91917172']].each { reported, c ->
+    putSlot(17, null, null)
+    app.request = [JSON: [slot: 17, code: c, name: 'SBM: Case']]
+    call('apiSetCode')
+    putSlot(17, reported, c)
+    int caseRes = results().size()
+    tick()
+    check("case: '${reported}' confirms 'SBM: Case' on the first check", results().size() == caseRes + 1 && results()[-1].value == 'confirmed' && results()[-1].d.slot == 17 && pendingFor(17) == null)
+}
+check('case: the result carries the name sent', results()[-1].d.name == 'SBM: Case')
+// A name that isn't ours, with the same code, still doesn't confirm
+[['SBM: Other', 'slot_changed'], ['gt:orb77-cy', 'booking_code'], ['SBM: Cases', 'slot_changed']].each { other, reason ->
+    putSlot(17, null, null)
+    app.request = [JSON: [slot: 17, code: '91917173', name: 'SBM: Case']]
+    call('apiSetCode')
+    putSlot(17, other, '91917173')
+    int caseRes = results().size()
+    tick()
+    check("case: '${other}' is not confirmed", results().size() == caseRes && pendingFor(17)?.status == 'pending')
+    tick()
+    check("case: '${other}' then fails ${reason}, never confirmed", results().size() == caseRes + 1 && results()[-1].value == 'failed' && results()[-1].d.reason == reason)
+}
+// A name the booking rule reads as a booking code never confirms by case
+putSlot(17, null, null)
+app.request = [JSON: [slot: 17, code: '91917175', name: 'SBM: Orbit']]
+check('case booking: SBM: Orbit accepted', call('apiSetCode').status == 202)
+putSlot(17, 'SBM: ORBIT', '91917175')
+int caseBk = results().size()
+tick()
+check("case booking: 'SBM: ORBIT' does not confirm 'SBM: Orbit'", results().size() == caseBk && pendingFor(17)?.status == 'pending')
+tick()
+check("case booking: then fails booking_code, never confirmed", results().size() == caseBk + 1 && results()[-1].value == 'failed' && results()[-1].d.reason == 'booking_code')
+check('sameName: exact booking-looking name still matches', app.sameName('SBM: ORBIT', [name: 'SBM: ORBIT']) && !app.sameName('SBM: ORBIT', [name: 'SBM: Orbit']))
+// A change that only changes the case compares exactly
+putSlot(17, 'SBM: case', '91917174')
+app.request = [JSON: [slot: 17, code: '91917174', name: 'SBM: Case']]
+call('apiSetCode')
+int caseOnly = results().size()
+tick()
+check('case-only rename: the old name does not confirm it', results().size() == caseOnly && pendingFor(17)?.status == 'pending')
+putSlot(17, 'SBM: Case', '91917174')
+tick()
+check('case-only rename: confirmed once the lock shows the new name', results().size() == caseOnly + 1 && results()[-1].value == 'confirmed')
+check('sameName: plain compare ignores case', app.sameName('sbm: x', [name: 'SBM: X']) && app.sameName('SBM: X', [name: 'sbm: x', prevName: 'SBM: Y']) && !app.sameName('SBM: Y', [name: 'SBM: X']))
+check('sameName: null only matches null', !app.sameName(null, [name: 'SBM: X']) && !app.sameName('SBM: X', [:]) && app.sameName(null, [:]))
+putSlot(17, null, null)
 app.fakeNow = null
 
 // Disconnect drops pending changes too
@@ -890,7 +941,7 @@ app.appButtonHandler('btnDisconnect')
 check('disconnect reports and clears', results()[-1].d.reason == 'disconnected' && app.state.pendingCodeChanges == null)
 
 // No code anywhere outside app state
-List codes = ['91919192', '91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
+List codes = ['91917175', '91917171', '91917172', '91917173', '91917174', '91919192', '91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
 String everything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })
@@ -1277,7 +1328,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.6.5'
+String VERSION = '1.6.6'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1490,6 +1541,22 @@ app.eventHandler([id: 902, deviceId: 7, name: 'lastCodeName', value: 'Guest Smit
 check('codes on: lastCodeName data code still stripped', sentData() == [:])
 app.eventHandler([id: 903, deviceId: 9, name: 'contact', value: 'open', data: '{"pin":"' + PIN + '","code":"E101"}'])
 check('codes on: non-lock event keeps error code, strips pin', sentData() == [code: 'E101'])
+// The platform's whole list of secret keys, in any case and at any depth
+int keysMark = app.posts.size()
+int keysLogMark = app.logged.size()
+List moreKeys = ['authentication_value', 'authenticationValue', 'pin_code', 'pinCode', 'PINCODE', 'door_code', 'doorCode', 'lock_code', 'lockCode', 'access_code', 'accessCode', 'entry_code', 'entryCode']
+[true, false].each { on ->
+    app.includeDoorCodes = on
+    moreKeys.each { k ->
+        app.eventHandler(lockEvt(data: '{"' + k + '":"' + PIN + '","codeName":"Cleaner","nested":[{"' + k + '":' + PIN + '}]}'))
+        check("codes ${on ? 'on' : 'off'}: lock event ${k} stripped", sentData() == [codeName: 'Cleaner', nested: [[:]]])
+        app.eventHandler([id: 904, deviceId: 9, name: 'contact', value: 'open', data: '{"' + k + '":"' + PIN + '","errorCode":"E7"}'])
+        check("codes ${on ? 'on' : 'off'}: other event ${k} stripped", sentData() == [errorCode: 'E7'])
+    }
+}
+app.includeDoorCodes = true
+check('codes: the new keys never in a post or log', !(app.posts.drop(keysMark).collect { it.params.body } + app.logged.drop(keysLogMark).collect { it.toString() }).join('\n').contains(PIN))
+check('codes: lookalike keys kept (whole key only)', app.isSecretKey('pincodes', false) == false && app.isSecretKey('accessCodeId', false) == false && app.isSecretKey('lockCodeCount', false) == false)
 List lockPosts = app.posts.findAll { new JsonSlurper().parseText(it.params.body).name == 'lock' }
 check('codes on: sent over the ingestion URL with the bearer token', lockPosts.every { it.params.uri == 'https://ingest.test/v1/webhooks/hubitat' && it.params.headers.Authorization == 'Bearer ingest-fake' })
 check('codes on: never in the logs (debug logging on)', !app.logged.any { it.toString().contains(PIN) })
