@@ -102,6 +102,7 @@
 
 import groovy.json.JsonOutput
 import groovy.transform.Field
+import java.security.MessageDigest
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -349,7 +350,7 @@ Map mainPage() {
                     if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set (code fingerprints for onboarding are unavailable)'}"
                     Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
                     if (fpPending) {
-                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}). The current key stays in use until you approve. SignalBricks replaces it only rarely: approve only if your SignalBricks admin expects it. If not, reject it and rotate the access token below."
+                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}, key check <b>${fpPending.check}</b>). The current key stays in use until you approve. Approve only if SignalBricks shows the same key check for your organization. If not, reject it and rotate the access token below."
                         // The id ties the click to the request shown, so a newer request needs its own approval
                         input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
                         input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
@@ -718,6 +719,7 @@ void wipeLockState() {
     state.remove('lockConfig')
     state.remove('fingerprintKey')
     state.remove('fingerprintKeyPending')
+    state.remove('fingerprintKeyWarned')
     app.removeSetting('approvedAdoptedSlots')
     app.removeSetting('fullControlLocks')
 }
@@ -1876,10 +1878,23 @@ Boolean takeFingerprintKey(String key) {
     }
     Map p = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
     if (p?.key != key) {
-        state.fingerprintKeyPending = [key: key, id: UUID.randomUUID().toString().take(8), at: new Date().format('yyyy-MM-dd HH:mm')]
-        log.warn 'SignalBricks Telemetry: SignalBricks sent a new fingerprint key; it is used only once approved in the app'
+        String check = fingerprintKeyCheck(key)
+        state.fingerprintKeyPending = [key: key, id: UUID.randomUUID().toString().take(8), check: check, at: new Date().format('yyyy-MM-dd HH:mm')]
+        // Once a day per key, so repeated pushes don't flood the log
+        Map warned = (state.fingerprintKeyWarned ?: [:]).findAll { k, v -> now() - (v as long) < 86400000L }
+        if (!warned.containsKey(check)) {
+            warned[check] = now()
+            log.warn 'SignalBricks Telemetry: SignalBricks sent a new fingerprint key; it is used only once approved in the app'
+        }
+        state.fingerprintKeyWarned = warned
     }
     return false
+}
+
+// Shown with a pending key so the operator can compare it with SignalBricks:
+// first 8 hex characters of SHA-256 of the key's bytes. Never the key itself.
+String fingerprintKeyCheck(String key) {
+    return MessageDigest.getInstance('SHA-256').digest(key.decodeBase64()).encodeHex().toString().take(8)
 }
 
 Map apiListLocks() {

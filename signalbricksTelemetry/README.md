@@ -153,7 +153,7 @@ Already-connected hubs need only an app update:
 4. Check **Highest slot SignalBricks may manage** (default 25). Keep it below every booking app's **Minimum code position**.
 5. Click **Done**. Reopen the app and check **Registration: registered …**.
 6. Nothing can be written yet: SignalBricks first sends the slot rules during lock onboarding in the portal. If it asks to manage existing codes above the ceiling, they are listed in the app under **Approve these slots**. Approve only codes you recognise as admin or managed codes.
-7. If SignalBricks asks to replace its fingerprint key (rare), the app shows **Approve the new fingerprint key** and **Reject the new fingerprint key**. Approve only if your SignalBricks admin expects it; otherwise reject it and click **Rotate access token and re-register**.
+7. If SignalBricks asks to replace its fingerprint key (rare), the app shows **Approve the new fingerprint key** and **Reject the new fingerprint key**. The request shows a short **key check**: approve only if SignalBricks shows the same key check for your organization; otherwise reject it and click **Rotate access token and re-register**.
 
 New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 5.
 

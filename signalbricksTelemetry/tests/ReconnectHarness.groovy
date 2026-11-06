@@ -155,6 +155,7 @@ app.apiSetLockConfig()
 String fpPage = mainPage()
 check('fpkey page: the request is shown with approve and reject buttons', fpPage.contains('asks to replace the fingerprint key') &&
     app.inputs["btnApproveFpKey_${app.state.fingerprintKeyPending.id}".toString()]?.type == 'button' && app.inputs.btnRejectFpKey?.type == 'button')
+check('fpkey page: key check shown', fpPage.contains("key check <b>${app.fingerprintKeyCheck(KEY_NEW)}</b>") && app.fingerprintKeyCheck(KEY_NEW) ==~ /[0-9a-f]{8}/)
 check('fpkey page: no key on the page', !fpPage.contains(KEY_NEW) && !fpPage.contains(KEY) && !app.inputs.keySet().any { it.contains(KEY_NEW) })
 app.appButtonHandler('btnRejectFpKey')
 check('fpkey page: gone after reject, held key kept', !mainPage().contains('asks to replace') && app.state.fingerprintKey == KEY)

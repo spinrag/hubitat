@@ -1010,6 +1010,9 @@ check('fpkey: fingerprints stay on the held key', body(fcall('apiListFingerprint
 check('fpkey: one warning in the log', app.logged.count { it.toString().contains('new fingerprint key') && it.toString().contains('approved in the app') } == 1)
 check('fpkey: pending key counts as lock state', app.holdsLockState())
 String req1 = app.state.fingerprintKeyPending.id
+String sha8 = java.security.MessageDigest.getInstance('SHA-256').digest(key2Bytes).encodeHex().toString().take(8)
+check('fpkey: key check is the first 8 hex of SHA-256 of the key bytes', app.state.fingerprintKeyPending.check == sha8 && app.fingerprintKeyCheck(KEY2) == sha8)
+check('fpkey: key check not in the reply or the log', !swap.data.contains(sha8) && !app.logged.any { it.toString().contains(sha8) })
 check('fpkey: request id is 8 hex characters', req1 ==~ /[0-9a-f]{8}/)
 fcall('apiSetLockConfig')
 check('fpkey: same new key again keeps the request and does not warn again', app.state.fingerprintKeyPending.id == req1 && app.state.fingerprintKey == KEY &&
@@ -1025,6 +1028,17 @@ app.appButtonHandler('btnApproveFpKey_')
 check('fpkey: approval without the request id does nothing', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending != null)
 app.appButtonHandler('btnRejectFpKey')
 check('fpkey: reject drops the request and keeps the key', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending == null)
+// The warning comes once per key per day, even when keys alternate
+int warnsBefore = app.logged.count { it.toString().contains('approved in the app') }
+[KEY2, KEY3, KEY2].each { k -> app.request = [JSON: fpCfg + [fingerprintKey: k]]; fcall('apiSetLockConfig') }
+check('fpkey: alternating keys warned at most once each per day', app.logged.count { it.toString().contains('approved in the app') } == warnsBefore)
+Long savedNow = app.fakeNow
+app.fakeNow = app.now() + 86_400_001L
+app.request = [JSON: fpCfg + [fingerprintKey: KEY3]]
+fcall('apiSetLockConfig')
+check('fpkey: warned again after a day', app.logged.count { it.toString().contains('approved in the app') } == warnsBefore + 1)
+app.fakeNow = savedNow
+app.appButtonHandler('btnRejectFpKey')
 // The held key sent again clears a pending request
 app.request = [JSON: fpCfg + [fingerprintKey: KEY2]]
 fcall('apiSetLockConfig')
