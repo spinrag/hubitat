@@ -129,7 +129,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.6.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.2')
+check('version is 1.6.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.6.3')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -144,10 +144,21 @@ app.state.connectedAt = '2026-10-01 12:00'
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 app.state.lockMgmtRegisteredAt = '2026-10-01 12:00'
-app.state.registeredVersion = '1.6.2'
+app.state.registeredVersion = '1.6.3'
 String KEY = ((1..32).collect { it as byte } as byte[]).encodeBase64().toString()
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY, locks: ['7': [adopted: [40]]]]]
 check('setup: slot rules and fingerprint key accepted', app.apiSetLockConfig().status == 200 && app.state.fingerprintKey == KEY)
+// A fingerprint key change waiting for approval (#19): shown with its own approve button, never a key
+String KEY_NEW = ((1..32).collect { (it + 100) as byte } as byte[]).encodeBase64().toString()
+app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY_NEW, locks: ['7': [adopted: [40]]]]]
+app.apiSetLockConfig()
+String fpPage = mainPage()
+check('fpkey page: the request is shown with approve and reject buttons', fpPage.contains('asks to replace the fingerprint key') &&
+    app.inputs["btnApproveFpKey_${app.state.fingerprintKeyPending.id}".toString()]?.type == 'button' && app.inputs.btnRejectFpKey?.type == 'button')
+check('fpkey page: key check shown', fpPage.contains("key check <b>${app.fingerprintKeyCheck(KEY_NEW)}</b>") && app.fingerprintKeyCheck(KEY_NEW) ==~ /[0-9a-f]{8}/)
+check('fpkey page: no key on the page', !fpPage.contains(KEY_NEW) && !fpPage.contains(KEY) && !app.inputs.keySet().any { it.contains(KEY_NEW) })
+app.appButtonHandler('btnRejectFpKey')
+check('fpkey page: gone after reject, held key kept', !mainPage().contains('asks to replace') && app.state.fingerprintKey == KEY)
 app.approvedAdoptedSlots = ['7:40']
 app.fullControlLocks = ['7']
 app.params = [lockId: '7']

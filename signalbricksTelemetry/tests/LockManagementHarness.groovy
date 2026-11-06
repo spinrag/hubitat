@@ -901,6 +901,8 @@ byte[] keyBytes = (1..32).collect { (byte) (it * 7) } as byte[]
 String KEY = keyBytes.encodeBase64().toString()
 byte[] key2Bytes = (1..32).collect { (byte) (255 - it) } as byte[]
 String KEY2 = key2Bytes.encodeBase64().toString()
+byte[] key3Bytes = (1..32).collect { (byte) (it * 3 + 1) } as byte[]
+String KEY3 = key3Bytes.encodeBase64().toString()
 // Independent RFC 2104 HMAC-SHA256 (MessageDigest only), first 16 hex chars
 def hmac16 = { byte[] k, String msg ->
     def sha = { byte[] b -> java.security.MessageDigest.getInstance('SHA-256').digest(b) }
@@ -995,12 +997,74 @@ def unread = fcall('apiListFingerprints')
 check('fp: unreadable lockCodes -> 409 lock_codes_unreadable', unread.status == 409 && body(unread).error == 'lock_codes_unreadable')
 lockA.attrs.lockCodes = savedCodes
 
-// Rotating the key changes every fingerprint
+// A different key while one is held waits for the operator's approval (#19)
 app.state.fingerprintTimes = []
+check('fpkey: replies say no key change is pending', body(setKey).fingerprintKeyPending == false && body(getCfg).fingerprintKeyPending == false)
+app.request = [JSON: fpCfg + [fingerprintKey: KEY2]]
+def swap = fcall('apiSetLockConfig')
+check('fpkey: different key not taken; POST reply says not set and pending', swap.status == 200 && app.state.fingerprintKey == KEY &&
+    body(swap).fingerprintKeySet == false && body(swap).fingerprintKeyPending == true && !swap.data.contains(KEY2))
+check('fpkey: the rules in that POST still apply', app.state.lockConfig.locks.keySet() == ['10', '11'] as Set)
+check('fpkey: GET says a key is held and a change is pending', body(fcall('apiGetLockConfig')).fingerprintKeySet == true && body(fcall('apiGetLockConfig')).fingerprintKeyPending == true)
+check('fpkey: fingerprints stay on the held key', body(fcall('apiListFingerprints')).slots.find { it.slot == 1 }.fp == hmac16(keyBytes, '12340001'))
+check('fpkey: one warning in the log', app.logged.count { it.toString().contains('new fingerprint key') && it.toString().contains('approved in the app') } == 1)
+check('fpkey: pending key counts as lock state', app.holdsLockState())
+String req1 = app.state.fingerprintKeyPending.id
+String sha8 = java.security.MessageDigest.getInstance('SHA-256').digest(key2Bytes).encodeHex().toString().take(8)
+check('fpkey: key check is the first 8 hex of SHA-256 of the key bytes', app.state.fingerprintKeyPending.check == sha8 && app.fingerprintKeyCheck(KEY2) == sha8)
+check('fpkey: key check not in the reply or the log', !swap.data.contains(sha8) && !app.logged.any { it.toString().contains(sha8) })
+check('fpkey: request id is 8 hex characters', req1 ==~ /[0-9a-f]{8}/)
+fcall('apiSetLockConfig')
+check('fpkey: same new key again keeps the request and does not warn again', app.state.fingerprintKeyPending.id == req1 && app.state.fingerprintKey == KEY &&
+    app.logged.count { it.toString().contains('approved in the app') } == 1)
+// Another key replaces the request; approving the request shown earlier does nothing
+app.request = [JSON: fpCfg + [fingerprintKey: KEY3]]
+fcall('apiSetLockConfig')
+String req2 = app.state.fingerprintKeyPending.id
+check('fpkey: a third key replaces the pending request', req2 != req1 && app.state.fingerprintKeyPending.key == KEY3 && app.state.fingerprintKey == KEY)
+app.appButtonHandler("btnApproveFpKey_${req1}".toString())
+check('fpkey: approving an older request does nothing', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending.id == req2)
+app.appButtonHandler('btnApproveFpKey_')
+check('fpkey: approval without the request id does nothing', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending != null)
+app.appButtonHandler('btnRejectFpKey')
+check('fpkey: reject drops the request and keeps the key', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending == null)
+// The warning comes once per key per day, even when keys alternate
+int warnsBefore = app.logged.count { it.toString().contains('approved in the app') }
+[KEY2, KEY3, KEY2].each { k -> app.request = [JSON: fpCfg + [fingerprintKey: k]]; fcall('apiSetLockConfig') }
+check('fpkey: alternating keys warned at most once each per day', app.logged.count { it.toString().contains('approved in the app') } == warnsBefore)
+Long savedNow = app.fakeNow
+app.fakeNow = app.now() + 86_400_001L
+app.request = [JSON: fpCfg + [fingerprintKey: KEY3]]
+fcall('apiSetLockConfig')
+check('fpkey: warned again after a day', app.logged.count { it.toString().contains('approved in the app') } == warnsBefore + 1)
+// The per-key warning record keeps only the newest 20 keys
+List floodKeys = (1..25).collect { i -> ((1..32).collect { (byte) (i * 5 + it) } as byte[]).encodeBase64().toString() }
+floodKeys.eachWithIndex { k, i -> app.fakeNow += 1000; app.request = [JSON: fpCfg + [fingerprintKey: k]]; fcall('apiSetLockConfig') }
+Map warnedNow = app.state.fingerprintKeyWarned
+check('fpkey: warning record capped at the newest 20 keys', warnedNow.size() == 20 &&
+    floodKeys.takeRight(20).every { warnedNow.containsKey(app.fingerprintKeyCheck(it)) } && !floodKeys.take(5).any { warnedNow.containsKey(app.fingerprintKeyCheck(it)) })
+check('fpkey: warning record holds no key', !floodKeys.any { k -> app.state.fingerprintKeyWarned.toString().contains(k) })
+app.fakeNow = savedNow
+app.appButtonHandler('btnRejectFpKey')
+// The held key sent again clears a pending request
 app.request = [JSON: fpCfg + [fingerprintKey: KEY2]]
 fcall('apiSetLockConfig')
+app.request = [JSON: fpCfg + [fingerprintKey: KEY]]
+def same = fcall('apiSetLockConfig')
+check('fpkey: held key sent again -> taken, request dropped', body(same).fingerprintKeySet == true && body(same).fingerprintKeyPending == false && app.state.fingerprintKeyPending == null)
+app.request = [JSON: fpCfg]
+fcall('apiSetLockConfig')
+check('fpkey: POST without a key leaves it as is', body(fpResponses[-1]).fingerprintKeySet == true && app.state.fingerprintKey == KEY)
+
+// Approving it makes the new key the one in use, and changes every fingerprint
+app.request = [JSON: fpCfg + [fingerprintKey: KEY2]]
+fcall('apiSetLockConfig')
+app.appButtonHandler("btnApproveFpKey_${app.state.fingerprintKeyPending.id}".toString())
+check('fpkey: approved -> key replaced, request gone', app.state.fingerprintKey == KEY2 && app.state.fingerprintKeyPending == null)
 def slotsA2 = body(fcall('apiListFingerprints')).slots
 check('fp: new key replaces old', app.state.fingerprintKey == KEY2 && slotsA2.find { it.slot == 1 }.fp == hmac16(key2Bytes, '12340001') && slotsA2.find { it.slot == 1 }.fp != slotsA.find { it.slot == 1 }.fp)
+def again = fcall('apiSetLockConfig')
+check('fpkey: the approved key sent again -> taken', body(again).fingerprintKeySet == true && body(again).fingerprintKeyPending == false)
 
 // Rate limit: own bucket of 10/min
 app.state.fingerprintTimes = []
@@ -1177,6 +1241,7 @@ app.params = [lockId: '10']
 app.state.lockMgmtLastEnabled = true
 app.syncLockManagementEnabled()
 check('fp: key cleared on disable', app.state.fingerprintKey == null && app.state.fingerprintTimes == null && app.state.fingerprintBatchTimes == null)
+check('fpkey: pending request cleared on disable', app.state.fingerprintKeyPending == null)
 app.lockManagementEnabled = true
 app.syncLockManagementEnabled()
 app.request = [JSON: fpCfg]
@@ -1190,17 +1255,21 @@ app.params = [lockId: '10']
 app.request = [JSON: fpCfg + [fingerprintKey: KEY]]
 fcall('apiSetLockConfig')
 check('fp: key set again', app.state.fingerprintKey == KEY)
+app.request = [JSON: fpCfg + [fingerprintKey: KEY3]]
+fcall('apiSetLockConfig')
+check('fpkey: first key after re-enable is taken, a different one waits', app.state.fingerprintKey == KEY && app.state.fingerprintKeyPending?.key == KEY3)
 app.appButtonHandler('btnDisconnect')
 check('fp: key cleared on disconnect', app.state.fingerprintKey == null)
+check('fpkey: pending request cleared on disconnect', app.state.fingerprintKeyPending == null)
 
 // Neither key nor codes anywhere outside app state
-List keyForms = [KEY, KEY2, keyBytes.encodeHex().toString(), key2Bytes.encodeHex().toString()]
+List keyForms = [KEY, KEY2, KEY3, keyBytes.encodeHex().toString(), key2Bytes.encodeHex().toString(), key3Bytes.encodeHex().toString()]
 String fpEverything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + fpResponses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.contains(it) })
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.6.2'
+String VERSION = '1.6.3'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()

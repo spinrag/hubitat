@@ -176,7 +176,7 @@ def lockCfg = { app.state.lockConfig.locks['9'] }
 def r0 = push(['9': [adopted: [28]]])
 check('old config: accepted', r0.status == 200)
 check('old config: stored exactly as before (no registered/fullControl keys)', app.state.lockConfig == [admin: [from: 1, to: 10], managed: [from: 11, to: 20], locks: ['9': [adopted: [28]]]])
-check('old config: reply keeps its keys and adds features + fullControlAllowed', body(r0).keySet() == ['config', 'ceiling', 'pendingApproval', 'fingerprintKeySet', 'features', 'fullControlAllowed'] as Set &&
+check('old config: reply keeps its keys and adds features + fullControlAllowed', body(r0).keySet() == ['config', 'ceiling', 'pendingApproval', 'fingerprintKeySet', 'fingerprintKeyPending', 'features', 'fullControlAllowed'] as Set &&
     body(r0).features == ['registered_slots', 'full_control'] && body(r0).fullControlAllowed == [])
 fresh()
 check('old config: unmarked code in range still refused (slot_not_managed)', body(reveal(3)).error == 'slot_not_managed' && body(deleteCode(3)).error == 'slot_not_managed')
