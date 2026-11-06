@@ -907,6 +907,17 @@ check('case: the result carries the name sent', results()[-1].d.name == 'SBM: Ca
     tick()
     check("case: '${other}' then fails ${reason}, never confirmed", results().size() == caseRes + 1 && results()[-1].value == 'failed' && results()[-1].d.reason == reason)
 }
+// A name the booking rule reads as a booking code never confirms by case
+putSlot(17, null, null)
+app.request = [JSON: [slot: 17, code: '91917175', name: 'SBM: Orbit']]
+check('case booking: SBM: Orbit accepted', call('apiSetCode').status == 202)
+putSlot(17, 'SBM: ORBIT', '91917175')
+int caseBk = results().size()
+tick()
+check("case booking: 'SBM: ORBIT' does not confirm 'SBM: Orbit'", results().size() == caseBk && pendingFor(17)?.status == 'pending')
+tick()
+check("case booking: then fails booking_code, never confirmed", results().size() == caseBk + 1 && results()[-1].value == 'failed' && results()[-1].d.reason == 'booking_code')
+check('sameName: exact booking-looking name still matches', app.sameName('SBM: ORBIT', [name: 'SBM: ORBIT']) && !app.sameName('SBM: ORBIT', [name: 'SBM: Orbit']))
 // A change that only changes the case compares exactly
 putSlot(17, 'SBM: case', '91917174')
 app.request = [JSON: [slot: 17, code: '91917174', name: 'SBM: Case']]
@@ -930,7 +941,7 @@ app.appButtonHandler('btnDisconnect')
 check('disconnect reports and clears', results()[-1].d.reason == 'disconnected' && app.state.pendingCodeChanges == null)
 
 // No code anywhere outside app state
-List codes = ['91917171', '91917172', '91917173', '91917174', '91919192', '91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
+List codes = ['91917175', '91917171', '91917172', '91917173', '91917174', '91919192', '91922222', '91922229', '91919191', '91912121', '91923232', '91924242', '91911111', '91913333', '91914444', '91915555', '91916666', '91917777', '01818', '90903333', '90903334', '90903335', '90904444', '90905555', '90906666', '90907777', '90907778', '90908888', '90909999', '90901010']
 String everything = (app.posts.collect { it.params.body } + app.logged.collect { it.toString() } + responses.collect { it.data } + app.scheduled.collect { it.data?.toString() }).join('\n')
 check('no code in any event, log, response or scheduled job', !codes.any { everything.contains(it) })
 check('result events carry only contract keys', results().every { (it.d.keySet() - ['lockId', 'slot', 'action', 'result', 'attempts', 'reason', 'requestId', 'name']).isEmpty() })

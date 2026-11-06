@@ -544,6 +544,27 @@ putSlot(19, null, null)
 putSlot(15, 'SBM: Busy', '50500015')
 lock.storedName = null
 
+// ...but never when the other case reads as a booking code: source kept
+fresh()
+lock.storedName = 'SBM: ORBIT'
+relocate(15, [name: 'SBM: Orbit', toSlot: 19])
+settle('50500015', [15, 19])
+check('booking-looking case: not confirmed, failed target_name_mismatch, source kept', results()[-1].value == 'failed' && results()[-1].d.reason == 'target_name_mismatch' &&
+    results()[-1].d.targetConfirmed == false && !lock.calls.any { it[0] == 'deleteCode' } && slotOf(15) == [name: 'SBM: Busy', code: '50500015'])
+putSlot(19, null, null)
+
+// In-place rename that only changes the case: the old name doesn't confirm it
+fresh()
+lock.dropSets = 1
+relocate(15, [name: 'SBM: BUSY'])
+int caseMark = results().size()
+tick('50500015', [15])
+check('case-only rename: the old name does not confirm it', results().size() == caseMark && pending()['9:15']?.status == 'pending')
+settle('50500015', [15])
+check('case-only rename: re-sent and confirmed once the lock shows the new name', results()[-1].value == 'confirmed' && results()[-1].d.attempts == 2 &&
+    lock.calls.count { it == ['setCode', 15, 'SBM: BUSY'] } == 2 && slotOf(15) == [name: 'SBM: BUSY', code: '50500015'])
+putSlot(15, 'SBM: Busy', '50500015')
+
 // Retry on either slot of a move in flight -> 409
 fresh()
 lock.dropSets = 99

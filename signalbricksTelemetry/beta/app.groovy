@@ -2607,14 +2607,15 @@ Boolean codeChangeApplied(Map p, Map codes) {
 
 // The slot's name against the change's name, ignoring case (some drivers change
 // it), as signalbricksIntegration does. A change that only changes the case
-// compares exactly, or the old name would confirm it.
+// compares exactly, or the old name would confirm it. A name the booking rule
+// reads as a booking code only matches exactly.
 Boolean sameName(def actual, Map p) {
     String a = actual?.toString()
     String want = p.name?.toString()
     String before = p.prevName?.toString()
     if (a == null || want == null) return a == want
     if (before != null && before != want && before.equalsIgnoreCase(want)) return a == want
-    return a.equalsIgnoreCase(want)
+    return a.equalsIgnoreCase(want) && (a == want || !isAnyBookingName(a))
 }
 
 // Scheduled: runs every check that is due, then schedules the next one. A
