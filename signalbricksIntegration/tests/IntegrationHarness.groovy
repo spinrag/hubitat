@@ -1032,6 +1032,78 @@ check('#63 logs: no code', !newLogs().any { l -> ['20000077', '20000079', '12345
 app.atomicState.codeShortWarned = [:]
 lock.attrs.lockCodes = '{}'
 
+// --- 1.4.16: duplicate check compares codes as text, a dropped leading zero counts ---
+def dup = { Map lockCodes, Map bk = booking77() -> lock.attrs.lockCodes = JsonOutput.toJson(lockCodes); app.helperHasDuplicateCode('7', bk['77'], bk + booking88) }
+check('1.4.16 duplicate: same PIN reported as a number is a duplicate', dup(['20': [name: 'Front desk', code: 20000077]]))
+check('1.4.16 duplicate: booking code a number, lock code text', dup(['20': [name: 'Front desk', code: '20000077']], booking77(code: 20000077)))
+check('1.4.16 duplicate: surrounding spaces still a duplicate', dup(['20': [name: 'Front desk', code: ' 20000077 ']]))
+check('1.4.16 duplicate: another current booking\'s slot, code as a number', dup(['53': [name: 'G:ORB88-Di', code: 20000077]]))
+check('1.4.16 duplicate: a code that only lost its leading zero is a duplicate', dup(['20': [name: 'Front desk', code: 1234567]], booking77(code: '01234567')))
+check('1.4.16 duplicate: a longer code is not (0 added, not dropped)', !dup(['20': [name: 'Front desk', code: '01234567']], booking77(code: '1234567')))
+check('1.4.16 duplicate: a different number is not', !dup(['20': [name: 'Front desk', code: 20000079]]) && !dup(['20': [name: 'Front desk', code: 101234567]], booking77(code: '01234567')))
+check('1.4.16 duplicate: a hidden or missing code is not ("can\'t tell")', !dup(['20': [name: 'Front desk', code: '********']]) && !dup(['20': [name: 'Front desk']]) && !dup(['20': [name: 'Front desk', code: '']]))
+check('1.4.16 duplicate: a booking without a code matches no hidden or missing code', !dup(['20': [name: 'Front desk', code: '********'], '21': [name: 'Back desk']], booking77(code: null)))
+check('1.4.16 duplicate: the booking\'s own slot (code as a number) is not', !dup(['51': [name: 'G:ORB77-Cy', code: 20000077]]))
+check('1.4.16 duplicate: the booking\'s own old-name slot with the code short is not', !dup(['51': [name: 'GT:ORB77-Cy', code: 1234567]], booking77(code: '01234567')))
+lock.attrs.lockCodes = '{}'
+
+// --- 1.4.16: a hidden or missing code on a slot found by name ---
+Map tracked77 = ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]]
+mark()
+app.warned.clear()
+[['hidden', ['51': [name: 'G:ORB77-Cy', code: '********']]], ['missing', ['51': [name: 'G:ORB77-Cy']]], ['empty', ['51': [name: 'G:ORB77-Cy', code: '']]],
+ ['partly hidden', ['51': [name: 'G:ORB77-Cy', code: '2000****']]]].each { t ->
+    r = prefixRun(t[1], tracked77, booking77())
+    r2 = prefixRun(t[1], app.atomicState.codeAssignments, booking77())
+    check("1.4.16 tracked slot, code ${t[0]}: no rewrite on either run, no second slot, no delete".toString(),
+        r.sets.isEmpty() && r2.sets.isEmpty() && r.deletes.isEmpty() && r2.deletes.isEmpty())
+}
+Map hidden51 = ['51': [name: 'G:ORB77-Cy', code: '********']]
+r = prefixRun(hidden51, tracked77, booking77(guest: 'VIP Cy'))
+check('1.4.16 hidden code, guest name changed: no rewrite', r.sets.isEmpty())
+r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [confirmed: false]]], booking77())
+check('1.4.16 hidden code, write not confirmed yet: its own retry re-sends it, reconcile doesn\'t', r.sets.isEmpty())
+r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [code: '20000070']]], booking77())
+check('1.4.16 hidden code, booking code changed: rewritten once into its slot with the new code',
+    r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].code == '20000077' && r.sets[0].codeName == 'G:ORB77-Cy')
+r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [bookingId: 'unknown']]], booking77())
+check('1.4.16 hidden code, slot tracked for no booking: rewritten', r.sets.size() == 1 && r.sets[0].codePosition == 51)
+r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [deleting: true]]], booking77())
+check('1.4.16 hidden code, slot being deleted for a current booking: rewritten', r.sets.size() == 1 && r.sets[0].codePosition == 51)
+// While a refresh reads the lock, tracking of another booking isn't pruned yet: it doesn't count
+reading('7')
+r = prefixRun(hidden51, ['7': ['51': tracked77['7']['51'] + [bookingId: 'ORB88']]], booking77())
+check('1.4.16 hidden code, slot tracked for another booking during a read: the write is held, not skipped', r.sets.isEmpty() && app.atomicState.codeWritesDeferred == ['7': 1])
+reset55()
+// Untracked (Reset State, or written before tracking): written once, then tracked and left alone
+r = prefixRun(hidden51, [:], booking77())
+check('1.4.16 untracked slot, hidden code: rewritten once into its slot, no second slot', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.deletes.isEmpty())
+lock.setCalls.clear()
+app.trySetCode(r.sets[0])
+check('1.4.16 untracked slot, hidden code: the write reaches the lock and is tracked', lock.setCalls == [51] && app.atomicState.codeAssignments['7']['51'].code == '20000077')
+app.codeChangedHandler([device: [id: '7'], value: 'changed', data: JsonOutput.toJson(['51': [name: 'G:ORB77-Cy', code: '********']])])
+check('1.4.16 untracked slot, hidden code: the lock confirms it', app.atomicState.codeAssignments['7']['51'].confirmed == true)
+r = prefixRun(hidden51, app.atomicState.codeAssignments, booking77())
+r2 = prefixRun(hidden51, app.atomicState.codeAssignments, booking77())
+check('1.4.16 untracked slot, hidden code: no rewrite on the next runs', r.sets.isEmpty() && r2.sets.isEmpty())
+// The operator asks: Debug -> Reconcile Door Codes rewrites it
+lock.attrs.lockCodes = JsonOutput.toJson(hidden51)
+app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(tracked77))
+app.atomicState.bookings = booking77()
+app.scheduled.clear()
+app.appButtonHandler('btnReconcile')
+def opSets = app.scheduled.findAll { it.handler == 'trySetCode' }.collect { it.data }
+check('1.4.16 Reconcile Door Codes: a hidden code is rewritten into its slot', opSets.size() == 1 && opSets[0].codePosition == 51 && opSets[0].code == '20000077')
+app.atomicState.bookings = [:]
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '20000079']], tracked77, booking77())
+check('1.4.16 a different readable code on a tracked slot is still rewritten', r.sets.size() == 1 && r.sets[0].codePosition == 51)
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '********']], tracked77, [:])
+check('1.4.16 hidden code after checkout: still deleted', r.deletes == [51])
+check('1.4.16 no warning for hidden or missing codes', app.warned.isEmpty())
+check('1.4.16 logs: no code', !newLogs().any { l -> ['20000077', '20000070', '20000079', '1234567'].any { l.contains(it) } })
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = [:]
+
 // --- #64: ambiguous names (different ORB ids after the prefix and at the end) ---
 Map booking5 = ['5': [id: '5', guest: 'Eve', code: '20000005', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)]]
 [false, true].each { boolean atEnd ->

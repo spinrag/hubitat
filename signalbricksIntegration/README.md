@@ -148,7 +148,7 @@ You don't need to open the app and click **Done** after an update; the existing 
 
 - **No codes are generated for a booking.** Check the log for `no free code position`: the lock has no empty slot between **Minimum Code Position** and its `maxCodes`. Lower the minimum or free slots, and check that the lock is selected in the app.
 - **Codes vanished.** Don't use **Reset State** on the Debug page: it clears the app's bookings and code assignments, so the app's codes are removed until the dispatcher syncs the bookings again.
-- **A current booking's code is missing.** Check the app page for *Waiting*. Otherwise open **Debug** → **Reconcile Door Codes**.
+- **A current booking's code is missing.** Check the app page for *Waiting*. Otherwise open **Debug** → **Reconcile Door Codes**, which also rewrites codes on locks that hide them.
 - **A lock stays on *Waiting*.** The lock didn't answer its code reads (offline, out of range, low battery) or its driver doesn't report codes. Check the lock is online and that **Get Codes** on its device page fills in **lockCodes**. The app tries again on its own every few hours.
 - **A lock shows *its lockCodes can't be read*.** The app leaves that lock alone until it can read it, so it neither adds nor removes codes there: **remove a past guest's code by hand** on the lock's device page if needed. Run **Get Codes**, and if **lockCodes** still isn't readable, check the lock's driver.
 - **Another app's codes are changed or removed.** Check that each app has its own non-empty code name prefix and that neither is the start of the other, and that Lock Code Manager isn't running on the lock (see [Conflicts](#conflicts)).

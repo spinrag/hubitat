@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.15' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.16' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -356,9 +356,9 @@ void appButtonHandler(String btnName) {
             // SignalBricks needs the new token, or the dispatcher can't reach the app (#34)
             if (state.sbCredential) sbRegister()
             break
-        // Manually run the reconcileDoorCodes function
+        // Manually run the reconcileDoorCodes function; also rewrites codes the lock hides
         case 'btnReconcile':
-            reconcileDoorCodes()
+            reconcileDoorCodes(helperGetBookings(atomicState.bookings), true)
             break
         // Read door codes from the chosen lock, or all locks one at a time
         case 'btnRefreshCodes':
@@ -1025,7 +1025,9 @@ void reconcileDoorCodes() {
     reconcileDoorCodes(bookings)
 }
 
-void reconcileDoorCodes(Map bookings) {
+// rewriteUnknown: the operator asked (Reconcile Door Codes), so slots whose code the lock
+// hides or doesn't report are rewritten too
+void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
     log.debug 'reconcileDoorCodes'
 
     // We only care about bookings that should be active right now
@@ -1168,6 +1170,13 @@ void reconcileDoorCodes(Map bookings) {
                 }
                 // Is the booking's code different from the current code (compared as text, #63)
                 else if (helperCodeText(sbCodes[bookingId].code) != helperCodeText(booking.code)) {
+                    // The lock hides the code (********) or reports none: unknown, the name matches.
+                    // Rewritten only when this slot has no record of the booking's current code
+                    // (untracked, or its code changed), or when the operator asks
+                    if (!rewriteUnknown && !helperCodeKnown(sbCodes[bookingId].code)) {
+                        Map a = lockAssignments["${sbCodes[bookingId].key}"]
+                        if (a && !a.deleting && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && helperCodeText(a.code) == helperCodeText(booking.code)) return
+                    }
                     if (holdWrites) {
                         held++
                         return
@@ -2075,9 +2084,13 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
     }
 
     String codeName = helperGetCodeName(booking)
+    String pin = helperCodeText(booking.code)
 
+    // Compared as text, a reported code without its leading zeros counts; a hidden or
+    // missing code is "can't tell", like an unreadable lock
     return lockCodes.any { k, existing ->
-        if (existing.name == codeName || existing.code != booking.code) {
+        String reported = helperCodeText(existing.code)
+        if (existing.name == codeName || !helperCodeKnown(reported) || !helperSameCode(reported, pin)) {
             return false
         }
 
@@ -2302,6 +2315,11 @@ List helperCodeNameIds(String rest, boolean ignoreCase = false) {
 // A code as text for comparing; drivers may report numbers (#63). Never log it
 String helperCodeText(def code) {
     return code == null ? '' : code.toString().trim()
+}
+
+// A reported code that can be compared: digits only, not hidden (********) or missing
+boolean helperCodeKnown(def code) {
+    return helperCodeText(code) ==~ /\d+/
 }
 
 // The booking id in a code name this app wrote (with the current prefix), or null
