@@ -308,5 +308,24 @@ step('GET /devices/<id>, undecryptable lockCodes') {
 }
 check('GET /devices/<id>, undecryptable lockCodes: lockCodes null, not a 500', dev?.status == 200 && new JsonSlurper().parseText(dev.data).attributes.find { it.name == 'lockCodes' }.currentValue == null)
 
+// A code reported without its leading zeros (#61): one warn from the confirmation, one from reconcile,
+// lock and slot only, never the code
+String ZERO_CODE = '08001234'
+String SHORT_CODE = '8001234'
+secrets << ZERO_CODE << SHORT_CODE
+front.attrs.lockCodes = JsonOutput.toJson(['55': [name: 'GT:ORB44-Eve', code: SHORT_CODE as int]])
+app.atomicState.codeAssignments = ['1': ['55': [bookingId: 'ORB44', code: ZERO_CODE, codeName: 'GT:ORB44-Eve', attempt: 1, confirmed: false]]]
+String logsZero = step('lock event: our code without its leading zeros, twice') {
+    2.times { app.codeChangedHandler([name: 'codeChanged', value: 'changed', data: JsonOutput.toJson(['55': [name: 'GT:ORB44-Eve', code: SHORT_CODE as int]]), device: [id: '1']]) }
+}
+check('lock event: a code without its leading zeros confirms and warns once with the lock and slot only',
+    app.atomicState.codeAssignments['1']['55'].confirmed == true && logsZero.count('warn codeChangedHandler: lock 1 pos 55 reported the code written without its leading zeros') == 1)
+Map eve = ['44': [id: '44', guest: 'Eve', code: ZERO_CODE, lockId: ['1'], checkIn: new Date(t - h), checkOut: new Date(t + h)]]
+String logsZeroRec = step('reconcile, the lock keeps the code without its leading zeros, twice') {
+    2.times { app.scheduled.clear(); app.reconcileDoorCodes(eve) }
+}
+check('reconcile, the lock keeps the code without its leading zeros: rewritten, one warn with the lock and slot only',
+    app.scheduled.any { it.handler == 'trySetCode' && it.data.codePosition == 55 } && logsZeroRec.count('warn reconcileDoorCodes: lock 1 pos 55 keeps reporting the code without its leading zeros') == 1)
+
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
