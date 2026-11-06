@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.11' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.12' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -352,6 +352,7 @@ void appButtonHandler(String btnName) {
             atomicState.lockCodesReadEmpty = []
             atomicState.codeWritesDeferred = [:]
             atomicState.lockCodesUnreadable = []
+            atomicState.codeDisplaced = [:]
             atomicState.codeAutoReadAt = [:]
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
@@ -1118,6 +1119,10 @@ void reconcileDoorCodes(Map bookings) {
                     } else {
                         nextPosition = availableCodePositions[index]
                         if (nextPosition == null) {
+                            // Its slot was taken by another code (#59): the guest has no code here until a slot frees
+                            if (((atomicState.codeDisplaced ?: [:])[lockKey] ?: []).contains("${bookingId}".toString())) {
+                                log.warn "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} lost its slot to another code and no slot is free; no code for it on this lock until one frees"
+                            }
                             log.warn "reconcileDoorCodes: no free code position (>= ${minCodePosition}) on lock ${lock.id} for ${codeName} - skipping"
                             return // continue to next booking
                         }
@@ -1127,8 +1132,8 @@ void reconcileDoorCodes(Map bookings) {
 
                     log.debug "reconcileDoorCodes: trySetCode ${helperLogBooking(booking)}"
 
-                    // Create the code
-                    runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName ]])
+                    // Create the code (free: the slot must still be empty when the job runs)
+                    runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName, free: true ]])
                 }
                 // Is the booking's code different from the current code 
                 else if (sbCodes[bookingId].code != booking.code) {
@@ -1204,14 +1209,45 @@ void trySetCode(Map data) {
         return
     }
 
+    // A queued job must not write over a code that took the slot since it was scheduled (#59).
+    // A retry (attempt set) needs the slot's tracking for this same write; a reconcile write
+    // needs the slot still empty (free) or still this booking's in the lock's current codes
+    Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
+    boolean stale
+    if (data.attempt != null) {
+        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}"
+    } else {
+        Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+        def lockCode = codes == null ? null : (codes[data.codePosition] ?: codes["${data.codePosition}"])
+        String bookingId = data.codeName?.find(/ORB\d+/) ?: ''
+        String v = helperTrackedVerdict([bookingId: bookingId], lockCode, data.codePosition)
+        boolean ours = bookingId && lockCode?.name?.toString()?.find(/ORB\d+/) == bookingId
+        stale = codes == null || v in ['otherName', 'otherBooking'] || (data.free && lockCode && !ours)
+    }
+    if (stale) {
+        log.info "trySetCode: lock ${data.lockId} pos ${data.codePosition} no longer free for this write, skipped"
+        return
+    }
+
     int attempt = (data.attempt ?: 0) + 1
 
     lock.setCode(data.codePosition, data.code, data.codeName)
+
+    // Written again: no longer displaced (#59)
+    Map displaced = atomicState.codeDisplaced ?: [:]
+    String displacedId = data.codeName?.find(/ORB(\d+)/) ? data.codeName.find(/ORB(\d+)/).substring(3) : null
+    String displacedKey = "${data.lockId}"
+    if (displacedId && displaced[displacedKey]?.contains(displacedId)) {
+        atomicState.codeDisplaced = displaced + [(displacedKey): displaced[displacedKey].findAll { it != displacedId }]
+    }
 
     // Track the assignment in state (lock drivers may not preserve code names)
     Map assignments = atomicState.codeAssignments ?: [:]
     String lockKey = "${data.lockId}"
     if (!assignments[lockKey]) assignments[lockKey] = [:]
+    // Mismatching confirmations carry over a re-send of the same write (#59)
+    Map previous = assignments[lockKey]["${data.codePosition}"]
+    def mismatches = previous?.codeName == data.codeName && previous?.code == data.code ? previous?.mismatches : null
     assignments[lockKey]["${data.codePosition}"] = [
         bookingId: data.codeName?.find(/ORB\d+/) ?: 'unknown',
         code: data.code,
@@ -1219,6 +1255,7 @@ void trySetCode(Map data) {
         attempt: attempt,
         confirmed: false,
     ]
+    if (mismatches) assignments[lockKey]["${data.codePosition}"].mismatches = mismatches
     atomicState.codeAssignments = assignments
     log.debug "trySetCode: tracked assignment lock ${data.lockId} pos ${data.codePosition} (attempt ${attempt})"
 
@@ -1359,9 +1396,33 @@ void codeChangedHandler(e) {
             Map assignment = lockAssignments[pos]
 
             if (assignment) {
-                if (e.value == 'added' || e.value == 'changed') {
+                String verdict = (e.value == 'added' || e.value == 'changed') ? helperEventVerdict(data, pos, assignment) : null
+                if (verdict == 'foreign') {
+                    // Another app or a person wrote this slot: leave their code, stop tracking (and
+                    // re-sending) ours there, and let reconcile put the booking in a free slot (#59)
+                    log.info "codeChangedHandler: ${e.value} at pos ${pos} on lock ${lockId} is not ${assignment.bookingId}; tracking dropped, reconcile in 10 s"
+                    lockAssignments.remove(pos)
+                    assignments[lockId] = lockAssignments
+                    atomicState.codeAssignments = assignments
+                    String displacedId = "${assignment.bookingId ?: ''}".find(/\d+/)
+                    if (displacedId && !assignment.deleting) {
+                        Map displaced = atomicState.codeDisplaced ?: [:]
+                        atomicState.codeDisplaced = displaced + [(lockId): ((displaced[lockId] ?: []) + [displacedId]).unique()]
+                    }
+                    runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+                } else if (verdict == 'stale') {
+                    // Our name with another code (an older write of ours): the set stays pending
+                    int mismatches = (assignment.mismatches ?: 0) + 1
+                    log.info "codeChangedHandler: ${e.value} at pos ${pos} on lock ${lockId} doesn't match ${assignment.bookingId}, not confirmed"
+                    if (mismatches == sbMaxEventMismatches && helperPendingSet(assignment)) log.warn "codeChangedHandler: lock ${lockId} pos ${pos}: ${mismatches} confirmations in a row didn't match the code written; still re-sending"
+                    assignment.mismatches = mismatches
+                    lockAssignments[pos] = assignment
+                    assignments[lockId] = lockAssignments
+                    atomicState.codeAssignments = assignments
+                } else if (e.value == 'added' || e.value == 'changed') {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
                     assignment.confirmed = true
+                    assignment.remove('mismatches')
                     lockAssignments[pos] = assignment
                     assignments[lockId] = lockAssignments
                     atomicState.codeAssignments = assignments
@@ -2105,6 +2166,42 @@ String helperTrackedVerdict(Map assignment, def lockCode, def pos) {
     def bMatcher = ("${assignment.bookingId ?: ''}" =~ /(\d+)/)
     return bMatcher.find() && bMatcher.group(1) == nMatcher.group(1) ? 'claim' : 'otherBooking'
 }
+
+// What codeChanged data for a slot says about this app's write there (#59). The slot's
+// entry is data["<slot>"] or else data itself.
+// 'match': the code written is reported (whatever the name: drivers may lower-case or
+//   replace names), or a name this app's (below) with no other code, or neither a name
+//   nor a code (confirm by slot).
+// 'foreign': a name that isn't this app's (another ORB<id>, or one reconcile wouldn't
+//   claim that isn't a truncation of the written one) and not the code written.
+// 'stale': this app's name, or no name, with another code (an older write of ours, or
+//   too little to tell): the write stays pending.
+// Names compare ignoring case. A truncation counts only when it is the start of the written
+// name and still holds the whole ORB of ORB<id>: GT:ORB matches GT:ORB77-Cy, GT and GT:ORB7
+// don't. Masked codes (not all digits) are ignored. Never log the name or the code.
+String helperEventVerdict(Map data, String pos, Map assignment) {
+    def entry = data[pos] instanceof Map ? data[pos] : data
+    String name = (entry.name ?: entry.codeName)?.toString()?.trim()?.toUpperCase()
+    String code = entry.code?.toString()?.trim()
+    boolean reported = code ==~ /\d+/
+    if (reported && helperSameCode(code, "${assignment.code ?: ''}".trim())) return 'match'
+    if (!name) return reported ? 'stale' : 'match'
+    String v = helperTrackedVerdict(assignment, [name: name], pos)
+    String written = (assignment.codeName ?: '').toString().trim().toUpperCase()
+    if (v == 'otherBooking' || (v == 'otherName' && !(name.contains('ORB') && written.startsWith(name)))) return 'foreign'
+    return reported ? 'stale' : 'match'
+}
+
+// A reported code against the one written. A driver that reports the code as a number
+// drops its leading zeros (0123 as 123): that counts as the same code. Only ever used to
+// confirm, never to claim a slot, so a wrong match costs a missed re-send at most
+boolean helperSameCode(String reported, String written) {
+    if (reported == written) return true
+    return written.startsWith('0') && reported.length() < written.length() && written.replaceFirst(/^0+/, '') == reported
+}
+
+// Mismatching confirmations of this app's own name in a row before a warning
+int getSbMaxEventMismatches() { 3 }
 
 // A setCode not confirmed yet: verifySetCode keeps retrying it
 boolean helperPendingSet(Map assignment) {
