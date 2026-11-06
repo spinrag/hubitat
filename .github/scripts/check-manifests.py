@@ -9,7 +9,10 @@
   manifest's betaVersion; with no beta out it must be identical to the stable
   file; a betaVersion needs betaReleaseNotes and must be one HPM offers over version
 - repository.json entries point at existing manifests, and every manifest is listed
+- HPM schema: manifest and app/driver fields follow HPM's sampleManifest.json;
+  repository.json category and tags come from hubitat-packagerepositories settings.json
 """
+import datetime
 import filecmp
 import json
 import re
@@ -23,6 +26,33 @@ VERSION_PATTERNS = [
     r"get\w*Version\(\)\s*\{\s*(?:return\s+)?['\"]([^'\"]+)['\"]",
     r"\bversion\s*:\s*['\"]([^'\"]+)['\"]",
 ]
+
+# https://github.com/HubitatCommunity/hubitatpackagemanager/blob/main/sampleManifest.json
+MANIFEST_KEYS = {
+    "packageName", "minimumHEVersion", "author", "version", "betaVersion", "dateReleased",
+    "documentationLink", "communityLink", "licenseFile", "releaseNotes", "betaReleaseNotes",
+    "apps", "drivers", "bundles", "files",
+}
+REQUIRED_MANIFEST_KEYS = ("packageName", "author", "version", "minimumHEVersion", "dateReleased", "releaseNotes")
+# "version" per app/driver is allowed (HPM README: version the package or each item)
+ITEM_KEYS = {"id", "name", "namespace", "alternateNames", "location", "betaLocation", "required", "oauth", "primary", "version"}
+REQUIRED_ITEM_KEYS = ("id", "name", "namespace", "location", "required")
+GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Ids that predate GUIDs; HPM tracks installs by id, so these must never change.
+LEGACY_IDS = {"cloudflareDnsUpdater", "dmsMonitor", "dnsMadeEasyUpdater"}
+# https://raw.githubusercontent.com/HubitatCommunity/hubitat-packagerepositories/master/settings.json
+CATEGORIES = {"Control", "Convenience", "Integrations", "Notifications", "Security", "Utility"}
+TAGS = {
+    "Alarm Systems", "Appliances", "Automations & Groups", "Bathroom", "Buttons", "Cameras",
+    "Cleaning Devices", "Climate Control", "Cloud", "Dashboards", "Doors & Windows",
+    "Energy Monitoring", "Garage Doors", "HDMI", "Health & Fitness", "IR & RF", "Irrigation", "KVM",
+    "LAN", "Lights & Switches", "Locks", "Matter", "Misc. Devices", "Monitoring", "Motion Control",
+    "MQTT", "Multimedia", "Multi Sensors", "Notifications", "Pets & Animals", "Pools & Spas",
+    "Presence & Location", "Relays", "Repeaters & Extenders", "Safety & Security", "Scales", "Shower",
+    "Sleep", "Speakers", "Tasmota", "Temperature & Humidity", "Timers", "Tools & Utilities", "Valves",
+    "Vehicles & Transportation", "Voice Assistants", "Water Heater", "Water", "Weather",
+    "Window Coverings", "Zigbee", "ZWave",
+}
 
 errors = []
 warnings = []
@@ -53,6 +83,18 @@ def hpm_compare(old, new):
         if i >= len(old_parts) or int(old_parts[i]) < int(part):
             return 1
     return -1
+
+
+def source_definition(path):
+    """name and namespace from the definition(...) call in an app or driver."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    start = re.search(r"\bdefinition\s*\(", text)
+    if not start:
+        return None
+    head = text[start.end():start.end() + 1000]
+    fields = {k: v for k, _, v in re.findall(r"\b(name|namespace)\s*:\s*(['\"])(.*?)\2", head)[::-1]}
+    return fields.get("name"), fields.get("namespace")
 
 
 def source_version(path):
@@ -91,15 +133,48 @@ for path in manifests:
         errors.append(f"{path}: betaReleaseNotes without betaVersion")
     if beta_version and not any(e.get("betaLocation") for k in ("apps", "drivers") for e in m.get(k, [])):
         errors.append(f"{path}: betaVersion {beta_version} but no app or driver has a betaLocation")
-    # The top-level location is optional in HPM; when present it must be this file.
-    if "location" in m and local_path(m["location"]) != path:
-        errors.append(f"{path}: location {m.get('location')!r} does not point at itself")
+    for key in sorted(set(m) - MANIFEST_KEYS):
+        errors.append(f"{path}: {key!r} is not an HPM manifest field (category and tags belong in repository.json)")
+    for key in REQUIRED_MANIFEST_KEYS:
+        if not m.get(key):
+            errors.append(f"{path}: missing {key}")
+    if m.get("minimumHEVersion") and not re.fullmatch(r"\d+(\.\d+)*", m["minimumHEVersion"]):
+        errors.append(f"{path}: malformed minimumHEVersion {m['minimumHEVersion']!r}")
+    if m.get("dateReleased"):
+        try:
+            # strptime alone accepts unpadded 2025-6-9
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", m["dateReleased"]):
+                raise ValueError
+            datetime.datetime.strptime(m["dateReleased"], "%Y-%m-%d")
+        except (TypeError, ValueError):
+            errors.append(f"{path}: dateReleased {m['dateReleased']!r} is not YYYY-MM-DD")
+    if not m.get("apps") and not m.get("drivers"):
+        errors.append(f"{path}: no apps or drivers")
+    ids = set()
     for kind in ("apps", "drivers"):
         for entry in m.get(kind, []):
+            for key in sorted(set(entry) - ITEM_KEYS):
+                errors.append(f"{path}: {kind} {entry.get('name')!r}: {key!r} is not an HPM {kind} field")
+            for key in REQUIRED_ITEM_KEYS:
+                if key not in entry:
+                    errors.append(f"{path}: {kind} {entry.get('name')!r}: missing {key}")
+            for key in ("required", "oauth", "primary"):
+                if key in entry and not isinstance(entry[key], bool):
+                    errors.append(f"{path}: {kind} {entry.get('name')!r}: {key} must be true or false")
+            item_id = entry.get("id")
+            if item_id in ids:
+                errors.append(f"{path}: duplicate id {item_id!r}")
+            ids.add(item_id)
+            if item_id and item_id not in LEGACY_IDS and not GUID.fullmatch(item_id):
+                errors.append(f"{path}: {kind} {entry.get('name')!r}: id {item_id!r} is not a lowercase GUID")
             src = local_path(entry.get("location"))
             if src not in tracked:
                 errors.append(f"{path}: {kind} location {entry.get('location')!r} is not a file in this repo")
                 continue
+            # HPM's Match Up finds code already on a hub by name and namespace.
+            for s in (src, local_path(entry.get("betaLocation"))):
+                if s in tracked and source_definition(s) != (entry.get("name"), entry.get("namespace")):
+                    errors.append(f"{s}: definition name/namespace {source_definition(s)} does not match {path} ({entry.get('name')!r}, {entry.get('namespace')!r})")
             found = source_version(src)
             if found is None:
                 if kind == "apps":
@@ -138,6 +213,17 @@ if repo is not None:
         else:
             listed.add(target)
             print(f"OK   repository.json -> {target}")
+        for key in ("name", "description"):
+            if not pkg.get(key):
+                errors.append(f"repository.json: {pkg.get('name')!r} has no {key}")
+        if pkg.get("category") not in CATEGORIES:
+            errors.append(f"repository.json: {pkg.get('name')!r} category {pkg.get('category')!r} is not one of {sorted(CATEGORIES)}")
+        if not isinstance(pkg.get("tags"), list) or not pkg["tags"]:
+            errors.append(f"repository.json: {pkg.get('name')!r} has no tags")
+        else:
+            for tag in pkg["tags"]:
+                if tag not in TAGS:
+                    errors.append(f"repository.json: {pkg.get('name')!r} tag {tag!r} is not an HPM tag")
 
 for path in manifests:
     if path not in listed:
