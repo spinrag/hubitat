@@ -1037,6 +1037,13 @@ app.fakeNow = app.now() + 86_400_001L
 app.request = [JSON: fpCfg + [fingerprintKey: KEY3]]
 fcall('apiSetLockConfig')
 check('fpkey: warned again after a day', app.logged.count { it.toString().contains('approved in the app') } == warnsBefore + 1)
+// The per-key warning record keeps only the newest 20 keys
+List floodKeys = (1..25).collect { i -> ((1..32).collect { (byte) (i * 5 + it) } as byte[]).encodeBase64().toString() }
+floodKeys.eachWithIndex { k, i -> app.fakeNow += 1000; app.request = [JSON: fpCfg + [fingerprintKey: k]]; fcall('apiSetLockConfig') }
+Map warnedNow = app.state.fingerprintKeyWarned
+check('fpkey: warning record capped at the newest 20 keys', warnedNow.size() == 20 &&
+    floodKeys.takeRight(20).every { warnedNow.containsKey(app.fingerprintKeyCheck(it)) } && !floodKeys.take(5).any { warnedNow.containsKey(app.fingerprintKeyCheck(it)) })
+check('fpkey: warning record holds no key', !floodKeys.any { k -> app.state.fingerprintKeyWarned.toString().contains(k) })
 app.fakeNow = savedNow
 app.appButtonHandler('btnRejectFpKey')
 // The held key sent again clears a pending request

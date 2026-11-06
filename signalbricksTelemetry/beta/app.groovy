@@ -102,7 +102,6 @@
 
 import groovy.json.JsonOutput
 import groovy.transform.Field
-import java.security.MessageDigest
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -1886,7 +1885,8 @@ Boolean takeFingerprintKey(String key) {
             warned[check] = now()
             log.warn 'SignalBricks Telemetry: SignalBricks sent a new fingerprint key; it is used only once approved in the app'
         }
-        state.fingerprintKeyWarned = warned
+        // Newest 20 keys only, so a flood of keys can't grow app state
+        state.fingerprintKeyWarned = warned.sort { -(it.value as long) }.take(20)
     }
     return false
 }
@@ -1894,7 +1894,7 @@ Boolean takeFingerprintKey(String key) {
 // Shown with a pending key so the operator can compare it with SignalBricks:
 // first 8 hex characters of SHA-256 of the key's bytes. Never the key itself.
 String fingerprintKeyCheck(String key) {
-    return MessageDigest.getInstance('SHA-256').digest(key.decodeBase64()).encodeHex().toString().take(8)
+    return java.security.MessageDigest.getInstance('SHA-256').digest(key.decodeBase64()).encodeHex().toString().take(8)
 }
 
 Map apiListLocks() {
