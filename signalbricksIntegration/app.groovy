@@ -96,7 +96,7 @@ preferences {
                         String until = sbConnectLinkUntil()
                         href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbReconnectEntryUrl(),
                             description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
-                                'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
+                                'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again (or Connect, if that is what the app shows).')
                         paragraph '<small>The sign-in link works for 10 minutes. Whether you finish it or not, the app then replaces its access token and registers the new one with SignalBricks, so an unused link can\'t be reused. Door codes keep syncing.</small>'
                         input(name: 'btnSbDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                         paragraph '<small>Disconnect tells SignalBricks to delete its copy of the access token, then replaces the token here, so the dispatcher can no longer reach this app.</small>'

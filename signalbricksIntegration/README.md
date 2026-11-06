@@ -156,7 +156,7 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **Connect fails with "connected to SignalBricks in another organization".** An admin in that organization must disconnect the hub (hub page → **Disconnect**) first.
 - **Last connect error: SignalBricks could not verify this hub.** Check the hub's cloud connection and click **Done** to try again, or **Reconnect to SignalBricks**.
 - **Last connect error: Registration failed.** Click **Done** to retry, or **Reconnect to SignalBricks**.
-- **"SignalBricks disconnected this hub".** Click **Connect to SignalBricks** to connect it again.
+- **"SignalBricks no longer accepts this hub's connection".** Click **Connect to SignalBricks** in the app to connect the hub again.
 
 ## Development
 

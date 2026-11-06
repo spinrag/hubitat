@@ -137,7 +137,7 @@ check('page: Reconnect is one link to the app\'s own /reconnect, never to Signal
     link().url == entryUrl() && !page.contains('/oauth/hubitat-integration/authorize') && !app.inputs.btnSbReconnect)
 check('page: says the link works for 10 minutes, an unused link can\'t be reused, and what to do after a Hubitat error',
     page.contains('works for 10 minutes') && page.contains("an unused link can't be reused") && page.contains('Door codes keep syncing') &&
-    link().description.contains('If you see a Hubitat error after signing in, click Reconnect again.'))
+    link().description.contains('If you see a Hubitat error after signing in, click Reconnect again (or Connect, if that is what the app shows).'))
 check('page: the token is only in the Reconnect URL, never in text', !pageText().contains(app.state.accessToken))
 5.times { mainPage() }
 check('page: viewing the page opens no window, schedules nothing and changes no token', app.atomicState.sbConnectLink == null && !expiryJob() && registers().isEmpty() && app.state.accessToken == tokens[0])
