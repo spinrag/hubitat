@@ -454,6 +454,17 @@ check('cancelled rename: relocate dropped as name_not_allowed, slot keeps the ol
 check('cancelled rename: a delete in flight is kept', { push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]]); fresh(); lock.dropDeletes = 99
     deleteCode(22); push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]]); lock.dropDeletes = 0
     boolean kept = app.state.pendingCodeChanges?.containsKey('9:22'); settle(); kept && slotOf(22) == null }())
+// The lock already took the delete when a push names the slot differently.
+check('renamed registration: a delete in flight is kept and confirmed', { putSlot(22, 'Dog Walker', '60600097'); push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: true]])
+    fresh(); deleteCode(22); push(['9': [registered: [[slot: 22, name: 'Dog Walker Three']], fullControl: true]])
+    boolean kept = app.state.pendingCodeChanges?.containsKey('9:22'); settle()
+    kept && slotOf(22) == null && lastResult().result == 'confirmed' && lock.calls == [['deleteCode', 22]] }())
+
+// --- Approval labels flag names caught by either booking rule ---
+push(['9': [adopted: [26, 27, 28, 30, 31, 32, 34, 35]]])
+Map approvalLabels = app.pendingAdoptedOptions()
+check('approval labels: booking codes flagged under both rules', ['9:26', '9:27', '9:30', '9:31', '9:32', '9:34', '9:35'].every { approvalLabels[it]?.endsWith('booking code, always refused') } &&
+    approvalLabels['9:28'] == 'Side: slot 28 (Owner)')
 
 // --- Turning lock management off, or disconnecting, drops the hub switch ---
 app.fullControlLocks = ['9']
