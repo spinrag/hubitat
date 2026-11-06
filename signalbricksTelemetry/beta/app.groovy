@@ -32,6 +32,8 @@
  * SignalBricks can see which slots share a code across locks and hubs. The key
  * is write-only: never returned, never logged, cleared on disable/disconnect.
  * /fingerprints (#17) returns the same for several locks in one call.
+ * Once a key is held, a different one waits for the operator's approval in
+ * the app UI (#19).
  *
  * Each set/delete is verified on the hub (signalbricks/platform#520): the app
  * keeps one pending change per lock and slot, re-reads the slot from
@@ -104,7 +106,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.2'
+@Field static final String APP_VERSION = '1.6.3'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -345,6 +347,13 @@ Map mainPage() {
                     }
                     paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (all code writes are refused until SignalBricks sends them)'}"
                     if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set (code fingerprints for onboarding are unavailable)'}"
+                    Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
+                    if (fpPending) {
+                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}). The current key stays in use until you approve. SignalBricks replaces it only rarely: approve only if your SignalBricks admin expects it. If not, reject it and rotate the access token below."
+                        // The id ties the click to the request shown, so a newer request needs its own approval
+                        input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
+                        input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
+                    }
                     Map changes = pendingCodeChanges()
                     if (changes) {
                         int failed = changes.values().count { it.status == 'failed' }
@@ -524,6 +533,18 @@ void appButtonHandler(String btn) {
         state.remove('lastReportError')
         unschedule('dailyCheckIn')
         atomicState.remove('checkInSecond')
+    } else if (btn.startsWith('btnApproveFpKey_')) {
+        Map p = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
+        if (p && btn == "btnApproveFpKey_${p.id}".toString()) {
+            state.fingerprintKey = p.key
+            state.remove('fingerprintKeyPending')
+            log.info 'SignalBricks Telemetry: new fingerprint key approved in the app'
+        }
+    } else if (btn == 'btnRejectFpKey') {
+        if (state.fingerprintKeyPending != null) {
+            state.remove('fingerprintKeyPending')
+            log.info 'SignalBricks Telemetry: new fingerprint key rejected in the app'
+        }
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         // Any open Reconnect link carried the old token, so it is dead now
@@ -689,13 +710,14 @@ String connectUrl() {
 // Lock code management state a Reconnect keeps (#46), which ties this hub to
 // the organization and hub SignalBricks manages its locks for.
 Boolean holdsLockState() {
-    return state.lockConfig != null || state.fingerprintKey != null || !!approvedAdoptedSlots || !!fullControlLocks
+    return state.lockConfig != null || state.fingerprintKey != null || state.fingerprintKeyPending != null || !!approvedAdoptedSlots || !!fullControlLocks
 }
 
 // Drops that state. Local only, so it can't fail on SignalBricks.
 void wipeLockState() {
     state.remove('lockConfig')
     state.remove('fingerprintKey')
+    state.remove('fingerprintKeyPending')
     app.removeSetting('approvedAdoptedSlots')
     app.removeSetting('fullControlLocks')
 }
@@ -1798,10 +1820,10 @@ Integer maxCodesOf(lock) {
 }
 
 // GET and POST /lockConfig reply. Says whether a fingerprint key is held,
-// never the key itself.
-Map lockConfigReply() {
-    return [config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys(), fingerprintKeySet: state.fingerprintKey != null,
-            features: CONFIG_FEATURES, fullControlAllowed: fullControlAllowedIds()]
+// never the key itself. `keyTaken` false: the POST's key is awaiting approval.
+Map lockConfigReply(Boolean keyTaken = true) {
+    return [config: state.lockConfig ?: null, ceiling: managedCeiling(), pendingApproval: pendingAdoptedKeys(), fingerprintKeySet: keyTaken && state.fingerprintKey != null,
+            fingerprintKeyPending: state.fingerprintKeyPending != null, features: CONFIG_FEATURES, fullControlAllowed: fullControlAllowedIds()]
 }
 
 Map apiGetLockConfig() {
@@ -1829,7 +1851,7 @@ Map apiSetLockConfig() {
     Map result = validateLockConfig(request.JSON)
     if (result.error) return jsonResponse([error: 'invalid_config', message: result.error], 400)
     state.lockConfig = result.config
-    if (fpKey.key) state.fingerprintKey = fpKey.key
+    Boolean keyTaken = takeFingerprintKey(fpKey.key)
     // Approvals only cover adopted slots the current config still lists.
     List stillAdopted = adoptedAboveCeiling()
     List kept = approvedAdoptedKeys().findAll { stillAdopted.contains(it) }
@@ -1838,8 +1860,26 @@ Map apiSetLockConfig() {
         else app.removeSetting('approvedAdoptedSlots')
     }
     dropDisallowedCodeChanges()
-    log.info "SignalBricks Telemetry: lock slot rules updated${fpKey.key ? ' (fingerprint key updated)' : ''}"
-    return jsonResponse(lockConfigReply())
+    log.info "SignalBricks Telemetry: lock slot rules updated${fpKey.key ? (keyTaken ? ' (fingerprint key updated)' : ' (new fingerprint key awaits approval in the app)') : ''}"
+    return jsonResponse(lockConfigReply(keyTaken))
+}
+
+// Fingerprint key from a /lockConfig POST (#19). The first key, or the held
+// one again, is taken; a different key is held aside until the operator
+// approves it in the app UI. Returns whether `key` is now the key in use.
+Boolean takeFingerprintKey(String key) {
+    if (!key) return true
+    if (!state.fingerprintKey || state.fingerprintKey == key) {
+        state.fingerprintKey = key
+        state.remove('fingerprintKeyPending')
+        return true
+    }
+    Map p = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
+    if (p?.key != key) {
+        state.fingerprintKeyPending = [key: key, id: UUID.randomUUID().toString().take(8), at: new Date().format('yyyy-MM-dd HH:mm')]
+        log.warn 'SignalBricks Telemetry: SignalBricks sent a new fingerprint key; it is used only once approved in the app'
+    }
+    return false
 }
 
 Map apiListLocks() {
