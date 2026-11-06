@@ -914,7 +914,7 @@ Map trackedOrb5 = ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 
 r = prefixRun(orb5, trackedOrb5, booking77(guest: 'Orb5'))
 check('#61 N3 reconcile: guest Orb5, id at the end, lower-cased: the tracked slot stays the booking\'s', r.sets.isEmpty() && r.deletes.isEmpty() && assigned('51') != null)
 claimed = app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(['51': [name: 'GT:Orb5-ORB77'], '52': [name: 'GT:ORB5-ORB78']])))
-check('#61 N3 untracked names, id at the end: the id is the one at the end (Orb5, ORB5 guest names)', claimed.keySet() == ['77', '78'] as Set && claimed['77'].key == '51')
+check('#61 N3 untracked names, id at the end: the id is the one at the end (Orb5); ORB5-ORB78 is ambiguous (#64)', claimed.keySet() == ['77'] as Set && claimed['77'].key == '51')
 lock.attrs.lockCodes = JsonOutput.toJson(orb5)
 app.atomicState.codeAssignments = tracked(trackedOrb5['7'])
 lock.setCalls.clear()
@@ -1002,6 +1002,106 @@ prefixRun(['51': [name: 'G:ORB77-Cy', code: '01234567']], ['7': ['51': [bookingI
 check('#61 N2 dedup: an empty lock entry and a deselected lock\'s entry are removed', app.atomicState.codeShortWarned == [:])
 lock.attrs.lockCodes = '{}'
 
+// --- #63: reconcile compares codes as text ---
+Map num51 = ['51': [name: 'G:ORB77-Cy', code: 20000077]]
+mark()
+app.warned.clear()
+r = prefixRun(num51, ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]], booking77())
+r2 = prefixRun(num51, app.atomicState.codeAssignments, booking77())
+check('#63 tracked slot, code reported as a number: no rewrite on either run', r.sets.isEmpty() && r2.sets.isEmpty() && r.deletes.isEmpty() && r2.deletes.isEmpty())
+r = prefixRun(num51, [:], booking77())
+r2 = prefixRun(num51, [:], booking77())
+check('#63 untracked slot found by name, code reported as a number: no rewrite, no second slot', r.sets.isEmpty() && r2.sets.isEmpty())
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '20000077']], [:], booking77(code: 20000077))
+check('#63 booking code a number, lock code text: no rewrite', r.sets.isEmpty())
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: ' 20000077 ']], [:], booking77())
+check('#63 code with surrounding spaces: no rewrite', r.sets.isEmpty())
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: 20000079]], [:], booking77())
+check('#63 a different code (as a number) is still rewritten into its slot', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].code == '20000077')
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: '20000079']], [:], booking77())
+check('#63 a different code (as text) is still rewritten into its slot', r.sets.size() == 1 && r.sets[0].codePosition == 51)
+check('#63 no warning for equal or different codes', app.warned.isEmpty())
+app.atomicState.codeShortWarned = [:]
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: 1234567]], [:], booking77(code: '01234567'))
+r2 = prefixRun(['51': [name: 'G:ORB77-Cy', code: 1234567]], [:], booking77(code: '01234567'))
+check('#63 a code that only lost its leading zero is not accepted: rewritten each run, warned once',
+    r.sets.size() == 1 && r.sets[0].codePosition == 51 && r2.sets.size() == 1 && app.warned == [zeroRecMsg])
+r = prefixRun(['51': [name: 'G:ORB77-Cy', code: 101234567]], [:], booking77(code: '01234567'))
+check('#63 a longer number is another code: rewritten, no leading-zero warn', r.sets.size() == 1 && app.warned.size() == 1)
+check('#63 logs: no code', !newLogs().any { l -> ['20000077', '20000079', '1234567'].any { l.contains(it) } })
+app.atomicState.codeShortWarned = [:]
+lock.attrs.lockCodes = '{}'
+
+// --- #64: ambiguous names (different ORB ids after the prefix and at the end) ---
+Map booking5 = ['5': [id: '5', guest: 'Eve', code: '20000005', lockId: ['7'], checkIn: new Date(now.time - 3600_000), checkOut: new Date(now.time + 3600_000)]]
+[false, true].each { boolean atEnd ->
+    app.idAtEnd = atEnd
+    String s = atEnd ? 'id at end' : 'id at start'
+    check("#64 ${s}: ids read from names".toString(), app.helperCodeNameId('ORB77-ORB5') == null && app.helperCodeNameId('orb77-orb5', true) == null &&
+        app.helperCodeNameId('ORB77-Cy') == '77' && app.helperCodeNameId('Cy-ORB77') == '77' && app.helperCodeNameId('ORB77') == '77' && app.helperCodeNameId('ORB77-ORB77') == '77')
+    check("#64 ${s}: both ids of an ambiguous name".toString(), app.helperCodeNameIds('ORB77-ORB5') == ['77', '5'] && app.helperCodeNameIds('ORB77-Cy') == null && app.helperCodeNameIds('ORB77-orb5') == null && app.helperCodeNameIds('ORB77-orb5', true) == ['77', '5'])
+    claimed = app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(['51': [name: 'G:ORB77-ORB5'], '52': [name: 'G:ORB5-ORB77']])))
+    check("#64 ${s}: untracked ambiguous names are not claimed".toString(), claimed.isEmpty())
+    Map ambCodes = ['51': [name: 'G:ORB77-ORB5', code: '20000077'], '52': [name: 'g:orb5-orb77', code: '20000005']]
+    r = prefixRun(ambCodes, [:], booking77() + booking5)
+    check("#64 ${s}: current bookings get new slots, the ambiguous slots are untouched".toString(),
+        r.deletes.isEmpty() && r.sets.size() == 2 && !r.sets.any { it.codePosition in [51, 52] })
+    r = prefixRun(ambCodes, [:], [:])
+    check("#64 ${s}: after checkout the ambiguous slots are not deleted".toString(), r.deletes.isEmpty())
+    lock.attrs.lockCodes = JsonOutput.toJson(ambCodes)
+    app.atomicState.codeAssignments = [:]
+    app.atomicState.bookings = booking77()
+    mark()
+    List an = app.bookingsView().notes.findAll { it.contains('names two bookings') }
+    app.atomicState.bookings = [:]
+    check("#64 ${s}: Bookings page lists both ambiguous slots with slot, name and ids".toString(), an.size() == 2 &&
+        an[0].contains('slot 51 (G:ORB77-ORB5) names two bookings, ORB77 and ORB5') && an[1].contains('slot 52 (g:orb5-orb77) names two bookings, ORB5 and ORB77'))
+    check("#64 ${s}: page lines carry no code, nothing logged".toString(), !an.any { it.contains('20000077') || it.contains('20000005') } && newLogs().isEmpty())
+}
+// Toggling the setting between runs changes nothing for an ambiguous slot
+Map ambOnly = ['51': [name: 'G:ORB77-ORB5', code: '20000077']]
+app.idAtEnd = false
+r = prefixRun(ambOnly, [:], booking77())
+app.idAtEnd = true
+r2 = prefixRun(ambOnly, app.atomicState.codeAssignments, [:])
+app.idAtEnd = false
+def r3 = prefixRun(ambOnly, app.atomicState.codeAssignments, booking5)
+check('#64 setting toggled between runs: the ambiguous slot is never claimed or deleted',
+    ![r, r2, r3].any { x -> x.deletes.contains(51) || x.sets.any { it.codePosition == 51 } } && r2.deletes.isEmpty())
+// A tracked slot is decided by its tracking, and is not listed
+r = prefixRun(ambOnly, ['7': ['51': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-ORB5', attempt: 1, confirmed: true]]], booking77())
+check('#64 tracked slot with an ambiguous name: stays its booking\'s (no second slot)', r.sets.isEmpty() && r.deletes.isEmpty())
+app.atomicState.bookings = booking77()
+check('#64 tracked slot with an ambiguous name: not listed', !app.bookingsView().notes.any { it.contains('names two bookings') })
+app.atomicState.bookings = [:]
+// A queued write from an older version carries its own name: the current setting decides
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = [:]
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB77-ORB5', free: true])
+check('#64 queued own write G:ORB77-ORB5, id at start: tracked as ORB77', assigned('51')?.bookingId == 'ORB77')
+app.idAtEnd = true
+app.atomicState.codeAssignments = [:]
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000005', codeName: 'G:ORB77-ORB5', free: true])
+check('#64 queued own write G:ORB77-ORB5, id at end: tracked as ORB5', assigned('51')?.bookingId == 'ORB5')
+// Code names never carry ORB<digits> from the guest string
+app.idAtEnd = false
+check('#64 naming: ORB<digits> stripped from the guest string, id at start',
+    app.helperGetCodeName([id: '77', guest: 'ORB5']) == 'G:ORB77' && app.helperGetCodeName([id: '77', guest: 'Cy orb5']) == 'G:ORB77-Cy' &&
+    app.helperGetCodeName([id: '77', guest: 'Orb5-Cy']) == 'G:ORB77-Cy' && app.helperGetCodeName([id: '77', guest: 'Cy ORB5 Lee']) == 'G:ORB77-Cy Lee')
+app.idAtEnd = true
+check('#64 naming: ORB<digits> stripped from the guest string, id at end',
+    app.helperGetCodeName([id: '77', guest: 'ORB5-Cy']) == 'G:Cy-ORB77' && app.helperGetCodeName([id: '77', guest: 'orb5']) == 'G:ORB77')
+check('#64 naming: other guest strings unchanged', app.helperGetCodeName([id: '77', guest: 'Orbison Ann']) == 'G:Orbison Ann-ORB77' && app.helperGetCodeName([id: '77', guest: 'Cy']) == 'G:Cy-ORB77')
+app.idAtEnd = false
+r = prefixRun([:], [:], booking77(guest: 'Cy ORB5'))
+check('#64 reconcile writes the stripped name', r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB77-Cy')
+check('#64 duplicate check: an ambiguous name holding the same PIN (not this booking) is a duplicate',
+    { lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'G:ORB88-ORB5', code: '20000077']]); app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88) }())
+check('#64 duplicate check: an ambiguous name holding this booking\'s id is not',
+    { lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'G:ORB88-ORB77', code: '20000077']]); !app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88) }())
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = [:]
+
 // A skipped lock that a read finds readable again is reconciled shortly after
 reset55()
 app.atomicState.lockCodesUnreadable = ['7']
@@ -1087,7 +1187,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
