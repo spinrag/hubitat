@@ -459,7 +459,7 @@ app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.posts.clear()
 app.registerWithPlatform()
 def reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
-check('register: capabilities [relocate, registered_slots, full_control], version 1.6.5', reg.capabilities == ['relocate', 'registered_slots', 'full_control'] && reg.version == '1.6.5' && reg.lockManagement == true)
+check('register: capabilities [relocate, registered_slots, full_control], version 1.6.6', reg.capabilities == ['relocate', 'registered_slots', 'full_control'] && reg.version == '1.6.6' && reg.lockManagement == true)
 app.posts.clear()
 app.lockManagementEnabled = false
 app.state.lockMgmtRegistered = true
@@ -532,6 +532,17 @@ settle('50500015', [15, 19])
 check('name mismatch: failed target_name_mismatch on the first check, no delete, source kept', results()[-1].d.reason == 'target_name_mismatch' && results()[-1].d.targetConfirmed == false && results()[-1].d.attempts == 1 &&
     !lock.calls.any { it[0] == 'deleteCode' } && slotOf(15) == [name: 'SBM: Busy', code: '50500015'])
 putSlot(19, null, null)
+
+// The lock stores the new name in another case: the move still completes
+fresh()
+lock.storedName = 'sbm: busy'
+relocate(15, [name: 'SBM: Busy', toSlot: 19])
+settle('50500015', [15, 19])
+check('name in another case: move confirmed, source deleted', results()[-1].value == 'confirmed' && results()[-1].d.targetConfirmed == true &&
+    lock.calls.any { it == ['deleteCode', 15] } && slotOf(15) == null && slotOf(19) == [name: 'sbm: busy', code: '50500015'])
+putSlot(19, null, null)
+putSlot(15, 'SBM: Busy', '50500015')
+lock.storedName = null
 
 // Retry on either slot of a move in flight -> 409
 fresh()

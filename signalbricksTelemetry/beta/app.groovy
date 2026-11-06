@@ -106,7 +106,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.5'
+@Field static final String APP_VERSION = '1.6.6'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -116,7 +116,12 @@ import javax.crypto.spec.SecretKeySpec
 // Door-code (PIN) keys, matched exactly on the whole key, case-insensitively
 // (never substrings: errorCode, statusCode, codeNumber, codeName pass through).
 // Same rules as the platform's redactSecrets (signalbricks/platform#387).
-@Field static final Set<String> ALWAYS_SECRET_KEYS = ['pin', 'passcode', 'lockcodes', 'usedpin', 'door_codes', 'doorcodes'] as Set
+@Field static final Set<String> ALWAYS_SECRET_KEYS = [
+    'pin', 'passcode', 'lockcodes', 'usedpin', 'door_codes', 'doorcodes',
+    'authentication_value', 'authenticationvalue', 'pin_code', 'pincode',
+    'door_code', 'doorcode', 'lock_code', 'lockcode', 'access_code', 'accesscode',
+    'entry_code', 'entrycode',
+] as Set
 // `code` is ambiguous (PIN vs an error code), so it is only removed in lock
 // context: lock events, or a per-slot lock-code map {"3":{"name":"Guest","code":"1234"}}.
 @Field static final Set<String> LOCK_CONTEXT_SECRET_KEYS = ['code', 'usedcode'] as Set
@@ -2597,7 +2602,19 @@ Boolean codeChangeApplied(Map p, Map codes) {
     def entry = codes[p.slot.toString()]
     Boolean occupied = entry instanceof Map && entry.code != null && entry.code.toString() != ''
     if (p.action == 'delete') return !occupied
-    return occupied && entry.name?.toString() == p.name?.toString() && sameCode(entry.code, p.code?.toString())
+    return occupied && sameName(entry.name, p) && sameCode(entry.code, p.code?.toString())
+}
+
+// The slot's name against the change's name, ignoring case (some drivers change
+// it), as signalbricksIntegration does. A change that only changes the case
+// compares exactly, or the old name would confirm it.
+Boolean sameName(def actual, Map p) {
+    String a = actual?.toString()
+    String want = p.name?.toString()
+    String before = p.prevName?.toString()
+    if (a == null || want == null) return a == want
+    if (before != null && before != want && before.equalsIgnoreCase(want)) return a == want
+    return a.equalsIgnoreCase(want)
 }
 
 // Scheduled: runs every check that is due, then schedules the next one. A

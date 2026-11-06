@@ -211,7 +211,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) before opening an issue or pull reques
 - **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** and sign in. Lock code management can stay on.
 - **"Reconnect to SignalBricks to enable lock management"**: click **Reconnect to SignalBricks** and sign in; lock code management can stay on. Telemetry keeps working meanwhile.
 - **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
-- **A code change failed**: check the lock is awake and in range of the hub, then retry from SignalBricks. `Code changes awaiting the lock` in the app shows how many are in progress or failed.
+- **A code change failed**: check the lock is awake and in range of the hub, then retry from SignalBricks. `Code changes awaiting the lock` in the app shows how many are in progress or failed. Since 1.6.6, a change also counts as done when the lock shows its name in a different letter case.
 - **A lock's codes are unreadable**: see [Locks with encrypted codes](#locks-with-encrypted-codes).
 - Turn on **debug logging** to see each event as it is sent. Debug logging turns itself off after 30 minutes.
 
