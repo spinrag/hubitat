@@ -191,7 +191,7 @@ check('guard: ORB123-Guest booking', app.isBookingName('ORB123-Guest'))
 check('guard: GT: ORB123-Guest booking', app.isBookingName('GT: ORB123-Guest'))
 check('guard: orb123 not booking', !app.isBookingName('orb123'))
 check('guard: Guest-ORB12345 booking (idAtEnd)', app.isBookingName('Guest-ORB12345'))
-check('guard: Guest -ORB12345 booking (OwnerRez fork idAtEnd)', app.isBookingName('Guest -ORB12345'))
+check('guard: Guest -ORB12345 booking (idAtEnd with a space)', app.isBookingName('Guest -ORB12345'))
 check('guard: Orbit not booking', !app.isBookingName('Orbit'))
 check('guard: Re-Orbit not booking', !app.isBookingName('Re-Orbit'))
 // platform#581: ORB followed by a digit anywhere, whatever comes before it

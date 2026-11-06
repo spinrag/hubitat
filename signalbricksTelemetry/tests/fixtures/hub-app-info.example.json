@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "appId": "412",
-  "name": "OwnerRez Integration",
-  "version": "1.1.4-cto-sb7",
+  "name": "Example Booking App",
+  "version": "2.0.1",
   "minCodePosition": 30,
   "codeNamePrefix": "G: ",
   "manageDoorCodes": true
