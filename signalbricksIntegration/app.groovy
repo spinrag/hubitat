@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.13' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.14' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -240,6 +240,11 @@ Map bookingsView() {
     // claimed or deleted automatically, so the operator checks them
     onLock.each { lockId, l ->
         (l.strays ?: []).each { st ->
+            if (st.ambiguousIds) {
+                v.notes << "<b>${l.name}:</b> slot ${bookingsEsc(st.key)} (${bookingsEsc(st.name)}) names two bookings, ORB${bookingsEsc(st.ambiguousIds[0])} and ORB${bookingsEsc(st.ambiguousIds[1])}, so the app can't tell whose code it is: reconcile neither uses nor removes it. " +
+                    'Check it on the lock\'s device page, and delete it there if it isn\'t needed.'
+                return
+            }
             if (st.trackedKey) {
                 v.notes << "<b>${l.name}:</b> slot ${bookingsEsc(st.key)} (${bookingsEsc(st.name)}) is another copy of ORB${bookingsEsc(st.bookingId)}'s code; the app tracks slot ${bookingsEsc(st.trackedKey)}. " +
                     "Reconcile leaves this copy alone while slot ${bookingsEsc(st.trackedKey)} holds the booking's code, and removes it only once that slot's code is gone after checkout. If the copy isn't needed, delete it on the lock's device page."
@@ -1161,8 +1166,8 @@ void reconcileDoorCodes(Map bookings) {
                     // Create the code (free: the slot must still be empty when the job runs)
                     runIn(++i * 60, 'trySetCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: codePosition, code: booking.code, codeName: codeName, free: true ]])
                 }
-                // Is the booking's code different from the current code 
-                else if (sbCodes[bookingId].code != booking.code) {
+                // Is the booking's code different from the current code (compared as text, #63)
+                else if (helperCodeText(sbCodes[bookingId].code) != helperCodeText(booking.code)) {
                     if (holdWrites) {
                         held++
                         return
@@ -1178,9 +1183,7 @@ void reconcileDoorCodes(Map bookings) {
 
                     // The lock reports the code without its leading zeros: rewriting it may not
                     // help, so say so once while it lasts, not on every run (#61)
-                    String lockCode = "${sbCodes[bookingId].code ?: ''}".trim()
-                    String bookingCode = "${booking.code ?: ''}".trim()
-                    if (lockCode != bookingCode && helperSameCode(lockCode, bookingCode)) {
+                    if (helperSameCode(helperCodeText(sbCodes[bookingId].code), helperCodeText(booking.code))) {
                         shortSlots << "${codePosition}".toString()
                         if (!shortWarned.contains("${codePosition}".toString())) log.warn "reconcileDoorCodes: lock ${lock.id} pos ${codePosition} keeps reporting the code without its leading zeros; rewriting it (the lock may hold the shorter code)"
                     }
@@ -1977,7 +1980,8 @@ Date helperToDate(def value) {
 String helperGetCodeName(Map booking) {
     String prefix = codeNamePrefix ?: ''
     String orbId = 'ORB' + booking.id
-    String guest = booking.guest ?: ''
+    // No ORB<digits> from the guest string (#64)
+    String guest = "${booking.guest ?: ''}".replaceAll(/(?i)[\s-]*ORB\d+[\s-]*/, ' ').trim()
 
     if (!guest) return prefix + orbId
 
@@ -2213,7 +2217,8 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
 // - an exact name of a booking whose tracked slot (trackedKey) wins in reconcile's name pass,
 //   e.g. tracked gt:orb77-cy or an old-prefix GT:ORB77-Cy beside an untracked G:ORB77-Cy:
 //   reconcile leaves it while the tracked slot holds the code, removes it only after that
-//   slot's code is gone, and it isn't an orphan either
+//   slot's code is gone, and it isn't an orphan either;
+// - a name with different ids at both ends, in any case (#64): [key, name, ambiguousIds]
 List helperStrayCodes(Map codes, def lockId, Map claimed) {
     List prefixes = [codeNamePrefix ?: '', previousPrefixInUse()].findAll { it }
     Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
@@ -2232,6 +2237,11 @@ List helperStrayCodes(Map codes, def lockId, Map claimed) {
         }
         String own = prefixes ? prefixes.findAll { name.toUpperCase().startsWith(it.toUpperCase()) }.max { it.length() } : ''
         if (own == null) return
+        List both = helperCodeNameIds(name.substring(own.length()), true)
+        if (both) {
+            strays << [key: "${key}".toString(), name: name, ambiguousIds: both]
+            return
+        }
         String id = helperCodeNameId(name.substring(own.length()), true)
         if (id) strays << [key: "${key}".toString(), name: name, bookingId: id]
     }
@@ -2265,8 +2275,11 @@ boolean helperNameHasId(def name, def id) {
 // <prefix><guest>-ORB<id>. The id where the current naming puts it (start, or end with
 // Booking ID at end) wins over the other end, then any ORB<digits>, so a guest name
 // holding ORB<digits> (Orb5) doesn't decide. Case-sensitive unless ignoreCase.
-String helperCodeNameId(String rest, boolean ignoreCase = false) {
+// Different ids at both ends: null under either setting (#64), unless own (a name this
+// app is writing now, where the setting decides).
+String helperCodeNameId(String rest, boolean ignoreCase = false, boolean own = false) {
     if (!rest) return null
+    if (!own && helperCodeNameIds(rest, ignoreCase)) return null
     String f = ignoreCase ? '(?i)' : ''
     def start = (rest =~ /${f}^\s*ORB(\d+)(?!\d)/)
     def end = (rest =~ /${f}ORB(\d+)\s*$/)
@@ -2277,12 +2290,26 @@ String helperCodeNameId(String rest, boolean ignoreCase = false) {
     return null
 }
 
+// [start id, end id] when a code name (prefix removed) has different ids at both ends, else null (#64)
+List helperCodeNameIds(String rest, boolean ignoreCase = false) {
+    if (!rest) return null
+    String f = ignoreCase ? '(?i)' : ''
+    String start = rest.find(/${f}^\s*ORB(\d+)/) { m, id -> id }
+    String end = rest.find(/${f}ORB(\d+)\s*$/) { m, id -> id }
+    return start && end && start != end ? [start, end] : null
+}
+
+// A code as text for comparing; drivers may report numbers (#63). Never log it
+String helperCodeText(def code) {
+    return code == null ? '' : code.toString().trim()
+}
+
 // The booking id in a code name this app wrote (with the current prefix), or null
 String helperOwnCodeNameId(def codeName) {
     if (!codeName) return null
     String name = codeName.toString()
     String prefix = codeNamePrefix ?: ''
-    return helperCodeNameId(prefix && name.startsWith(prefix) ? name.substring(prefix.length()) : name)
+    return helperCodeNameId(prefix && name.startsWith(prefix) ? name.substring(prefix.length()) : name, false, true)
 }
 
 // What codeChanged data for a slot says about this app's write there (#59). The slot's
