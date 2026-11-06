@@ -93,7 +93,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.15', app.sbAppVersion == '1.4.15')
+check('version is 1.4.16', app.sbAppVersion == '1.4.16')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -192,7 +192,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.15'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.16'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')
@@ -220,6 +220,26 @@ app.apiDeleteBooking()
 check('last sync: delete recorded', bookingsPage().contains('(DELETE /sync/88)') && app.atomicState.lastSync.at == app.clock)
 app.appButtonHandler('btnReset')
 check('Reset State: last sync cleared', app.atomicState.lastSync == null && bookingsPage().contains('not recorded yet'))
+
+// --- Sync API: 409 when another code on the lock holds the booking's PIN (1.4.16) ---
+def syncReply = { Map lockCodes, def code ->
+    back.attrs.lockCodes = JsonOutput.toJson(lockCodes)
+    app.atomicState.bookings = [:]
+    app.params = [bookingId: '40', lockId: '2']
+    app.request = [JSON: [id: '40', guest: 'Jo', code: code, checkIn: now.time - h, checkOut: now.time + h]]
+    app.apiSyncBookingByLock()
+}
+def dupReply = syncReply(['20': [name: 'Front desk', code: 20000040]], '20000040')
+check('409: the same PIN reported as a number', dupReply.status == 409 && dupReply.data.contains('Duplicate code') && !dupReply.data.contains('20000040'))
+check('409: the PIN reported without its leading zero', syncReply(['20': [name: 'Front desk', code: 1234567]], '01234567').status == 409)
+check('409: the booking code sent as a number', syncReply(['20': [name: 'Front desk', code: '20000040']], 20000040).status == 409)
+check('200: a hidden or missing code on the lock', syncReply(['20': [name: 'Front desk', code: '********']], '20000040').status == 200 &&
+    syncReply(['20': [name: 'Front desk']], '20000040').status == 200)
+check('200: the booking\'s own slot, code as a number', syncReply(['20': [name: 'GT:ORB40-Jo', code: 20000040]], '20000040').status == 200)
+check('200: another code', syncReply(['20': [name: 'Front desk', code: 20000041]], '20000040').status == 200)
+check('409 sync: no code in any log line', !app.logged.any { l -> ['20000040', '1234567', '20000041'].any { l.contains(it) } })
+back.attrs.lockCodes = JsonOutput.toJson(backCodes)
+app.atomicState.bookings = [:]
 
 // No bookings, no locks
 app.atomicState.bookings = [:]

@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.15' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.16' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -356,9 +356,9 @@ void appButtonHandler(String btnName) {
             // SignalBricks needs the new token, or the dispatcher can't reach the app (#34)
             if (state.sbCredential) sbRegister()
             break
-        // Manually run the reconcileDoorCodes function
+        // Manually run the reconcileDoorCodes function; also rewrites codes the lock hides
         case 'btnReconcile':
-            reconcileDoorCodes()
+            reconcileDoorCodes(helperGetBookings(atomicState.bookings), true)
             break
         // Read door codes from the chosen lock, or all locks one at a time
         case 'btnRefreshCodes':
@@ -600,6 +600,8 @@ void scheduleEvents(Map bookings) {
     // ...and a pending SignalBricks registration retry (#34), and an open Reconnect link's expiry (#46)
     sbRegisterRetryRearm()
     sbConnectLinkRearm()
+    // ...and the retries of code writes the locks haven't confirmed
+    verifySetCodeRearm()
 
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
@@ -1025,7 +1027,9 @@ void reconcileDoorCodes() {
     reconcileDoorCodes(bookings)
 }
 
-void reconcileDoorCodes(Map bookings) {
+// rewriteUnknown: the operator asked (Reconcile Door Codes), so slots whose code the lock
+// hides or doesn't report are rewritten too
+void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
     log.debug 'reconcileDoorCodes'
 
     // We only care about bookings that should be active right now
@@ -1168,6 +1172,13 @@ void reconcileDoorCodes(Map bookings) {
                 }
                 // Is the booking's code different from the current code (compared as text, #63)
                 else if (helperCodeText(sbCodes[bookingId].code) != helperCodeText(booking.code)) {
+                    // The lock hides the code (********) or reports none: unknown, the name matches.
+                    // Rewritten only when this slot has no confirmed record of the booking's current
+                    // code (untracked, unconfirmed, or its code changed), or when the operator asks
+                    if (!rewriteUnknown && !helperCodeKnown(sbCodes[bookingId].code)) {
+                        Map a = lockAssignments["${sbCodes[bookingId].key}"]
+                        if (a && !a.deleting && a.confirmed != false && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && helperCodeText(a.code) == helperCodeText(booking.code)) return
+                    }
                     if (holdWrites) {
                         held++
                         return
@@ -1259,7 +1270,7 @@ void trySetCode(Map data) {
     Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
     boolean stale
     if (data.attempt != null) {
-        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}"
+        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}" || !helperRetryWanted(data, tracked)
     } else {
         Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
         def lockCode = codes == null ? null : (codes[data.codePosition] ?: codes["${data.codePosition}"])
@@ -1347,8 +1358,73 @@ void verifySetCode(Map data) {
         return
     }
 
+    // A newer send of this slot has its own verify: only the latest one retries
+    if (data.attempt != null && a.attempt != null && "${a.attempt}" != "${data.attempt}") {
+        log.debug "verifySetCode: lock ${data.lockId} pos ${data.codePosition} sent again since, this retry stops"
+        return
+    }
+
+    if (!helperRetryWanted(data, a)) return
+
     log.warn "verifySetCode: not confirmed for lock ${data.lockId} pos ${data.codePosition} after attempt ${a.attempt} — retrying"
     trySetCode(data)
+}
+
+// Whether a retry of an unconfirmed write is still wanted. No, and the retry stops, when the
+// lock is no longer selected or the slot's booking is no longer current on it. On a readable
+// lock, what it reports in the slot decides like a codeChanged event (#59): the code written
+// (not masked) confirms the write; another name or booking drops the tracking (foreign), and
+// reconcile puts the booking in a free slot. Never log the code or the name
+boolean helperRetryWanted(Map data, Map a) {
+    String lockKey = "${data.lockId}"
+    String pos = "${data.codePosition}"
+    def lock = locks.find { "${it.id}" == lockKey }
+    String bid = "${a.bookingId ?: ''}".find(/\d+/)
+    Map current = helperFindCurrentBookings(helperGetBookings(atomicState.bookings ?: [:]))
+    if (!lock || !bid || !current.values().any { b -> "${b.id}" == bid && b.lockId.any { "${it}" == lockKey } }) {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos}: ${a.bookingId} is no longer current on this lock, retry stopped"
+        return false
+    }
+
+    Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+    def lockCode = codes ? (codes[pos] ?: codes[data.codePosition]) : null
+    if (!(lockCode instanceof Map)) return true
+    Map slot = [(pos): lockCode]
+    String v = helperEventVerdict(slot, pos, a)
+    boolean confirm = v == 'match' && helperEventCode(slot, pos) != null
+    if (!confirm && v != 'foreign') return true
+
+    Map assignments = atomicState.codeAssignments ?: [:]
+    Map lockAssignments = assignments[lockKey] ?: [:]
+    if (confirm) {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos} reports the code written for ${a.bookingId}: confirmed"
+        a.confirmed = true
+        a.remove('mismatches')
+        lockAssignments[pos] = a
+    } else {
+        log.info "helperRetryWanted: lock ${lockKey} pos ${pos} holds another code than ${a.bookingId}; tracking dropped, reconcile in 10 s"
+        lockAssignments.remove(pos)
+        Map displaced = atomicState.codeDisplaced ?: [:]
+        atomicState.codeDisplaced = displaced + [(lockKey): ((displaced[lockKey] ?: []) + [bid]).unique()]
+        runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+    }
+    assignments[lockKey] = lockAssignments
+    atomicState.codeAssignments = assignments
+    return false
+}
+
+// An app-wide unschedule() removed the verifySetCode timers: put one back for each tracked
+// write the lock hasn't confirmed, so it keeps being re-sent
+void verifySetCodeRearm() {
+    (atomicState.codeAssignments ?: [:]).each { lockId, lockAssignments ->
+        if (!(lockAssignments instanceof Map)) return
+        lockAssignments.each { pos, a ->
+            if (!(a instanceof Map) || !helperPendingSet(a) || !"${pos}".isInteger()) return
+            int attempt = (a.attempt ?: 0) as int
+            runIn(Math.min(60 + (attempt * 30), sbMaxRetryDelaySec), 'verifySetCode', [ overwrite: false, data: [
+                lockId: lockId, codePosition: "${pos}".toInteger(), code: a.code, codeName: a.codeName, attempt: attempt ]])
+        }
+    }
 }
 
 void tryDeleteCode(Map data) {
@@ -1636,6 +1712,7 @@ Map apiUnregister() {
         sbRegisterRetryRearm()
         sbConnectLinkRearm()
         sbScheduleAppInfo()
+        verifySetCodeRearm()
 
         return sbHttpResponseJson(null)
     } catch (Exception ex) {
@@ -2075,9 +2152,13 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
     }
 
     String codeName = helperGetCodeName(booking)
+    String pin = helperCodeText(booking.code)
 
+    // Compared as text, a reported code without its leading zeros counts; a hidden or
+    // missing code is "can't tell", like an unreadable lock
     return lockCodes.any { k, existing ->
-        if (existing.name == codeName || existing.code != booking.code) {
+        String reported = helperCodeText(existing.code)
+        if (existing.name == codeName || !helperCodeKnown(reported) || !helperSameCode(reported, pin)) {
             return false
         }
 
@@ -2304,6 +2385,11 @@ String helperCodeText(def code) {
     return code == null ? '' : code.toString().trim()
 }
 
+// A reported code that can be compared: digits only, not hidden (********) or missing
+boolean helperCodeKnown(def code) {
+    return helperCodeText(code) ==~ /\d+/
+}
+
 // The booking id in a code name this app wrote (with the current prefix), or null
 String helperOwnCodeNameId(def codeName) {
     if (!codeName) return null
@@ -2354,7 +2440,7 @@ String helperEventCode(Map data, String pos) {
 // confirm, never to claim a slot, so a wrong match costs a missed re-send at most
 boolean helperSameCode(String reported, String written) {
     if (reported == written) return true
-    return written.startsWith('0') && reported.length() < written.length() && written.replaceFirst(/^0+/, '') == reported
+    return written.startsWith('0') && reported.length() < written.length() && (written.replaceFirst(/^0+/, '') ?: '0') == reported
 }
 
 // Mismatching confirmations of this app's own name in a row before a warning
