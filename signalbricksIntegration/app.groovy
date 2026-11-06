@@ -3,7 +3,7 @@
 // i.e. "getFunctionName" can be referenced as "functionName"
 String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
 String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.14' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.15' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -96,7 +96,7 @@ preferences {
                         String until = sbConnectLinkUntil()
                         href(name: 'hrefSbReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: sbReconnectEntryUrl(),
                             description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
-                                'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
+                                'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again (or Connect, if that is what the app shows).')
                         paragraph '<small>The sign-in link works for 10 minutes. Whether you finish it or not, the app then replaces its access token and registers the new one with SignalBricks, so an unused link can\'t be reused. Door codes keep syncing.</small>'
                         input(name: 'btnSbDisconnect', type: 'button', title: 'Disconnect from SignalBricks')
                         paragraph '<small>Disconnect tells SignalBricks to delete its copy of the access token, then replaces the token here, so the dispatcher can no longer reach this app.</small>'
@@ -2632,7 +2632,13 @@ void sbRegister(boolean retry = false) {
         unschedule('sbRegisterRetryRun')
     }
     state.sbRegisterAttemptAt = now()
-    asynchttpPost('sbRegisterCallback', sbRegisterParams())
+    asynchttpPost('sbRegisterCallback', sbRegisterParams(), [cred: sbCredentialTag()])
+}
+
+// Identifies the credential a registration was sent with, without carrying it (#48)
+String sbCredentialTag() {
+    if (!state.sbCredential) return null
+    return java.security.MessageDigest.getInstance('SHA-256').digest(state.sbCredential.toString().getBytes('UTF-8')).encodeHex().toString().take(16)
 }
 
 // Automatic retries of a registration that failed for a reason that may pass (not verified
@@ -2702,6 +2708,12 @@ String sbRegisterRetryStatus() {
 }
 
 void sbRegisterCallback(resp, Map data) {
+    // An answer for a credential replaced or dropped since it was sent says nothing about
+    // the current one (#48). Answers without a tag (sent by an earlier version) count.
+    if (data?.cred != null && data.cred != sbCredentialTag()) {
+        log.debug "${sbAppNameAndVersion}: ignored a registration answer (HTTP ${resp?.status}) for an earlier connection"
+        return
+    }
     Map body = [:]
     try {
         if (resp.status == 200) body = parseJson(resp.data ?: '{}') ?: [:]
@@ -2728,11 +2740,14 @@ void sbRegistered(Integer status, Map body, String failure = null) {
         state.sbRegisteredVersion = sbAppVersion
         state.remove('sbLastError')
     } else if (status == 401) {
-        // SignalBricks no longer knows this credential (disconnected on the portal, or not
-        // registered within 10 minutes of connecting)
+        // SignalBricks no longer knows this credential (disconnected on the portal, not
+        // registered within 10 minutes of connecting, or a sign-in whose answer was lost).
+        // Replace the access token too (#48): SignalBricks may still hold the current one.
         sbForgetConnection()
-        state.sbLastError = 'SignalBricks disconnected this hub; click Connect to SignalBricks to connect again'
-        log.warn "${sbAppNameAndVersion}: SignalBricks no longer recognises this hub's connection"
+        sbConnectLinkClear()
+        state.accessToken = createAccessToken()
+        state.sbLastError = 'SignalBricks no longer accepts this hub\'s connection; click Connect to SignalBricks to connect again'
+        log.warn "${sbAppNameAndVersion}: SignalBricks no longer recognises this hub's connection; access token replaced"
     } else if (status == 403) {
         state.sbLastError = 'SignalBricks could not verify this hub through Hubitat cloud (is the hub online with cloud access?)'
         log.warn "${sbAppNameAndVersion}: SignalBricks registration failed (hub not verified)"

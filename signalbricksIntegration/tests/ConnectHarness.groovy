@@ -104,7 +104,7 @@ def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.14', app.sbAppVersion == '1.4.14')
+check('version is 1.4.15', app.sbAppVersion == '1.4.15')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -139,7 +139,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.14' && q.location == 'Example Org')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.15' && q.location == 'Example Org')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -162,12 +162,12 @@ secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.14', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.15', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Example Org', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Example Org' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.14')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Example Org' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.15')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Example Org &rarr; Main') && oneStatus(page))
@@ -303,11 +303,15 @@ secrets << app.state.accessToken
 // --- Portal-side disconnect: the next registration gets 401 ---
 app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
+String before401 = app.state.accessToken
 app.sbRegistered(401, [:])
 page = mainPage()
 int statusAt = app.paragraphs.findIndexOf { it.startsWith('<b>Status:</b>') }
 check('401: connection forgotten, page explains under the one Status line', !app.state.sbCredential && oneStatus(page) &&
-    app.paragraphs[statusAt + 1].startsWith('<b>Last connect error:</b> SignalBricks disconnected this hub'))
+    app.paragraphs[statusAt + 1].startsWith("<b>Last connect error:</b> SignalBricks no longer accepts this hub's connection"))
+check('401: access token replaced (#48), the Connect link carries only the new one', app.state.accessToken != before401 &&
+    app.hrefs.find { it.name == 'hrefSbConnect' }?.url?.contains(URLEncoder.encode("access_token=${app.state.accessToken}", 'UTF-8')) && !page.contains(before401))
+secrets << app.state.accessToken
 app.state.sbCredential = CREDENTIAL
 app.sbRegisterCallback([status: 403, data: '{"error":"unverified"}'], null)
 check('403: could not verify through Hubitat cloud, credential kept for a retry', app.state.sbCredential && mainPage().contains('could not verify this hub'))
@@ -397,7 +401,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.14'
+app.state.sbRegisteredVersion = '1.4.15'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -409,7 +413,7 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Example Org', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.14' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.15' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text

@@ -142,6 +142,8 @@ You don't need to open the app and click **Done** after an update; the existing 
 
 **After updating to 1.4.13 or 1.4.14:** open the **Bookings** page and, on the lock's device page, delete by hand any codes it lists as copies of a booking's code and any slot it says *names two bookings*.
 
+**After updating to 1.4.15:** when SignalBricks no longer accepts the hub's connection, the app replaces its access token and shows **Connect to SignalBricks** again.
+
 ## Troubleshooting
 
 - **No codes are generated for a booking.** Check the log for `no free code position`: the lock has no empty slot between **Minimum Code Position** and its `maxCodes`. Lower the minimum or free slots, and check that the lock is selected in the app.
@@ -154,7 +156,7 @@ You don't need to open the app and click **Done** after an update; the existing 
 - **Connect fails with "connected to SignalBricks in another organization".** An admin in that organization must disconnect the hub (hub page → **Disconnect**) first.
 - **Last connect error: SignalBricks could not verify this hub.** Check the hub's cloud connection and click **Done** to try again, or **Reconnect to SignalBricks**.
 - **Last connect error: Registration failed.** Click **Done** to retry, or **Reconnect to SignalBricks**.
-- **"SignalBricks disconnected this hub".** Click **Connect to SignalBricks** to connect it again.
+- **"SignalBricks no longer accepts this hub's connection".** Click **Connect to SignalBricks** in the app to connect the hub again.
 
 ## Development
 

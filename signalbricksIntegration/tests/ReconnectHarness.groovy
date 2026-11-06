@@ -7,7 +7,8 @@
 // app-wide unschedule(), a lost timer, registration failure -> quick then 30-minute
 // retries on the app page,
 // that bookings, slot assignments, pending code writes and settings survive, and that
-// no token is logged or rendered outside the open link.
+// no token is logged or rendered outside the open link. #48: a Reconnect whose token
+// answer is lost, a 401 replacing the token, and answers for an earlier credential.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -72,10 +73,11 @@ abstract class HubitatStub extends Script {
     void httpPost(Map p, Closure c) {
         http << p
         def reply = replies.find { k, v -> p.uri.endsWith(k) }?.value
+        if (reply == 'lost') throw new java.net.SocketTimeoutException('Read timed out')
         if (reply instanceof Integer && reply != 200) throw new FakeHttpError(reply)
         c([status: 200, data: reply instanceof Map ? reply : [:]])
     }
-    void asynchttpPost(String callback, Map p, Map data = null) { http << p + [async: callback] }
+    void asynchttpPost(String callback, Map p, Map data = null) { http << p + [async: callback, data: data] }
     void httpPostJson(Map p, Closure c) { throw new IllegalStateException('no network in the harness') }
     def propertyMissing(String name) {
         if (name.endsWith('Handler')) return name
@@ -108,7 +110,7 @@ def CREDENTIAL_2 = CREDENTIAL.replace('00', '22')
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.4.14', app.sbAppVersion == '1.4.14')
+check('version is 1.4.15', app.sbAppVersion == '1.4.15')
 
 // --- A connected hub with bookings, slot assignments and a pending code write ---
 app.settings = [locks: ['1'] as String[], codeNamePrefix: 'GT:', minCodePosition: 50]
@@ -117,7 +119,7 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.state.sbOrgName = 'Test Org'
 app.state.sbHubName = 'Main'
-app.state.sbRegisteredVersion = '1.4.14'
+app.state.sbRegisteredVersion = '1.4.15'
 app.atomicState.bookings = ['101': [id: 101, guest: 'Fake Guest', code: '9876', lockId: '1', checkIn: '2030-01-01T16:00:00Z', checkOut: '2030-01-03T11:00:00Z']]
 app.atomicState.codeAssignments = ['1': ['101': 51]]
 app.atomicState.lastSync = [at: app.clock, source: 'PUT /sync']
@@ -135,7 +137,7 @@ check('page: Reconnect is one link to the app\'s own /reconnect, never to Signal
     link().url == entryUrl() && !page.contains('/oauth/hubitat-integration/authorize') && !app.inputs.btnSbReconnect)
 check('page: says the link works for 10 minutes, an unused link can\'t be reused, and what to do after a Hubitat error',
     page.contains('works for 10 minutes') && page.contains("an unused link can't be reused") && page.contains('Door codes keep syncing') &&
-    link().description.contains('If you see a Hubitat error after signing in, click Reconnect again.'))
+    link().description.contains('If you see a Hubitat error after signing in, click Reconnect again (or Connect, if that is what the app shows).'))
 check('page: the token is only in the Reconnect URL, never in text', !pageText().contains(app.state.accessToken))
 5.times { mainPage() }
 check('page: viewing the page opens no window, schedules nothing and changes no token', app.atomicState.sbConnectLink == null && !expiryJob() && registers().isEmpty() && app.state.accessToken == tokens[0])
@@ -330,9 +332,102 @@ app.appButtonHandler('btbAccessToken')
 track()
 check('refresh access token: link closed, no expiry left', app.atomicState.sbConnectLink == null && !expiryJob())
 
+// --- #48: a Reconnect whose token answer is lost ---
+def CREDENTIAL_3 = CREDENTIAL.replace('00', '33')
+def answer = { int status, Map reg -> app.sbRegisterCallback([status: status, data: status == 200 ? '{}' : null], reg.data) }
+def connectLink = { mainPage(); app.hrefs.find { it.name == 'hrefSbConnect' } }
+app.state.sbCredential = CREDENTIAL_2
+app.state.sbConnected = true
+app.apiReconnect()
+String linked = app.state.accessToken
+app.http.clear()
+app.replies['/oauth/hubitat-integration/token'] = 'lost'
+app.params = [code: 'fake-auth-code-lost']
+result = app.oauthCallback()
+String tLost = track()
+check('lost answer: Connection failed page, token replaced, link closed', result.data.contains('Connection failed') && tLost != linked && app.atomicState.sbConnectLink == null && !expiryJob())
+check('lost answer: the new token is registered with the credential held before, tagged without the credential', registers().size() == 1 &&
+    registers()[0].headers.Authorization == "Bearer ${CREDENTIAL_2}".toString() && body(registers()[0]).appAccessToken == tLost &&
+    registers()[0].data?.cred instanceof String && registers()[0].data.cred.size() == 16 && !CREDENTIAL_2.contains(registers()[0].data.cred))
+// SignalBricks had already replaced the credential: 401
+def lostReg = registers()[0]
+app.http.clear()
+answer(401, lostReg)
+String t401 = track()
+check('lost answer + 401: connection forgotten, no retry, no verifier', !app.state.sbCredential && !app.state.sbConnected && !app.atomicState.sbRegisterRetry &&
+    !app.scheduled.any { it.handler == 'sbRegisterRetryRun' } && !app.state.sbPkceVerifier)
+page = mainPage()
+check('lost answer + 401: access token replaced again, nothing re-registered', t401 != tLost && t401 != linked && app.http.isEmpty())
+check('lost answer + 401: the page offers Connect with an explanation', connectLink() != null && !link() && page.contains("SignalBricks no longer accepts this hub's connection"))
+String linkToken = URLDecoder.decode((connectLink().url =~ /[?&]state=([^&]+)/)[0][1], 'UTF-8').replaceFirst(/^.*access_token=/, '')
+check('lost answer + 401: the Connect link carries only the newest token', linkToken == t401 && !tokens[0..-2].contains(linkToken) &&
+    !(mainPage() =~ /${tLost}(?!\d)/) && !(mainPage() =~ /${linked}(?!\d)/))
+check('lost answer + 401: logged without a token', app.logged.any { it.contains('no longer recognises this hub\'s connection; access token replaced') })
+
+// The token request never reached SignalBricks: the held credential still works
+app.state.sbCredential = CREDENTIAL_2
+app.apiReconnect()
+app.http.clear()
+app.state.sbPkceVerifier = 'a' * 96
+app.params = [code: 'fake-auth-code-lost-2']
+app.oauthCallback()
+String tKept = track()
+answer(200, registers()[0])
+check('lost request: registered with the held credential and connected, token not replaced again', app.state.sbCredential == CREDENTIAL_2 && app.state.sbConnected == true && app.state.accessToken == tKept)
+
+// A 401 while a Reconnect window is open: the window closes with the token
+app.apiReconnect()
+app.http.clear()
+app.sbRegister()
+answer(401, registers()[0])
+String tWin = track()
+check('401 with a window open: window closed, expiry cancelled, token replaced', tWin != tKept && app.atomicState.sbConnectLink == null && !expiryJob())
+
+// A 401 to an unattended 30-minute retry: replaced too, retries stop
+app.state.sbCredential = CREDENTIAL_2
+app.http.clear()
+app.sbRegister()
+answer(503, registers()[0])
+[120, 300].each { app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }; app.sbRegisterRetryRun(); answer(503, registers()[-1]) }
+app.scheduled.removeAll { it.handler == 'sbRegisterRetryRun' }
+app.sbRegisterRetryRun()
+answer(401, registers()[-1])
+String tRetry = track()
+check('401 to a slow retry: forgotten, token replaced, no retry left', tRetry != tWin && !app.state.sbCredential && !app.atomicState.sbRegisterRetry && !app.scheduled.any { it.handler == 'sbRegisterRetryRun' })
+
+// --- #48: answers for an earlier credential change nothing ---
+app.state.sbCredential = CREDENTIAL_2
+app.state.sbConnected = true
+app.http.clear()
+app.sbRegister()
+def oldReg = registers()[0]
+app.apiReconnect()
+app.replies['/oauth/hubitat-integration/token'] = [access_token: CREDENTIAL_3, organization_name: 'Test Org', hub_name: 'Main']
+app.state.sbPkceVerifier = 'b' * 96
+app.params = [code: 'fake-auth-code-3']
+app.oauthCallback()
+String tNew = track()
+def newReg = registers()[-1]
+check('stale: the new registration has its own tag', newReg.headers.Authorization == "Bearer ${CREDENTIAL_3}".toString() && newReg.data.cred != oldReg.data.cred)
+answer(200, newReg)
+answer(401, oldReg)
+check('stale: a 401 for the earlier credential keeps the new connection and token', app.state.sbCredential == CREDENTIAL_3 && app.state.sbConnected == true && app.state.accessToken == tNew && !app.state.sbLastError)
+app.state.sbConnected = false
+answer(200, oldReg)
+check('stale: a 200 for the earlier credential does not mark the new one connected', app.state.sbConnected == false)
+answer(403, oldReg)
+check('stale: a retryable answer for the earlier credential schedules no retry', !app.atomicState.sbRegisterRetry && !app.scheduled.any { it.handler == 'sbRegisterRetryRun' })
+app.sbForgetConnection()
+answer(401, newReg)
+check('stale: an answer after a disconnect changes no token', app.state.accessToken == tNew && !app.state.sbCredential)
+// An answer without a tag (sent before the update) is still handled
+app.state.sbCredential = CREDENTIAL_3
+app.sbRegisterCallback([status: 200, data: '{}'], null)
+check('untagged answer: handled as before', app.state.sbConnected == true)
+
 // --- Never a token in the logs ---
 String logs = app.logged.join('\n')
-check('logs: no access token, credential or code', !tokens.any { it && logs.contains(it) } && !logs.contains(CREDENTIAL) && !logs.contains(CREDENTIAL_2) && !logs.contains('fake-auth-code') && !logs.contains('9876'))
+check('logs: no access token, credential or code', !tokens.any { it && logs.contains(it) } && !logs.contains(CREDENTIAL) && !logs.contains(CREDENTIAL_2) && !logs.contains(CREDENTIAL_3) && !logs.contains('fake-auth-code') && !logs.contains('9876'))
 check('logs: the link was logged as opened, without a token', app.logged.any { it.contains('Reconnect link opened for 10 minutes') })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
