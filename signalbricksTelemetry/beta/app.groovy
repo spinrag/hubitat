@@ -35,6 +35,9 @@
  * Once a key is held, a different one waits for the operator's approval in
  * the app UI (#19).
  *
+ * Code in use (#77): POST /locks/:id/codeInUse answers only whether the lock
+ * holds a code with the given fingerprint.
+ *
  * Each set/delete is verified on the hub (signalbricks/platform#520): the app
  * keeps one pending change per lock and slot, re-reads the slot from
  * lockCodes, re-sends the command up to 3 times and reports the outcome as a
@@ -106,7 +109,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.6.6'
+@Field static final String APP_VERSION = '1.7.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -145,6 +148,10 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int FINGERPRINT_BATCH_MAX_IDS = 100
 @Field static final int FINGERPRINT_HEX_LENGTH = 16
 @Field static final int FINGERPRINT_KEY_BYTES = 32
+// Code in use (#77)
+@Field static final int CODE_IN_USE_LIMIT_PER_MIN = 20
+@Field static final int CODE_IN_USE_LOCK_LIMIT_PER_MIN = 10
+@Field static final int CODE_IN_USE_LOCK_LIMIT_PER_DAY = 100
 @Field static final String ADMIN_NAME_PREFIX = 'SBA:'
 @Field static final String MANAGED_NAME_PREFIX = 'SBM:'
 // Hubs connected before signalbricks/platform#505 hold an ingestion token that
@@ -191,7 +198,7 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int WRITE_LIMIT_PER_MIN = 30
 @Field static final int MAX_PENDING_CODE_CHANGES = 100
 // Sent at registration so SignalBricks only offers what this version supports.
-@Field static final List<String> CAPABILITIES = ['relocate', 'registered_slots', 'full_control']
+@Field static final List<String> CAPABILITIES = ['relocate', 'registered_slots', 'full_control', 'code_in_use']
 // The /lockConfig fields this version reads (signalbricks/platform#684), returned
 // with every config reply so SignalBricks can tell it isn't talking to an older app.
 @Field static final List<String> CONFIG_FEATURES = ['registered_slots', 'full_control']
@@ -243,6 +250,9 @@ mappings {
     }
     path('/fingerprints') {
         action: [GET: 'apiListFingerprintsBatch']
+    }
+    path('/locks/:lockId/codeInUse') {
+        action: [POST: 'apiCodeInUse']
     }
     path('/locks/:lockId/codes') {
         action: [POST: 'apiSetCode']
@@ -452,6 +462,9 @@ Boolean syncLockManagementEnabled() {
     state.remove('writeTimes')
     state.remove('fingerprintTimes')
     state.remove('fingerprintBatchTimes')
+    state.remove('codeInUseTimes')
+    state.remove('codeInUseLockTimes')
+    state.remove('codeInUseLockDaily')
     createAccessToken()
     try {
         registerWithPlatform(false)
@@ -2046,6 +2059,43 @@ Map apiListFingerprintsBatch() {
     return jsonResponse([locks: out])
 }
 
+// Body {fingerprint, keyCheck?}: codeFingerprint of a candidate code, and
+// optionally fingerprintKeyCheck of the key it was made with. Answers whether
+// any occupied slot on the lock holds it, and nothing else. Never log the
+// fingerprint.
+Map apiCodeInUse() {
+    if (!lockManagementActive()) return notEnabled()
+    if (rateLimited('codeInUseTimes', CODE_IN_USE_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    def lock = findCodeLock(params.lockId)
+    if (!lock) return jsonResponse([error: 'lock_not_found'], 404)
+    String lockId = lock.id.toString()
+    if (lockRateLimited('codeInUseLockTimes', lockId, CODE_IN_USE_LOCK_LIMIT_PER_MIN)) return jsonResponse([error: 'rate_limited'], 429)
+    if (lockDailyLimited('codeInUseLockDaily', lockId, CODE_IN_USE_LOCK_LIMIT_PER_DAY)) return jsonResponse([error: 'rate_limited'], 429)
+    def body = request.JSON
+    def raw = body instanceof Map ? body.fingerprint : null
+    String fp = raw instanceof String ? raw : null
+    if (!(fp ==~ /[0-9a-fA-F]{${FINGERPRINT_HEX_LENGTH}}/)) return jsonResponse([error: 'invalid_fingerprint', message: "fingerprint must be ${FINGERPRINT_HEX_LENGTH} hex characters"], 400)
+    def rawCheck = body instanceof Map ? body.keyCheck : null
+    if (rawCheck != null && !(rawCheck instanceof String && rawCheck ==~ /[0-9a-fA-F]{8}/)) return jsonResponse([error: 'invalid_key_check', message: 'keyCheck must be 8 hex characters'], 400)
+    if (!state.fingerprintKey) return jsonResponse([error: 'fingerprint_key_missing', message: 'SignalBricks has not sent a fingerprint key'], 409)
+    if (state.fingerprintKeyPending != null) return jsonResponse([error: 'fingerprint_key_pending', message: 'a new fingerprint key awaits approval in the app'], 409)
+    if (rawCheck != null && rawCheck.toLowerCase() != fingerprintKeyCheck(state.fingerprintKey.toString())) {
+        return jsonResponse([error: 'fingerprint_key_mismatch', message: 'the hub holds a different fingerprint key'], 409)
+    }
+    Map codes = readLockCodes(lock)
+    if (codes == null) return jsonResponse([error: 'lock_codes_unreadable', message: 'lockCodes could not be read or decrypted'], 409)
+    byte[] key = state.fingerprintKey.toString().decodeBase64()
+    byte[] want = fp.toLowerCase().getBytes('UTF-8')
+    Boolean inUse = false
+    codes.each { k, v ->
+        if (!(k.toString() ==~ /\d{1,4}/) || !(v instanceof Map)) return
+        String code = v.code?.toString()
+        if (code && java.security.MessageDigest.isEqual(codeFingerprint(key, code).getBytes('UTF-8'), want)) inUse = true
+    }
+    log.info "SignalBricks Telemetry: code-in-use check on ${lock.displayName}"
+    return jsonResponse([lockId: lockId, inUse: inUse])
+}
+
 // A refusal: [response, error]. `error` doubles as the result event's reason.
 Map refuse(String error, int status, String message = null) {
     Map body = [error: error]
@@ -2192,6 +2242,36 @@ Boolean rateLimited(String key, int limit) {
     Boolean limited = recent.size() >= limit
     if (!limited) recent << nowMs
     state[key] = recent
+    return limited
+}
+
+// At most `limit` calls a minute per lock, counted in state[key][lockId].
+Boolean lockRateLimited(String key, String lockId, int limit) {
+    long nowMs = now()
+    Map all = [:]
+    (state[key] ?: [:]).each { k, v ->
+        List recent = (v ?: []).findAll { (nowMs - (it as long)) < 60000L }
+        if (recent) all[k.toString()] = recent
+    }
+    List recent = all[lockId] ?: []
+    Boolean limited = recent.size() >= limit
+    if (!limited) all[lockId] = recent + [nowMs]
+    state[key] = all
+    return limited
+}
+
+// At most `limit` calls per lock in a window that starts with the first call
+// and lasts a day, counted in state[key][lockId] as [start, count].
+Boolean lockDailyLimited(String key, String lockId, int limit) {
+    long nowMs = now()
+    Map all = [:]
+    (state[key] ?: [:]).each { k, v ->
+        if (v instanceof Map && (nowMs - (v.start as long)) < 86400000L) all[k.toString()] = [start: v.start as long, count: v.count as int]
+    }
+    Map w = all[lockId] ?: [start: nowMs, count: 0]
+    Boolean limited = w.count >= limit
+    if (!limited) all[lockId] = [start: w.start, count: w.count + 1]
+    state[key] = all
     return limited
 }
 
