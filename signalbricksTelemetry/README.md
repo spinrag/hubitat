@@ -14,6 +14,7 @@ Highlights by version:
 - **1.4.0** SignalBricks can rename or move a code on the hub without ever having the code.
 - **1.5.0** custom code names and full lock control, per lock and opt-in on the hub.
 - **1.6.0** a [daily hub report](#daily-hub-report): app versions and slot settings, hub firmware and uptime, and lock health, counts only.
+- **1.7.0** a check SignalBricks uses to avoid creating a door code that's already on a lock.
 
 ## Requirements
 
@@ -179,7 +180,7 @@ Some lock drivers can store their code list encrypted. The app decrypts it when 
 The harnesses in `tests/` exercise the app against a stubbed Hubitat sandbox with fake locks, codes and tokens; they are not loaded by Hubitat or HPM. Run each from the repository root with Docker:
 
 ```bash
-for h in LockManagementHarness RelocateHarness FullControlHarness ConnectHarness ReconnectHarness HubReportHarness; do
+for h in LockManagementHarness CodeInUseHarness RelocateHarness FullControlHarness ConnectHarness ReconnectHarness HubReportHarness; do
   docker run --rm --network none -v "$PWD/signalbricksTelemetry:/w:ro" groovy:4.0-jdk17 \
     groovy /w/tests/$h.groovy /w/app.groovy
 done
