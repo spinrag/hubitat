@@ -175,7 +175,7 @@ The hub decides which slots may be touched, using the settings you choose in the
 
 ### Upgrading from 1.7 or earlier
 
-Before 1.8.0, lock code management had its own lock list. On update, the locks on it are added to **Locks** (if they weren't there already) and ticked as managed locks, so you don't need to select anything again. Those locks now also send their lock state as telemetry.
+Before 1.8.0, lock code management had its own lock list. On update, the locks on it are added to **Locks** (if they weren't there already) and ticked as managed locks, so you don't need to select anything again. Those locks now also send their lock state as telemetry. Code-only devices such as keypads stay in their own list under **Devices**, with lock code management unchanged.
 
 ### Locks with encrypted codes
 
@@ -186,8 +186,8 @@ Some lock drivers can store their code list encrypted. The app decrypts it when 
 Added in 1.8.0, off by default. Lets SignalBricks lock, unlock and control the devices you select, without the Maker API. It uses the lock code management connection, so lock code management must be on.
 
 1. Update **SignalBricks Telemetry** and open the app.
-2. Under **Devices**, check **Locks SignalBricks manages**. Lock control applies to those locks only.
-3. For other devices, select them under **Devices SignalBricks may control**: switches, dimmers and outlets; garage doors; gates and other doors; thermostats; valves. A device only accepts the commands of the list you selected it in, for example on, off and level for switches and dimmers, or open and close for garage doors.
+2. Under **Devices**, check **Locks SignalBricks manages**. Lock control applies to those locks only. A lock you remove from **Locks** is no longer managed, also if you add it back later, until you tick it again.
+3. For other devices, select them under **Devices SignalBricks may control**: switches, dimmers and outlets; garage doors; gates and other doors; thermostats; valves. A device only accepts the commands of the list you selected it in, for example on, off and level for switches and dimmers, or open and close for garage doors. Locks are only ever controlled with lock control: a lock picked in one of these lists is ignored there, and the app says so.
 4. Under **Lock and device control (optional)**, turn on **Let SignalBricks lock and unlock the managed locks**, **Let SignalBricks control the devices selected for control**, or both.
 5. Click **Done**. Control starts only then: the app replaces its access token and registers the new one first.
 
@@ -220,7 +220,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) before opening an issue or pull reques
 
 - **By default, door codes (PINs) are never sent**, only the name of the code used. The app removes every code field from events before sending them, and the [daily hub report](#daily-hub-report) only counts occupied slots.
 - **Include door codes (optional, off by default).** When you and your organization's admin both turn it on, SignalBricks keeps only a keyed hash of the code used. See [Door codes in telemetry](#door-codes-in-telemetry-optional).
-- **Telemetry is read-only.** SignalBricks changes codes only when lock code management is on, and only for the locks and slots you allow; it controls devices only when lock or device control is on, and only those you select.
+- **Control is opt-in.** SignalBricks changes codes only when lock code management is on, and only for the locks and slots you allow; it controls devices only when lock or device control is on, and only those you select.
 - **No shared secret.** Connect uses OAuth with PKCE, so the app stores no client secret. The hub's access token is replaced after every Connect and Reconnect.
 - Events go only to the SignalBricks ingestion address returned during Connect. Nothing is sent until the hub is connected.
 

@@ -111,6 +111,8 @@ class FakeApp {
 
 class FakeLock {
     String id; String displayName; String typeName
+    List caps = ['Lock', 'LockCodes']
+    Boolean hasCapability(String c) { caps.contains(c) }
     Map attrs = [:]
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
 }

@@ -74,7 +74,8 @@ class FakeLock {
     String id; String displayName; String name; String label
     Map attrs = [:]
     List calls = []
-    Boolean hasCapability(String c) { c in ['Lock', 'LockCodes'] }
+    List caps = ['Lock', 'LockCodes']
+    Boolean hasCapability(String c) { caps.contains(c) }
     Boolean hasCommand(String c) { c in ['lock', 'unlock'] }
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
     void lock() { calls << 'lock' }
@@ -185,7 +186,8 @@ check('empty codeLocks: removed, nothing managed', app.codeLocks == null && app.
 app = oldHub()
 app.codeLocks = null
 app.updated()
-check('no codeLocks: no setting written, nothing logged', app.updatedSettings.isEmpty() && app.removedSettings.isEmpty() && !app.logged.any { it.contains('moved to Devices') })
+check('no codeLocks: no lock list written, nothing logged', !app.updatedSettings.any { it.name in ['locks', 'managedLocks', 'codeLocks'] } &&
+    !app.removedSettings.contains('codeLocks') && !app.logged.any { it.contains('moved to Devices') })
 
 // Lock code management was off (its lock list stays on the hub): migrated, still off
 app = oldHub()
@@ -199,6 +201,41 @@ app = oldHub()
 app.managedLocks = ['102']
 app.updated()
 check('existing managed locks are kept and the old ones added', app.managedLocks == ['102', '101', '103'] && app.codeLocks == null)
+
+// Code-only devices (keypads) can't be Locks: they stay in codeLocks, still managed
+app = oldHub()
+def keypad = new FakeLock(id: '104', displayName: 'Keypad', label: 'Keypad', caps: ['LockCodes'], attrs: [lockCodes: JsonOutput.toJson(['2': [name: 'SBA: Owner', code: codes[0]]])])
+app.devices['104'] = keypad
+app.codeLocks = [app.devices['101'], keypad, app.devices['103']]
+app.mainPage()
+check('keypad: locks migrated, keypad kept in codeLocks', ids(app.locks) == ['101', '102', '103'] && app.managedLocks == ['101', '103'] && ids(app.codeLocks) == ['104'] &&
+    !app.removedSettings.contains('codeLocks') && app.updatedSettings.find { it.name == 'codeLocks' }?.type == 'capability.lockCodes')
+check('keypad: not added to Locks', !app.updatedSettings.find { it.name == 'locks' }.value.contains('104'))
+check('keypad: still managed for codes', app.findCodeLock('104') != null && body(app.apiListLocks()).locks*.id.contains('104'))
+app.paragraphs.clear(); app.inputs.clear(); app.mainPage()
+check('keypad: shown under Devices to see or clear', app.inputs.codeLocks?.type == 'capability.lockCodes' && !app.inputs.managedLocks.options.containsKey('104'))
+int kw = app.updatedSettings.size()
+app.updated()
+app.dailyCheckIn()
+check('keypad: nothing rewritten again', app.updatedSettings.findAll { it.name in ['locks', 'managedLocks', 'codeLocks'] }.size() == app.updatedSettings.take(kw).findAll { it.name in ['locks', 'managedLocks', 'codeLocks'] }.size() &&
+    ids(app.codeLocks) == ['104'])
+app.lockControlEnabled = true
+app.updated()
+app.params = [lockId: '104']
+check('keypad: lock control never reaches it', app.state.lockControlOn == true && app.apiUnlock().status == 404 && keypad.calls.isEmpty())
+app.params = [lockId: '101']
+check('keypad: a migrated lock is controllable once turned on', app.apiUnlock().status == 202)
+app.codeLocks = null
+app.updated()
+check('keypad cleared: no longer managed', app.findCodeLock('104') == null)
+
+app = oldHub()
+def pad2 = new FakeLock(id: '105', displayName: 'Pad', label: 'Pad', caps: ['LockCodes'])
+app.devices['105'] = pad2
+app.codeLocks = [pad2]
+app.updated()
+check('only keypads: nothing moved, codeLocks kept, nothing logged', ids(app.codeLocks) == ['105'] && app.managedLocks == null && ids(app.locks) == ['101', '102'] &&
+    !app.updatedSettings.any { it.name in ['locks', 'managedLocks', 'codeLocks'] } && !app.logged.any { it.contains('moved to Devices') })
 
 String everything = apps.collect { (it.logged + it.posts.collect { p -> p.params.body }).join('\n') }.join('\n')
 check('no code in any log or post', !codes.any { everything.contains(it) })

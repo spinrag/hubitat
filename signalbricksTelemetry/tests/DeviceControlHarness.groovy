@@ -337,7 +337,73 @@ resetLimits()
 List devAcross = (1..30).collect { i -> i % 3 == 0 ? cmd('20', [command: 'on']).status : (i % 3 == 1 ? cmd('23', [command: 'close']).status : cmd('25', [command: 'open']).status) }
 r = cmd('22', [command: 'close'])
 check('device limit across the app -> 429', devAcross.every { it == 202 } && r.status == 429)
+check('refused across the app: not counted for the device', (app.state.deviceCommandDeviceTimes['22'] ?: []).isEmpty())
 app.clock += 61000
+resetLimits()
+List lockAcross = (1..20).collect { i -> call('apiLock', [lockId: ['10', '12', '13', '14'][i % 4]]).status }
+def lockOver = call('apiLock', [lockId: '10'])
+check('lock refused across the app: not counted for the lock', lockAcross.every { it == 202 } && lockOver.status == 429 && app.state.lockCommandLockTimes['10'].size() == 5)
+app.clock += 61000
+resetLimits()
+
+// Numbers: plain decimals only
+['5e1', '1E2', ' 50', '50 ', '+50', '050', '0x32', '50.', '.5', '', 'Infinity'].each { v ->
+    check("setLevel '${v}' -> 400", body(cmd('21', [command: 'setLevel', args: [v]])).error == 'invalid_args')
+}
+['6.85e1', ' 68', '068', '+68', '68.'].each { v ->
+    check("setpoint '${v}' -> 400", body(cmd('24', [command: 'setHeatingSetpoint', args: [v]])).error == 'invalid_args')
+}
+check("setLevel '50.0' -> 50", okCmd('21', [command: 'setLevel', args: ['50.0']], dim, ['setLevel', 50]))
+check("setpoint '68.5' -> 68.5", okCmd('24', [command: 'setHeatingSetpoint', args: ['68.5']], thermo, ['setHeatingSetpoint', 68.5]))
+resetLimits()
+
+// Locks are never controlled as switches or doors, with lock control on or off
+def lockSwitch = new FakeDevice(id: '40', displayName: 'Lock switch', label: 'Lock switch', caps: ['Lock', 'LockCodes', 'Switch'], attrs: [switch: 'off', lock: 'locked'])
+def lockDoor = new FakeDevice(id: '41', displayName: 'Lock door', label: 'Lock door', caps: ['Lock', 'DoorControl'], attrs: [door: 'closed', lock: 'locked'])
+def keypadSwitch = new FakeDevice(id: '42', displayName: 'Keypad', label: 'Keypad', caps: ['LockCodes', 'Switch'], attrs: [switch: 'off'])
+// Switch-only device whose id is a selected lock's
+def sameIdSwitch = new FakeDevice(id: '11', displayName: 'Shed switch', label: 'Shed switch', caps: ['Switch'], attrs: [switch: 'off'])
+app.controlSwitches = [sw, dim, lockSwitch, keypadSwitch, sameIdSwitch]
+app.controlDoors = [gate, lockDoor]
+[true, false].each { lockOn ->
+    if (!lockOn) { app.lockControlEnabled = false; app.paragraphs.clear(); app.mainPage() }
+    String when = lockOn ? 'lock control on' : 'lock control off'
+    [['40', 'on'], ['40', 'off'], ['41', 'open'], ['41', 'close'], ['42', 'on'], ['11', 'on']].each { id, c ->
+        def res = cmd(id, [command: c])
+        check("${when}: lock-like device ${id} ${c} -> 404", res.status == 404 && body(res) == [error: 'device_not_found'])
+    }
+    check("${when}: lock-like devices not listed", !body(call('apiListDevices')).devices*.id.any { it in ['40', '41', '42', '11'] })
+}
+check('lock-like devices: nothing sent', lockSwitch.calls.isEmpty() && lockDoor.calls.isEmpty() && keypadSwitch.calls.isEmpty() && sameIdSwitch.calls.isEmpty())
+app.paragraphs.clear(); app.inputs.clear(); app.mainPage()
+check('page: locks picked under a control list are named as ignored', app.paragraphs.any { it.contains('Locks are controlled under Lock control and are ignored here:') &&
+    ['Lock switch', 'Lock door', 'Keypad', 'Shed switch'].every { n -> it.contains(n) } && !it.contains('Porch light') })
+app.subscriptions.clear()
+app.subscribeToEvents()
+check('lock-like devices: no switch or door telemetry from the control lists', !app.subscriptions.any { it.id in ['40', '41', '42'] && it.attribute in ['switch', 'door'] })
+app.controlSwitches = [sw, dim]
+app.controlDoors = [gate]
+app.lockControlEnabled = true
+app.updated()
+check('setup: lock control back on', call('apiLock', [lockId: '10']).status == 202)
+resetLimits()
+
+// Lock code management only on managed locks with codes
+app.params = [:]
+check('/locks: managed locks without codes are left out', body(app.apiListLocks()).locks*.id == ['10'])
+def noCodes = call('apiSetCode', [lockId: '12'], [slot: 3, code: '13572468', name: 'SBA: Test'])
+check('code write on a managed lock without codes -> 404', noCodes.status == 404 && !lockC.calls.any { it[0] == 'setCode' })
+check('lock control still works on it', call('apiLock', [lockId: '12']).status == 202)
+
+// Done prunes managed and full-control locks no longer under Locks
+app.fullControlLocks = ['10', '13']
+app.locks = [lockA, lockB, lockC, lockE]
+app.updated()
+check('Done: a lock removed from Locks is no longer managed or fully controlled', app.managedLocks == ['10', '12', '14'] && app.fullControlLocks == ['10'])
+app.locks = [lockA, lockB, lockC, lockD, lockE]
+check('added back: not managed until ticked again', call('apiLock', [lockId: '13']).status == 404 && app.managedLocks == ['10', '12', '14'])
+app.managedLocks = ['10', '12', '13', '14']
+app.updated()
 resetLimits()
 
 // Telemetry for controlled devices
@@ -375,8 +441,15 @@ app.paragraphs.clear(); app.mainPage()
 check('lock code management back on: control waits for Done', call('apiUnlock', [lockId: '10']).status == 404)
 app.updated()
 check('after Done: control back on', call('apiUnlock', [lockId: '10']).status == 202 && call('apiListDevices').status == 200)
-app.state.remove('sbToken')
-check('disconnected: 404', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404)
+app.appButtonHandler('btnDisconnect')
+check('Disconnect: 404, control state cleared', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404 &&
+    app.state.lockControlOn == null && app.state.deviceControlOn == null)
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+check('connected again: control waits for Done', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404)
+tokenBefore = app.state.accessToken
+app.updated()
+check('after Done: control back on with a new token', app.state.accessToken != tokenBefore && call('apiUnlock', [lockId: '10']).status == 202)
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

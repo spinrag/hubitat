@@ -89,6 +89,8 @@ class FakeApp {
 // throws with the code in its message.
 class FakeLock {
     String id; String displayName; String name; String label
+    List caps = ['Lock', 'LockCodes']
+    Boolean hasCapability(String c) { caps.contains(c) }
     Map attrs = [:]
     List calls = []
     int dropSets = 0, dropDeletes = 0, unreadableReads = 0
