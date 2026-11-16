@@ -8,7 +8,8 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     Map getAtomicState() { state }
     Map params = [:]
     def request = [:]

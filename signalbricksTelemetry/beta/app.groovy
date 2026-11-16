@@ -174,6 +174,9 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int LOCK_COMMAND_LOCK_LIMIT_PER_MIN = 6
 @Field static final int DEVICE_COMMAND_LIMIT_PER_MIN = 30
 @Field static final int DEVICE_COMMAND_DEVICE_LIMIT_PER_MIN = 10
+// The settings migration finishes after this many runs even if a setting it
+// wrote never reads back (e.g. a device removed meanwhile)
+@Field static final int MIGRATION_MAX_RUNS = 5
 // Rate-limit state of door code management, dropped when it is turned off
 @Field static final List<String> CODE_LIMIT_KEYS = ['revealTimes', 'retryTimes', 'writeTimes', 'fingerprintTimes', 'fingerprintBatchTimes',
     'codeInUseTimes', 'codeInUseLockTimes', 'codeInUseLockDaily']
@@ -392,7 +395,7 @@ Map mainPage() {
                 href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: reconnectEntryUrl(),
                     description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
                         'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
-                paragraph '<small>The sign-in link works for 10 minutes. Then the app replaces its access token, so an unused link can\'t be reused. Your settings stay.</small>'
+                paragraph '<small>The sign-in link works for 10 minutes. Then the app replaces its access token, so an unused link can\'t be reused. Your settings stay. Lock and device control need a Done after you sign in.</small>'
                 input(name: 'btnDisconnect', type: 'button', title: 'Disconnect')
                 paragraph '<small>Disconnect stops sending at once. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
             } else {
@@ -449,7 +452,9 @@ Map mainPage() {
                 } else if (state.lockMgmtReconnectRequired) {
                     paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks)."
                 } else {
-                    if (featuresAwaitingDone()) {
+                    if (atomicState.settingsMigration?.done != true) {
+                        paragraph '<b>Settings update in progress.</b> Reopen this page, then click Done.'
+                    } else if (featuresAwaitingDone()) {
                         paragraph '<b>Click Done to turn it on.</b> The app replaces its access token first.'
                     } else {
                         paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
@@ -598,9 +603,10 @@ List allLocks() {
 }
 
 // Until the settings migration has started (an HPM update doesn't run
-// updated()), the earlier lists still decide which locks are managed.
+// updated()), the earlier lists still decide which locks are managed: on a
+// hub that had a feature on, no list means no managed lock.
 Boolean legacySelections() {
-    return atomicState.settingsMigration == null && (managedLocks != null || codeLocks != null)
+    return atomicState.settingsMigration == null && (managedLocks != null || codeLocks != null || endpointOn())
 }
 
 // Locks SignalBricks manages: door code management and lock control use these only
@@ -643,11 +649,12 @@ Boolean migrateSettings() {
         // Lock and device control only ever took effect with code management on
         List controlOff = lockManagementEnabled == true ? [] :
             [lockControlEnabled == true && !state.lockControlOn ? 'lockControlEnabled' : null, deviceControlEnabled == true && !state.deviceControlOn ? 'deviceControlEnabled' : null].findAll()
-        m = [locksBefore: lockIds, add: legacyIds.findAll { !lockIds.contains(it) }, fullControl: fullControl, controlOff: controlOff]
+        m = [locksBefore: lockIds, add: legacyIds.findAll { !lockIds.contains(it) }, fullControl: fullControl, controlOff: controlOff, runs: 0]
         Map note = [:]
         if (newlyManaged) note.locks = newlyManaged
         // Lock control on locks it didn't cover before waits for a Done, which replaces the token
-        if (newlyManaged && state.lockControlOn) {
+        Boolean paused = newlyManaged && state.lockControlOn
+        if (paused) {
             note.lockControlPaused = true
             state.remove('lockControlOn')
             state.remove('lockCommandTimes')
@@ -658,17 +665,30 @@ Boolean migrateSettings() {
         atomicState.settingsMigration = m
         started = true
         if (managedLocks != null || codeLocks != null || fullControl) {
-            log.info "SignalBricks Telemetry: settings moved to ${appNameAndVersion()}: ${newlyManaged.size()} lock(s) newly managed${fullControl ? ', full control is one switch' : ''}"
+            log.info "SignalBricks Telemetry: settings moved to ${appNameAndVersion()}: ${newlyManaged.size()} lock(s) newly managed${fullControl ? ', full control is one switch' : ''}${paused ? ', lock control paused until Done' : ''}"
         }
+        if (paused) {
+            try {
+                registerWithPlatform()
+            } catch (Exception e) {
+                // Only the class name: the request body carries the access token.
+                log.warn "SignalBricks Telemetry: registering the change failed (${e.class.simpleName})"
+            }
+        }
+    } else {
+        m.runs = ((m.runs ?: 0) as int) + 1
+        atomicState.settingsMigration = m
     }
+    // Gives up waiting for the new settings to read back
+    Boolean force = (m.runs as int) >= MIGRATION_MAX_RUNS
     // Written (again) until it reads back
     if (m.add && deviceIds(locks) == m.locksBefore) app.updateSetting('locks', [type: 'capability.lock', value: (m.locksBefore + m.add).unique()])
     if (m.fullControl && fullControlEnabled == null) app.updateSetting('fullControlEnabled', [type: 'bool', value: true])
     if ('lockControlEnabled' in m.controlOff && lockControlEnabled == true) app.updateSetting('lockControlEnabled', [type: 'bool', value: false])
     if ('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true) app.updateSetting('deviceControlEnabled', [type: 'bool', value: false])
-    Boolean controlRead = !('lockControlEnabled' in m.controlOff && lockControlEnabled == true) && !('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true)
-    Boolean locksRead = !m.add || deviceIds(locks) != m.locksBefore
-    Boolean fullRead = !m.fullControl || fullControlEnabled != null
+    Boolean controlRead = force || (!('lockControlEnabled' in m.controlOff && lockControlEnabled == true) && !('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true))
+    Boolean locksRead = force || !m.add || deviceIds(locks) != m.locksBefore
+    Boolean fullRead = force || !m.fullControl || fullControlEnabled != null
     if (managedLocks != null) app.removeSetting('managedLocks')
     if (fullRead && fullControlLocks != null) app.removeSetting('fullControlLocks')
     if (locksRead && legacyCodeLocks()) {
@@ -676,7 +696,8 @@ Boolean migrateSettings() {
         if (codeOnly) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: deviceIds(codeOnly)])
         else app.removeSetting('codeLocks')
     }
-    if (locksRead && fullRead && controlRead && managedLocks == null && fullControlLocks == null && !legacyCodeLocks()) {
+    if (force || (locksRead && fullRead && controlRead && managedLocks == null && fullControlLocks == null && !legacyCodeLocks())) {
+        if (force) log.warn 'SignalBricks Telemetry: settings update finished without every setting reading back'
         atomicState.settingsMigration = [done: true]
     }
     return started

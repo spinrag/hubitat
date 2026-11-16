@@ -80,7 +80,8 @@ class FakeApp {
     }
     void updateSetting(String n, Map v) {
         Map devs = owner.devices
-        def value = v.type?.startsWith('capability.') ? v.value.collect { devs[it] } : v.value
+        // A device no longer on the hub is left out, as the hub does
+        def value = v.type?.startsWith('capability.') ? v.value.collect { devs[it] }.findAll { it != null } : v.value
         def hub = owner
         write('update') { hub.updatedSettings << [name: n, type: v.type, value: v.value]; hub.setProperty(n, value) }
     }
@@ -243,6 +244,33 @@ app.params = [lockId: '102']
 check('1.8: Done resumes lock control with a new token, the newly managed lock included', app.state.lockControlOn == true && app.state.accessToken != token &&
     app.apiUnlock().status == 202 && registers(app)[-1].lockControl == true && registers(app)[-1].appAccessToken == app.state.accessToken)
 
+// The pause re-registers at once, from the page too
+app = hub18()
+token = app.state.accessToken
+page(app)
+reg = registers(app)[-1]
+check('1.8: pausing registers lockControl off with the same token', app.state.lockControlOn == null && reg.lockControl == false &&
+    reg.codeManagement == true && reg.appAccessToken == token && app.logged.any { it.endsWith(', lock control paused until Done') })
+
+// Before any migration run, a hub with lock control on and no managed-lock list manages no lock (as on 1.8)
+app = hub18()
+app.managedLocks = null
+app.fullControlLocks = null
+['101', '102', '103'].each { id ->
+    app.params = [lockId: id]
+    check("1.8 nothing ticked, before migration: unlock ${id} -> 404", app.apiUnlock().status == 404)
+}
+app.params = [:]
+check('1.8 nothing ticked, before migration: no lock for door codes either', body(app.apiListLocks()).locks == [] && app.fullControlAllowedIds() == [] &&
+    app.devices.values().every { it.calls.isEmpty() })
+app = hub18()
+app.managedLocks = null
+app.fullControlLocks = null
+app.lockControlEnabled = false
+app.state.remove('lockControlOn')
+app.params = [:]
+check('1.8 door codes only, nothing ticked, before migration: no lock', body(app.apiListLocks()).locks == [])
+
 // Lock control on, but the note is still there before Done (state held from an older run): still refused
 app = hub18()
 app.dailyCheckIn()
@@ -394,6 +422,27 @@ check('everything off: migrated, nothing on, no note, nothing registered', app.s
     check("interrupted at write ${n}: finished on the next runs", migrated(hub) && keptState(hub) && hub.state.settingsNote?.locks == ['102'] &&
         hub.logged.count { it.contains('settings moved to') } == 1)
 }
+
+// --- A lock removed from the hub while the update waits for its settings: it finishes after a few runs ---
+app = hub17()
+app.lockControlEnabled = true
+app.app.deferred = ['update', 'remove'] as Set
+page(app)
+app.app.held.clear()
+app.app.deferred = [] as Set
+app.devices.remove('103')
+app.codeLocks = [app.devices['101']]
+app.state.pendingCodeChanges = [:]
+String stuck = page(app)
+check('removed lock: update not finished yet, page says so', app.state.settingsMigration?.done != true && stuck.contains('Settings update in progress') &&
+    !stuck.contains('Click Done to turn it on'))
+app.updated()
+check('removed lock: Done meanwhile turns nothing on', app.state.lockControlOn == null)
+(1..3).each { page(app) }
+check('removed lock: finished after a bounded number of runs', app.state.settingsMigration == [done: true] && app.codeLocks == null &&
+    ids(app.locks) == ['101', '102'] && app.logged.any { it.contains('settings update finished without every setting reading back') })
+app.updated()
+check('removed lock: the next Done turns lock control on', app.state.lockControlOn == true)
 
 // --- Keypads (code-only devices) keep their list, shown while it has any ---
 app = hub17()
