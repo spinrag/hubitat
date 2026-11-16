@@ -524,5 +524,38 @@ mainPage()
 check('page: no managed-lock or full-control lists, no Select all or Clear', !['managedLocks', 'fullControlLocks', 'btnSelectAllManagedLocks', 'btnClearManagedLocks',
     'btnSelectAllFullControl', 'btnClearFullControl'].any { app.inputs.containsKey(it) } && app.inputs.fullControlEnabled?.type == 'bool')
 
+// --- Control-only hub: Reconnect needs a Done for control again; the rotate button is there ---
+app.state.sbToken = INGEST_2
+app.state.ingestUrl = 'https://ingest.example.invalid/v1/webhooks/hubitat'
+app.lockManagementEnabled = false
+mainPage()
+app.lockControlEnabled = true
+app.deviceControlEnabled = true
+app.updated()
+app.registerCallback(ok(true), [enabled: true])
+check('control only: on after Done', app.state.lockControlOn == true && app.state.deviceControlOn == true && app.state.lockMgmtLastEnabled == null)
+mainPage()
+check('control only: rotate button shown', app.inputs.btnRotateLockToken?.type == 'button')
+app.apiReconnect()
+app.params = [error: 'access_denied']
+app.oauthCallback()
+check('control only, sign-in cancelled: control kept', app.state.lockControlOn == true && app.state.deviceControlOn == true)
+app.apiReconnect()
+app.posts.clear()
+app.tokenReply = [access_token: INGEST, ingest_url: 'https://ingest.example.invalid/v1/webhooks/hubitat']
+app.params = [code: 'fake-auth-code-9', access_token: app.state.accessToken]
+app.oauthCallback()
+check('control only, Reconnect: control needs a Done again', app.state.lockControlOn == null && app.state.deviceControlOn == null &&
+    registers().size() == 1 && regBody(registers()[0]).lockControl == false && regBody(registers()[0]).appAccessToken == null)
+mainPage()
+check('control only, Reconnect: page asks for Done', app.paragraphs.any { it.contains('Click Done to turn it on') })
+String beforeDone = app.state.accessToken
+app.updated()
+check('control only, Reconnect then Done: on again with a new token', app.state.lockControlOn == true && app.state.deviceControlOn == true && app.state.accessToken != beforeDone)
+app.lockControlEnabled = false
+app.deviceControlEnabled = false
+mainPage()
+check('everything off: no rotate button', !app.inputs.containsKey('btnRotateLockToken'))
+
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

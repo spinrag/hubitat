@@ -214,7 +214,7 @@ app.updated()
 check('1.7 off: migrated and still off, no note', ids(app.locks) == ['101', '102', '103'] && app.codeLocks == null && app.lockManagementActive() == false &&
     app.state.settingsNote == null && app.endpointOn() == false)
 
-// --- 1.8 -> 1.9: lock control on keeps working without a Done, same token ---
+// --- 1.8 -> 1.9: a lock that was unticked becomes managed, so lock control waits for a Done ---
 app = hub18()
 String token = app.state.accessToken
 app.params = [lockId: '102']
@@ -223,24 +223,64 @@ app.params = [lockId: '101']
 check('1.8, before migration: a ticked lock is', app.apiUnlock().status == 202)
 app.dailyCheckIn()
 check('1.8 daily check-in: migrated', migrated(app) && keptState(app))
-check('1.8: token unchanged, lock control still on', app.state.accessToken == token && app.state.lockControlOn == true && app.lockControlEnabled == true)
+check('1.8: lock control paused, switch kept, token unchanged', app.state.lockControlOn == null && app.lockControlEnabled == true && app.state.accessToken == token)
 app.params = [lockId: '102']
-check('1.8: the unticked lock is now managed and controlled', app.apiUnlock().status == 202 && app.findCodeLock('102') != null)
+def paused102 = app.apiUnlock()
+app.params = [lockId: '101']
+check('1.8: no lock can be unlocked until Done, the newly managed one included', paused102.status == 404 && app.apiUnlock().status == 404 &&
+    app.devices['102'].calls.isEmpty())
 reg = registers(app)[-1]
-check('1.8: re-registered on the version change with the same token and every feature flag', reg.version == '1.9.0' && reg.appAccessToken == token &&
-    reg.lockManagement == true && reg.codeManagement == true && reg.lockControl == true && reg.deviceControl == false && reg.capabilities.contains('lock_control'))
-check('1.8: note names the unticked lock and full control', page(app).contains('Newly managed: Lock B.') && app.paragraphs.any { it.contains('Full control above the ceiling') })
+check('1.8: re-registered on the version change, lock control off until Done', reg.version == '1.9.0' && reg.appAccessToken == token &&
+    reg.lockManagement == true && reg.codeManagement == true && reg.lockControl == false && reg.deviceControl == false)
+String p18 = page(app)
+check('1.8: note says why lock control is paused and names the lock', p18.contains('Lock control is paused because these locks are now managed: Lock B. Click Done to turn it back on.') &&
+    p18.contains('Full control above the ceiling') && p18.contains('Click Done to turn it on'))
+app.appButtonHandler('btnDismissSettingsNote')
+app.params = [lockId: '101']
+check('1.8: dismissing the note does not resume lock control', app.state.lockControlOn == null && app.apiUnlock().status == 404)
 app.updated()
-check('1.8: Done keeps the token and control', app.state.accessToken == token && app.state.lockControlOn == true && app.state.settingsNote == null)
+app.params = [lockId: '102']
+check('1.8: Done resumes lock control with a new token, the newly managed lock included', app.state.lockControlOn == true && app.state.accessToken != token &&
+    app.apiUnlock().status == 202 && registers(app)[-1].lockControl == true && registers(app)[-1].appAccessToken == app.state.accessToken)
 
-// 1.8 with no managed locks ticked: all of them become managed and are listed
+// Lock control on, but the note is still there before Done (state held from an older run): still refused
+app = hub18()
+app.dailyCheckIn()
+app.state.lockControlOn = true
+app.params = [lockId: '101']
+check('1.8: lock control refused while the pause note is up', app.apiUnlock().status == 404)
+
+// 1.8 with no managed locks ticked: all of them become managed and are listed; lock control paused
 app = hub18()
 app.managedLocks = null
 app.fullControlLocks = null
 page(app)
-check('1.8 nothing ticked: every lock managed, all listed, no full control', ['101', '102', '103'].every { app.findCodeLock(it) != null } &&
-    app.paragraphs.any { it.contains('Newly managed: Lock A, Lock B, Lock C.') } && app.fullControlEnabled == null && app.fullControlAllowedIds() == [])
+check('1.8 nothing ticked: every lock managed, all listed, lock control paused, no full control', ['101', '102', '103'].every { app.findCodeLock(it) != null } &&
+    app.paragraphs.any { it.contains('Lock control is paused because these locks are now managed: Lock A, Lock B, Lock C.') } && app.state.lockControlOn == null &&
+    app.fullControlEnabled == null && app.fullControlAllowedIds() == [])
 check('1.8 nothing ticked: done', app.state.settingsMigration == [done: true] && !app.updatedSettings.any { it.name == 'locks' })
+
+// 1.8 nothing ticked, lock control off: newly managed listed, nothing paused
+app = hub18()
+app.managedLocks = null
+app.fullControlLocks = null
+app.lockControlEnabled = false
+app.state.remove('lockControlOn')
+page(app)
+check('1.8 nothing ticked, lock control off: listed as newly managed', app.paragraphs.any { it.contains('Newly managed: Lock A, Lock B, Lock C.') } &&
+    !app.state.settingsNote.lockControlPaused)
+
+// 1.8 with every lock ticked: lock control keeps working with no Done and the same token
+app = hub18()
+app.managedLocks = ['101', '102', '103']
+token = app.state.accessToken
+app.dailyCheckIn()
+app.params = [lockId: '102']
+check('1.8 all ticked: lock control still on, same token, no Done', app.state.lockControlOn == true && app.state.accessToken == token && app.apiUnlock().status == 202)
+reg = registers(app)[-1]
+check('1.8 all ticked: registered with lock control on and the same token', reg.lockControl == true && reg.appAccessToken == token)
+check('1.8 all ticked: note is only about full control', !page(app).contains('Newly managed') && !app.paragraphs.any { it.contains('paused') } &&
+    app.paragraphs.any { it.contains('Full control above the ceiling') })
 
 // 1.8 with every lock ticked: no note
 app = hub18()
@@ -284,6 +324,7 @@ check('1.8 device control: still on, same token', app.state.deviceControlOn == t
 // After the migration, code management off: control carries on, code endpoints 404
 app = hub18()
 page(app)
+app.updated()
 app.lockManagementEnabled = false
 page(app)
 app.params = [lockId: '102']
@@ -323,6 +364,22 @@ check('everything off: migrated, nothing on, no note, nothing registered', app.s
     check("next Done (${kinds}): migrated, state kept", migrated(hub) && keptState(hub) && hub.findCodeLock('103') != null)
     check("next Done (${kinds}): note cleared now", hub.state.settingsNote == null)
     check("next Done (${kinds}): lock control on now", hub.state.lockControlOn == true)
+}
+
+// --- A Done while the migration hasn't finished (its writes not read back yet) turns nothing on ---
+[['update'], ['update', 'remove']].each { kinds ->
+    def hub = hub17()
+    hub.lockControlEnabled = true
+    hub.deviceControlEnabled = true
+    hub.app.deferred = kinds as Set
+    page(hub)
+    hub.updated()
+    check("Done before the migration finished (${kinds} held): nothing turned on", hub.state.lockControlOn == null && hub.state.deviceControlOn == null &&
+        hub.state.settingsMigration?.done != true && keptState(hub))
+    hub.app.flush()
+    hub.app.deferred = [] as Set
+    hub.updated()
+    check("Done after it finished (${kinds}): turned on", migrated(hub) && hub.state.lockControlOn == true && hub.state.deviceControlOn == true)
 }
 
 // --- Interrupted part-way: the next run finishes it, note and log once ---

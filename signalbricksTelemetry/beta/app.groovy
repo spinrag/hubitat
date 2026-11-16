@@ -367,60 +367,6 @@ Map mainPage() {
             }
         }
 
-        section('<b>What SignalBricks may do</b>') {
-            String note = settingsNoteText()
-            if (note) {
-                paragraph note
-                input(name: 'btnDismissSettingsNote', type: 'button', title: 'Dismiss')
-            }
-            paragraph '<small>Each is off by default and starts when you click Done. Every command is logged here and reported to SignalBricks.</small>'
-            input(name: 'lockManagementEnabled', type: 'bool', title: 'Manage door codes on the locks above', defaultValue: false, submitOnChange: true)
-            if (lockManagementEnabled) {
-                paragraph '<small>Only admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes, up to the slot below, plus codes you approve. Booking codes (names with <code>ORB</code> and a digit in any case, <code>ORB</code> starting a word, or <code>G:</code> or <code>GT:</code> first) are always refused. Codes are never logged.</small>'
-                input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may use (below the booking apps' first slot)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
-                input(name: 'fullControlEnabled', type: 'bool', title: 'Full control above that slot', defaultValue: false, submitOnChange: true)
-                paragraph '<small>Only codes SignalBricks registered, on locks it marks for full control. Never empty slots, booking codes or unnamed codes.</small>'
-                Map pending = pendingAdoptedOptions()
-                if (pending) {
-                    paragraph '<b>Codes above that slot SignalBricks asks to manage.</b> Approve only admin or managed codes you recognise.'
-                    input(name: 'approvedAdoptedSlots', type: 'enum', title: 'Approve these slots', options: pending, multiple: true, required: false, submitOnChange: true)
-                }
-                if (state.sbToken) {
-                    paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (code changes are refused until then)'}"
-                    if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set'}"
-                    Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
-                    if (fpPending) {
-                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}, key check <b>${fpPending.check}</b>). Approve only if SignalBricks shows the same key check. If not, reject it and rotate the access token."
-                        // The id ties the click to the request shown, so a newer request needs its own approval
-                        input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
-                        input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
-                    }
-                    Map changes = pendingCodeChanges()
-                    if (changes) {
-                        int failed = changes.values().count { it.status == 'failed' }
-                        paragraph "<b>Code changes awaiting the lock:</b> ${changes.size() - failed} in progress, ${failed} failed (SignalBricks can retry failed changes for 24 hours)"
-                    }
-                    input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
-                }
-            }
-            input(name: 'lockControlEnabled', type: 'bool', title: 'Lock and unlock the locks above', defaultValue: false, submitOnChange: true)
-            input(name: 'deviceControlEnabled', type: 'bool', title: 'Control the devices above', defaultValue: false, submitOnChange: true)
-            if (lockManagementEnabled || lockControlEnabled || deviceControlEnabled) {
-                if (!state.sbToken) {
-                    paragraph '<b>Connect to SignalBricks first.</b>'
-                } else if (state.lockMgmtReconnectRequired) {
-                    paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks)."
-                } else {
-                    if (featuresAwaitingDone()) {
-                        paragraph '<b>Click Done to turn it on.</b> The app replaces its access token first.'
-                    } else {
-                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
-                    }
-                    if (state.lockMgmtRegisterError) paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
-                }
-            }
-        }
-
         section('<b>Connection</b>') {
             if (!ensureAccessToken()) {
                 paragraph '<b>OAuth is not enabled for this app.</b> In <i>Apps Code</i>, open SignalBricks Telemetry, click <i>OAuth</i> → <i>Enable OAuth in App</i> → <i>Update</i>, then reopen this app.'
@@ -460,6 +406,60 @@ Map mainPage() {
             }
         }
 
+        section('<b>What SignalBricks may do</b>') {
+            String note = settingsNoteText()
+            if (note) {
+                paragraph note
+                input(name: 'btnDismissSettingsNote', type: 'button', title: 'Dismiss')
+            }
+            paragraph '<small>Each is off by default and starts when you click Done. Every command is logged here and reported to SignalBricks.</small>'
+            input(name: 'lockManagementEnabled', type: 'bool', title: 'Manage door codes on the locks above', defaultValue: false, submitOnChange: true)
+            if (lockManagementEnabled) {
+                paragraph '<small>Only admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes, up to the slot below, plus codes you approve. Booking codes (names with <code>ORB</code> and a digit in any case, <code>ORB</code> starting a word, or <code>G:</code> or <code>GT:</code> first) are always refused. Codes are never logged.</small>'
+                input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may use (below the booking apps' first slot)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
+                input(name: 'fullControlEnabled', type: 'bool', title: 'Full control above that slot', defaultValue: false, submitOnChange: true)
+                paragraph '<small>Only codes SignalBricks registered, on locks it marks for full control. Never empty slots, booking codes or unnamed codes.</small>'
+                Map pending = pendingAdoptedOptions()
+                if (pending) {
+                    paragraph '<b>Codes above that slot SignalBricks asks to manage.</b> Approve only admin or managed codes you recognise.'
+                    input(name: 'approvedAdoptedSlots', type: 'enum', title: 'Approve these slots', options: pending, multiple: true, required: false, submitOnChange: true)
+                }
+                if (state.sbToken) {
+                    paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (code changes are refused until then)'}"
+                    if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set'}"
+                    Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
+                    if (fpPending) {
+                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}, key check <b>${fpPending.check}</b>). Approve only if SignalBricks shows the same key check. If not, reject it and rotate the access token."
+                        // The id ties the click to the request shown, so a newer request needs its own approval
+                        input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
+                        input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
+                    }
+                    Map changes = pendingCodeChanges()
+                    if (changes) {
+                        int failed = changes.values().count { it.status == 'failed' }
+                        paragraph "<b>Code changes awaiting the lock:</b> ${changes.size() - failed} in progress, ${failed} failed (SignalBricks can retry failed changes for 24 hours)"
+                    }
+                }
+            }
+            input(name: 'lockControlEnabled', type: 'bool', title: 'Lock and unlock the locks above', defaultValue: false, submitOnChange: true)
+            input(name: 'deviceControlEnabled', type: 'bool', title: 'Control the devices above', defaultValue: false, submitOnChange: true)
+            if (lockManagementEnabled || lockControlEnabled || deviceControlEnabled) {
+                if (!state.sbToken) {
+                    paragraph '<b>Connect to SignalBricks first.</b>'
+                } else if (state.lockMgmtReconnectRequired) {
+                    paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks)."
+                } else {
+                    if (featuresAwaitingDone()) {
+                        paragraph '<b>Click Done to turn it on.</b> The app replaces its access token first.'
+                    } else {
+                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                    }
+                    if (state.lockMgmtRegisterError) paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
+                    if (endpointOn()) input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
+                }
+            }
+        }
+
         section('<b>Door codes in telemetry (optional)</b>') {
             paragraph '<small>Off by default: the code used at a lock is removed before sending. When on, SignalBricks keeps only a keyed hash of it, and only if your organization also turned on <i>Hash door codes from Hubitat telemetry</i>. Codes are never logged, and code lists are never sent.</small>'
             input(name: 'includeDoorCodes', type: 'bool', title: 'Include door codes (hashed by SignalBricks)', defaultValue: false, submitOnChange: true)
@@ -488,9 +488,9 @@ void installed() {
 
 void updated() {
     logDebug 'updated'
-    // A Done that starts the settings migration turns nothing on: settings it
-    // just wrote may not read back in the same run
-    Boolean migrating = migrateSettings()
+    // Nothing turns on until the settings migration is done: settings it
+    // wrote may not read back in the same run
+    Boolean migrating = migrateSettings() || atomicState.settingsMigration?.done != true
     if (!migrating) atomicState.remove('settingsNote')
     initialize()
     // Re-register on every save, so turning features on and app upgrades reach
@@ -646,6 +646,13 @@ Boolean migrateSettings() {
         m = [locksBefore: lockIds, add: legacyIds.findAll { !lockIds.contains(it) }, fullControl: fullControl, controlOff: controlOff]
         Map note = [:]
         if (newlyManaged) note.locks = newlyManaged
+        // Lock control on locks it didn't cover before waits for a Done, which replaces the token
+        if (newlyManaged && state.lockControlOn) {
+            note.lockControlPaused = true
+            state.remove('lockControlOn')
+            state.remove('lockCommandTimes')
+            state.remove('lockCommandLockTimes')
+        }
         if (fullControl && fullControlEnabled == null) note.fullControl = true
         if (note) atomicState.settingsNote = note
         atomicState.settingsMigration = m
@@ -687,7 +694,11 @@ String settingsNoteText() {
     if (!n) return null
     List parts = []
     List names = allLocks().findAll { settingIds(n.locks).contains(it.id.toString()) }.collect { escapeHtml(it.displayName?.toString()) }
-    if (names) parts << "Every selected lock is now managed. Newly managed: ${names.join(', ')}."
+    if (names && n.lockControlPaused) {
+        parts << "Every selected lock is now managed. Lock control is paused because these locks are now managed: ${names.join(', ')}. Click Done to turn it back on."
+    } else if (names) {
+        parts << "Every selected lock is now managed. Newly managed: ${names.join(', ')}."
+    }
     if (n.fullControl) parts << 'Full control above the ceiling is now one switch, and it is on. SignalBricks still turns it on per lock.'
     return parts ? "<b>Updated settings.</b> ${parts.join(' ')}" : null
 }
@@ -830,6 +841,8 @@ void appButtonHandler(String btn) {
             log.info 'SignalBricks Telemetry: new fingerprint key rejected in the app'
         }
     } else if (btn == 'btnDismissSettingsNote') {
+        // Dismissing doesn't resume paused lock control: that needs a Done
+        if (atomicState.settingsNote?.lockControlPaused) state.remove('lockControlOn')
         atomicState.remove('settingsNote')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
@@ -1020,10 +1033,11 @@ def oauthCallback() {
     // sit in proxy/CDN access logs. Replace it once the callback has run
     // (success or failure): createAccessToken() invalidates the previous token,
     // the same behaviour signalbricksIntegration's "Refresh Access Token"
-    // button relies on. The only other inbound calls are the lock-management
-    // endpoints, which use the new token: it is registered with SignalBricks
-    // below and never appears in a URL. Only the token changes: the slot
-    // rules, fingerprint key, approvals and pending code changes stay.
+    // button relies on. The only other inbound calls are the door code, lock
+    // and device control endpoints, which use the new token: it is registered
+    // with SignalBricks below and never appears in a URL. Only the token
+    // changes: the slot rules, fingerprint key, approvals and pending code
+    // changes stay. Lock and device control need a Done again.
     createAccessToken()
     registerWithPlatform()
     return page
@@ -1133,8 +1147,6 @@ Map handleOauthCallback() {
         return renderPage(false, 'Connect link expired', 'This connect link is no longer valid.')
     }
 
-    // A Connect (not a Reconnect) may be to another organization
-    Boolean freshConnect = !state.sbToken
     Map tokenParams = [
         uri: "${SB_PORTAL_URL}/oauth/hubitat/token",
         requestContentType: 'application/json',
@@ -1160,10 +1172,10 @@ Map handleOauthCallback() {
                 state.remove('lastError')
                 // A fresh Connect issues a token bound to this hub and app.
                 state.remove('lockMgmtReconnectRequired')
-                if (freshConnect) {
-                    state.remove('lockControlOn')
-                    state.remove('deviceControlOn')
-                }
+                // A Connect or Reconnect may be to another organization:
+                // control needs a Done again
+                state.remove('lockControlOn')
+                state.remove('deviceControlOn')
             } else {
                 state.lastError = "Token exchange returned HTTP ${resp.status}"
             }
@@ -1607,8 +1619,8 @@ Map buildHubReport(String reason) {
         schemaVersion: REPORT_SCHEMA_VERSION,
         sentAt: now(),
         reason: reason,
-        // The ceiling only applies while lock code management is on
-        telemetry: lockManagementEnabled == true ? [version: APP_VERSION, maxManagedSlot: managedCeiling()] : [version: APP_VERSION],
+        // The ceiling only applies while door code management is on
+        telemetry: lockManagementEnabled == true && state.lockMgmtLastEnabled == true ? [version: APP_VERSION, maxManagedSlot: managedCeiling()] : [version: APP_VERSION],
         apps: apps.values().collect { it },
         hub: reportHub(),
         locks: reportLocks(),
@@ -3204,8 +3216,9 @@ void reportCodeResult(Map p, String result, String reason) {
 
 // --- Lock and device control (#80) ---
 
+// Paused by the settings migration until the next Done
 Boolean lockControlActive() {
-    return lockControlEnabled == true && state.lockControlOn == true && state.sbToken
+    return lockControlEnabled == true && state.lockControlOn == true && state.sbToken && !atomicState.settingsNote?.lockControlPaused
 }
 
 Boolean deviceControlActive() {

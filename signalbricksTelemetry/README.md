@@ -152,7 +152,7 @@ Under **Devices**, pick each device once: **Locks**, sensors, and the devices Si
 - **Lock and unlock the locks above**
 - **Control the devices above**
 
-Turning a feature on takes effect when you click **Done**: the app replaces its access token and registers it first. Turning one off takes effect at once, even before **Done**. The features are independent: lock and device control don't need door code management.
+Turning a feature on takes effect when you click **Done**: the app replaces its access token and registers it first. Turning one off takes effect at once, even before **Done**. The features are independent: lock and device control don't need door code management. After a Reconnect, lock and device control need a **Done** again.
 
 ### Manage door codes
 
@@ -185,13 +185,13 @@ Each command is logged on the hub (device and command) and reported to SignalBri
 
 ### Updating to 1.9.0
 
-Your selections carry over; no Done is needed for what was already on.
+Your selections carry over.
 
 - Every lock under **Locks** is now managed. The app shows a one-time note listing locks that newly became managed. Dismiss it, or it clears after the next **Done**.
 - If any lock had full control, **Full control above that slot** is on. SignalBricks still decides per lock.
 - Code-only devices such as keypads stay in their own list under **Devices** while it has any.
 - Pending code changes, approvals, slot rules and the fingerprint key are kept.
-- Lock and device control stay on if they were on. A control switch that never took effect (door code management was off) is turned off.
+- Lock and device control stay on if they were on. If a lock became managed, lock control is paused until you click **Done**, and the note says so. A control switch that never took effect (door code management was off) is turned off.
 
 ## Development
 
@@ -229,7 +229,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) before opening an issue or pull reques
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
 - **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** and sign in. Your settings can stay on.
 - **"Reconnect to SignalBricks to enable lock management"**: click **Reconnect to SignalBricks** and sign in; your settings can stay on. Telemetry keeps working meanwhile.
-- **Registration error** under What SignalBricks may do: check the hub is connected, then click **Rotate access token and re-register**.
+- **Registration error** under What SignalBricks may do: check the hub is connected, then click **Rotate access token and re-register** (shown while any feature is on).
 - **A code change failed**: check the lock is awake and in range of the hub, then retry from SignalBricks. `Code changes awaiting the lock` in the app shows how many are in progress or failed. Since 1.6.6, a change also counts as done when the lock shows its name in a different letter case.
 - **A lock's codes are unreadable**: see [Locks with encrypted codes](#locks-with-encrypted-codes).
 - Turn on **debug logging** to see each event as it is sent. Debug logging turns itself off after 30 minutes.

@@ -262,8 +262,10 @@ app.state.appInfos['388'].lastSeenAt = 1_793_311_200_000L
 app.posts.clear()
 app.lockManagementEnabled = true
 app.decrypted.clear()
+app.state.lockMgmtLastEnabled = true
 app.dailyCheckIn()
 app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
 check('daily: one report posted', reports().size() == 1)
 check('lockCodes: plain JSON never passed to decrypt()', app.decrypted && !app.decrypted.any { it.trim().startsWith('{') } && app.decrypted.every { it.startsWith('ENC:') || it == 'not json' })
 def post = reports()[0]
@@ -313,6 +315,10 @@ check('lock code management off: telemetry has no maxManagedSlot', reports().eve
 app.maxManagedSlot = '40'
 app.posts.clear(); app.dailyCheckIn()
 check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.0'] && validateReport(lastReport()).isEmpty())
+app.lockManagementEnabled = true
+app.posts.clear(); app.dailyCheckIn()
+check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.0'])
+app.lockManagementEnabled = false
 app.maxManagedSlot = '25'
 
 // lockCodes that parse to something other than an object: no count
