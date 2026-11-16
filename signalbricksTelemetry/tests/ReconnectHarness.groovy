@@ -18,8 +18,20 @@ abstract class HubitatStub extends Script {
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    def codeLocks = []
-    def locks = null, contactSensors = null, temperatureSensors = null, humiditySensors = null
+    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
+    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
+    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
+    // codeLocks setting reads as gone.
+    def lockList = null
+    List managedDevices = []
+    def managedLocks = null
+    def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
+    void setLocks(def v) { lockList = v }
+    def getCodeLocks() { null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    def contactSensors = null, temperatureSensors = null, humiditySensors = null
+    def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
+    Boolean lockControlEnabled = false, deviceControlEnabled = false
     Boolean lockManagementEnabled = true
     Boolean includeDoorCodes = false
     Boolean debugLogging = false
@@ -131,7 +143,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.7.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.7.0')
+check('version is 1.8.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.8.0')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -146,7 +158,7 @@ app.state.connectedAt = '2026-10-01 12:00'
 app.state.lockMgmtLastEnabled = true
 app.state.lockMgmtRegistered = true
 app.state.lockMgmtRegisteredAt = '2026-10-01 12:00'
-app.state.registeredVersion = '1.7.0'
+app.state.registeredVersion = '1.8.0'
 String KEY = ((1..32).collect { it as byte } as byte[]).encodeBase64().toString()
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], fingerprintKey: KEY, locks: ['7': [adopted: [40]]]]]
 check('setup: slot rules and fingerprint key accepted', app.apiSetLockConfig().status == 200 && app.state.fingerprintKey == KEY)
@@ -510,8 +522,8 @@ check('page: booking rule in any letter case, ORB starting a word, G:/GT:', app.
 // Select all / Clear buttons beside both lists (#66)
 app.codeLocks = [new FakeLock(id: '50', displayName: 'Sel', name: 'Sel', label: 'Sel')]
 String selPage = mainPage()
-check('page: Select all and Clear for both lists, the lists still shown', ['btnSelectAllCodeLocks', 'btnClearCodeLocks', 'btnSelectAllFullControl', 'btnClearFullControl'].every { app.inputs[it]?.type == 'button' } &&
-    app.inputs.codeLocks != null && app.inputs.fullControlLocks != null && selPage.contains('not added until you click it again'))
+check('page: Select all and Clear for both lists, the lists still shown', ['btnSelectAllManagedLocks', 'btnClearManagedLocks', 'btnSelectAllFullControl', 'btnClearFullControl'].every { app.inputs[it]?.type == 'button' } &&
+    app.inputs.managedLocks != null && app.inputs.fullControlLocks != null && selPage.contains('not added until you click it again'))
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

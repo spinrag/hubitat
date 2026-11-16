@@ -14,8 +14,20 @@ abstract class HubitatStub extends Script {
     Map settings = [:]
     Map params = [:]
     Map request = [:]
-    def codeLocks = []
-    def locks = null, contactSensors = null, temperatureSensors = null, humiditySensors = null
+    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
+    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
+    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
+    // codeLocks setting reads as gone.
+    def lockList = null
+    List managedDevices = []
+    def managedLocks = null
+    def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
+    void setLocks(def v) { lockList = v }
+    def getCodeLocks() { null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    def contactSensors = null, temperatureSensors = null, humiditySensors = null
+    def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
+    Boolean lockControlEnabled = false, deviceControlEnabled = false
     Boolean lockManagementEnabled = true
     Boolean includeDoorCodes = false
     Boolean debugLogging = false
@@ -459,7 +471,7 @@ app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.posts.clear()
 app.registerWithPlatform()
 def reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
-check('register: capabilities [relocate, registered_slots, full_control, code_in_use], version 1.7.0', reg.capabilities == ['relocate', 'registered_slots', 'full_control', 'code_in_use'] && reg.version == '1.7.0' && reg.lockManagement == true)
+check('register: capabilities [relocate, registered_slots, full_control, code_in_use, lock_control, device_control], version 1.8.0', reg.capabilities == ['relocate', 'registered_slots', 'full_control', 'code_in_use', 'lock_control', 'device_control'] && reg.version == '1.8.0' && reg.lockManagement == true)
 app.posts.clear()
 app.lockManagementEnabled = false
 app.state.lockMgmtRegistered = true
