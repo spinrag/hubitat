@@ -18,17 +18,16 @@ abstract class HubitatStub extends Script {
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -38,6 +37,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -143,7 +143,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.8.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.8.0')
+check('version is 1.9.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.0')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---
@@ -174,13 +174,13 @@ check('fpkey page: no key on the page', !fpPage.contains(KEY_NEW) && !fpPage.con
 app.appButtonHandler('btnRejectFpKey')
 check('fpkey page: gone after reject, held key kept', !mainPage().contains('asks to replace') && app.state.fingerprintKey == KEY)
 app.approvedAdoptedSlots = ['7:40']
-app.fullControlLocks = ['7']
+app.fullControlEnabled = true
 app.params = [lockId: '7']
 app.request = [JSON: [slot: 2, code: '12345678', name: 'SBA: Cleaner']]
 check('setup: a code change pending on the lock', app.apiSetCode().status == 202 && app.state.pendingCodeChanges?.size() == 1)
 // A pending change as Reconnect must leave it (Done re-times its next check, by design)
 def pendingNow = { (app.state.pendingCodeChanges ?: [:]).collectEntries { k, v -> [(k): v.findAll { kk, vv -> !(kk in ['check', 'checkAt']) }] } }
-def snapshot = { JsonOutput.toJson([app.state.lockConfig, app.state.fingerprintKey, pendingNow(), app.approvedAdoptedSlots, app.fullControlLocks, app.lockManagementEnabled, app.state.lockMgmtRegistered]) }
+def snapshot = { JsonOutput.toJson([app.state.lockConfig, app.state.fingerprintKey, pendingNow(), app.approvedAdoptedSlots, app.fullControlEnabled, app.lockManagementEnabled, app.state.lockMgmtRegistered]) }
 String keep = snapshot()
 def survived = { String when ->
     check("${when}: slot rules, fingerprint key, pending code change, approvals, full control and lock management unchanged",
@@ -196,7 +196,7 @@ check('page: one Reconnect link, to the app\'s own /reconnect, shown while lock 
     link().url == entryUrl() && !page.contains('/oauth/hubitat/authorize') && !app.inputs.btnReconnect)
 check('page: says what to do after a Hubitat error, and that an unused link can\'t be reused', link().description.contains('If you see a Hubitat error after signing in, click Reconnect again.') && page.contains("an unused link can't be reused"))
 check('page: no "turn lock code management off" instructions', !page.toLowerCase().contains('turn lock code management off') && !page.contains('first turn off'))
-check('page: says the link works for 10 minutes and lock management stays on', page.contains('works for 10 minutes') && page.contains('Lock code management stays on'))
+check('page: says the link works for 10 minutes and settings stay', page.contains('works for 10 minutes') && page.contains('Your settings stay'))
 check('page: the token is only in the Reconnect URL, never in text', !pageText().contains(app.state.accessToken))
 5.times { mainPage() }
 check('page: viewing the page opens no window, schedules nothing and changes no token', app.state.connectLink == null && !expiryJob() && registers().isEmpty() && app.state.accessToken == tokens[0])
@@ -371,7 +371,7 @@ app.scheduled.removeAll { it.handler == 'registerRetryRun' }
 app.registerRetryRun()
 app.registerCallback(new FakeResp(status: 403, body: '{"error":"Forbidden","code":"TOKEN_NOT_BOUND_TO_APP"}'), [enabled: true])
 check('register failure: reconnect required is not retried', !retryJob() && !app.state.registerRetry && app.state.lockMgmtReconnectRequired == true)
-check('reconnect required: the page points at Reconnect', mainPage().contains('click Reconnect to SignalBricks above') && link())
+check('reconnect required: the page points at Reconnect', mainPage().contains('click Reconnect to SignalBricks') && link())
 app.state.remove('lockMgmtReconnectRequired')
 // A retry with nothing left to send (disconnected meanwhile) clears itself
 app.registerWithPlatform()
@@ -406,42 +406,42 @@ app.clearConnectLink()
 // --- signalbricks/platform#699 P1: the sign-in link reports held lock state ---
 def lockStateParam = { String url -> url.split('\\?', 2)[1].split('&').any { it == 'lock_state=1' } }
 check('lock state held: the sign-in link carries lock_state=1', lockStateParam(app.connectUrl()) && again.contains('&amp;lock_state=1&amp;'))
-Map held = [lockConfig: app.state.lockConfig, fingerprintKey: app.state.fingerprintKey, approved: app.approvedAdoptedSlots, full: app.fullControlLocks]
+Map held = [lockConfig: app.state.lockConfig, fingerprintKey: app.state.fingerprintKey, approved: app.approvedAdoptedSlots, full: app.fullControlEnabled]
 def onlyHolding = { String which ->
     app.state.lockConfig = which == 'lockConfig' ? held.lockConfig : null
     app.state.fingerprintKey = which == 'fingerprintKey' ? held.fingerprintKey : null
     app.approvedAdoptedSlots = which == 'approved' ? held.approved : null
-    app.fullControlLocks = which == 'full' ? held.full : null
+    app.fullControlEnabled = which == 'full' ? held.full : null
     lockStateParam(app.connectUrl())
 }
 check('lock state: any one of slot rules, fingerprint key, approvals or full control is enough', ['lockConfig', 'fingerprintKey', 'approved', 'full'].every { onlyHolding(it) })
 check('lock state: none held (lock management on but nothing received yet), no lock_state', !onlyHolding('none'))
-app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlEnabled = held.full
 // Turning lock code management off wipes it on the hub even when SignalBricks can't be reached
 app.throwOnPost = true
 app.logged.clear()
 app.lockManagementEnabled = false
 String offPage = mainPage()
 track()
-check('off with SignalBricks unreachable: the page still renders', offPage.contains('Enable lock code management'))
+check('off with SignalBricks unreachable: the page still renders', offPage.contains('Manage door codes'))
 check('off with SignalBricks unreachable: slot rules, fingerprint key, approvals and full control wiped', app.state.lockConfig == null && app.state.fingerprintKey == null &&
-    app.approvedAdoptedSlots == null && app.fullControlLocks == null && !app.holdsLockState() && (app.state.pendingCodeChanges ?: [:]).isEmpty())
+    app.approvedAdoptedSlots == null && app.fullControlEnabled == null && !app.holdsLockState() && (app.state.pendingCodeChanges ?: [:]).isEmpty())
 check('off with SignalBricks unreachable: the next sign-in link has no lock_state', !lockStateParam(app.connectUrl()))
-check('off with SignalBricks unreachable: failures logged by class only', app.logged.any { it.contains('registering lock code management off failed (IllegalStateException)') } &&
+check('off with SignalBricks unreachable: failures logged by class only', app.logged.any { it.contains('registering the change failed (IllegalStateException)') } &&
     app.logged.any { it.contains('reporting abandoned code changes failed (IllegalStateException)') } && !app.logged.any { it.contains('13572468') })
 app.throwOnPost = false
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(true)
 track()
 app.removedSettings.clear()
 
 // --- platform#699 K2: management off with lock state left over: wiped, no lock_state ---
 app.lockManagementEnabled = false
-app.syncLockManagementEnabled()
+app.syncFeatures(false)
 track()
 app.state.lockConfig = held.lockConfig
-app.fullControlLocks = held.full
-check('leftover: setup holds lock state with management off', app.holdsLockState() && app.state.lockMgmtLastEnabled == false)
+app.fullControlEnabled = held.full
+check('leftover: setup holds lock state with management off', app.holdsLockState() && !app.state.lockMgmtLastEnabled)
 mainPage()
 check('leftover: rendering the app page wipes it, so the sign-in link has no lock_state', !app.holdsLockState() && !lockStateParam(app.connectUrl()))
 app.state.fingerprintKey = held.fingerprintKey
@@ -450,9 +450,9 @@ app.updated()
 track()
 check('leftover: Done wipes it too', !app.holdsLockState())
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(true)
 track()
-app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlEnabled = held.full
 mainPage()
 check('management on: lock state kept and reported', app.holdsLockState() && lockStateParam(app.connectUrl()))
 app.removedSettings.clear()
@@ -474,11 +474,11 @@ app.state.lockMgmtRegistered = true
 // --- Turning lock code management on or off rotates the token: an open window is closed ---
 app.apiReconnect()
 app.lockManagementEnabled = false
-app.syncLockManagementEnabled()
+app.syncFeatures(false)
 check('lock management off: an open Reconnect window is closed (its token was rotated)', app.state.connectLink == null && !expiryJob())
 app.apiReconnect()
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(true)
 check('lock management on: an open Reconnect window is closed too', app.state.connectLink == null && !expiryJob())
 track()
 app.removedSettings.clear()
@@ -487,7 +487,7 @@ app.removedSettings.clear()
 // platform#699 K1: with SignalBricks unreachable (every post throws), Disconnect still
 // rotates the token and wipes the lock state
 app.apiReconnect()
-app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlLocks = held.full
+app.state.lockConfig = held.lockConfig; app.state.fingerprintKey = held.fingerprintKey; app.approvedAdoptedSlots = held.approved; app.fullControlEnabled = held.full
 app.state.pendingCodeChanges = ['7:2': [status: 'pending', lockId: '7', slot: 2, action: 'set', attempts: 1, name: 'SBA: Cleaner', createdAt: app.clock,
     requestId: '00000000-0000-4000-8000-000000000001']]
 String beforeDisconnect = app.state.accessToken
@@ -516,14 +516,13 @@ check('logs: the link was logged as opened, without a token', app.logged.any { i
 app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
 String rulePage = mainPage()
-check('page: booking rule in any letter case, ORB starting a word, G:/GT:', app.paragraphs.findAll { it.contains('starting a word, or starting with <code>G:</code> or <code>GT:</code>') }.size() >= 1 &&
-    rulePage.contains('followed by a digit in any letter case'))
+check('page: booking rule in any letter case, ORB starting a word, G:/GT:', app.paragraphs.any { it.contains('<code>ORB</code> and a digit in any case, <code>ORB</code> starting a word, or <code>G:</code> or <code>GT:</code> first') })
 
-// Select all / Clear buttons beside both lists (#66)
+// One Locks list, one full control switch (#82)
 app.codeLocks = [new FakeLock(id: '50', displayName: 'Sel', name: 'Sel', label: 'Sel')]
-String selPage = mainPage()
-check('page: Select all and Clear for both lists, the lists still shown', ['btnSelectAllManagedLocks', 'btnClearManagedLocks', 'btnSelectAllFullControl', 'btnClearFullControl'].every { app.inputs[it]?.type == 'button' } &&
-    app.inputs.managedLocks != null && app.inputs.fullControlLocks != null && selPage.contains('not added until you click it again'))
+mainPage()
+check('page: no managed-lock or full-control lists, no Select all or Clear', !['managedLocks', 'fullControlLocks', 'btnSelectAllManagedLocks', 'btnClearManagedLocks',
+    'btnSelectAllFullControl', 'btnClearFullControl'].any { app.inputs.containsKey(it) } && app.inputs.fullControlEnabled?.type == 'bool')
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

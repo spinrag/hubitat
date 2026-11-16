@@ -10,17 +10,16 @@ abstract class HubitatStub extends Script {
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -32,6 +31,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -165,7 +165,7 @@ def lockOff = new FakeLock(id: '20', displayName: 'IuOff', name: 'IuOff', label:
 lockOff.attrs.lockCodes = groovy.json.JsonOutput.toJson(['1': [name: 'SBA: Owner', code: '12340001']])
 List codes = ['12340001', '55550003', '12340012', '55550026', '55550030', '55550031', '55550040', '55550041', '99990012']
 app.codeLocks = [lockA, lockB, lockC]
-app.locks = [lockA, lockB, lockC, lockOff]
+app.locks = [lockA, lockB, lockC]
 app.state.sbToken = 'ingest-fake'
 app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.state.lockMgmtLastEnabled = true
@@ -218,7 +218,7 @@ check('lock without codes -> false', body(inUse('12', fpOf('12340001'))).inUse =
 app.request = [JSON: 'not an object']; app.params = [lockId: '10']; app.state.codeInUseTimes = []; app.state.codeInUseLockTimes = [:]; app.state.codeInUseLockDaily = [:]
 check('body not an object -> 400', body(call('apiCodeInUse')).error == 'invalid_fingerprint')
 check('unknown lock -> 404', body(inUse('999', fpOf('12340001'))) == [error: 'lock_not_found'])
-check('lock not selected for code management -> 404', inUse('20', fpOf('12340001')).status == 404)
+check('lock not selected -> 404', inUse('20', fpOf('12340001')).status == 404)
 String saved = lockA.attrs.lockCodes
 lockA.attrs.lockCodes = 'ENCRYPTEDBLOB'
 def unread = inUse('10', fpOf('12340001'))
@@ -289,10 +289,10 @@ app.state.codeInUseTimes = [app.now()]; app.state.codeInUseLockTimes = ['10': [a
 app.lockManagementEnabled = false
 app.params = [lockId: '10']; app.request = [JSON: [fingerprint: fpOf('12340001')]]
 check('lock management off -> 404', call('apiCodeInUse').status == 404)
-app.syncLockManagementEnabled()
+app.syncFeatures(false)
 check('limits and key cleared on disable', app.state.codeInUseTimes == null && app.state.codeInUseLockTimes == null && app.state.codeInUseLockDaily == null && app.state.fingerprintKey == null)
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(true)
 app.request = [JSON: [admin: [from: 1, to: 10], managed: [from: 11, to: 25], locks: ['10': [:]]]]
 call('apiSetLockConfig')
 check('after re-enable -> 409 fingerprint_key_missing', body(inUse('10', fpOf('12340001'))).error == 'fingerprint_key_missing')
