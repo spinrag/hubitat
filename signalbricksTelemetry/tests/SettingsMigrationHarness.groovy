@@ -62,12 +62,23 @@ class FakeApp {
     def owner
     def id = 42
     FakeApp(o) { owner = o }
-    void removeSetting(String n) { owner.removedSettings << n; owner.setProperty(n, null) }
+    // Hubitat may not show a setting written in a run until the run ends: when
+    // set, writes of these kinds are held until flush()
+    Set deferred = [] as Set
+    List held = []
+    void removeSetting(String n) {
+        owner.removedSettings << n
+        def hub = owner
+        if ('remove' in deferred) held << { hub.setProperty(n, null) } else hub.setProperty(n, null)
+    }
     void updateSetting(String n, Map v) {
         owner.updatedSettings << [name: n, type: v.type, value: v.value]
         Map devs = owner.devices
-        owner.setProperty(n, v.type?.startsWith('capability.') ? v.value.collect { devs[it] } : v.value)
+        def value = v.type?.startsWith('capability.') ? v.value.collect { devs[it] } : v.value
+        def hub = owner
+        if ('update' in deferred) held << { hub.setProperty(n, value) } else hub.setProperty(n, value)
     }
+    void flush() { held.each { it() }; held.clear() }
 }
 
 class FakeLock {
@@ -148,6 +159,20 @@ app.dailyCheckIn()
 check('migration runs once', app.updatedSettings.size() == writes && app.removedSettings.count { it == 'codeLocks' } == 1 && app.logged.count { it.contains('moved to Devices') } == 1)
 check('Done after migration: held change kept, lock code management still registered on', app.state.pendingCodeChanges.containsKey('103:12') &&
     new JsonSlurper().parseText(app.posts.findAll { it.cb == 'registerCallback' }[-1].params.body).lockManagement == true)
+
+// Migration and Done in one run, with settings written in the run not yet
+// readable (updates, or updates and removals): every tick survives
+[['update'], ['update', 'remove']].each { kinds ->
+    def hub = oldHub()
+    hub.app.deferred = kinds as Set
+    hub.updated()
+    hub.app.flush()
+    hub.app.deferred = [] as Set
+    check("Done with ${kinds} held to the end of the run: migrated, managed and full-control ticks kept", migrated(hub) && hub.fullControlLocks == ['101'] &&
+        !hub.removedSettings.contains('fullControlLocks') && !hub.removedSettings.contains('managedLocks'))
+    hub.updated()
+    check("next Done (${kinds}): ticks still kept", hub.managedLocks == ['101', '103'] && hub.fullControlLocks == ['101'] && hub.findCodeLock('103') != null)
+}
 
 // Done migrates
 app = oldHub()

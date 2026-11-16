@@ -502,8 +502,8 @@ void installed() {
 
 void updated() {
     logDebug 'updated'
-    migrateDeviceSettings()
-    pruneLockSelections()
+    // Settings just written may not read back in the same run: prune on the next Done
+    if (!migrateDeviceSettings()) pruneLockSelections()
     initialize()
     Boolean disabled = syncLockManagementEnabled()
     syncControlToggles(true)
@@ -640,13 +640,14 @@ def findControlLock(lockId) {
 // 1.8.0: the locks picked for lock code management join Locks and become the
 // managed locks, so nobody has to pick them again. Code-only devices (keypads)
 // can't be Locks: they stay in codeLocks, shown under Devices until cleared.
-// Runs on Done, on opening the app and at the daily check-in.
-void migrateDeviceSettings() {
+// Runs on Done, on opening the app and at the daily check-in. Returns whether
+// it wrote any setting.
+Boolean migrateDeviceSettings() {
     def legacy = codeLocks
-    if (legacy == null) return
+    if (legacy == null) return false
     List lockable = (legacy ?: []).findAll { it.hasCapability('Lock') }
     List codeOnly = (legacy ?: []).findAll { !it.hasCapability('Lock') }
-    if (legacy && !lockable) return
+    if (legacy && !lockable) return false
     List legacyIds = lockable.collect { it.id.toString() }
     if (legacyIds) {
         List lockIds = (locks ?: []).collect { it.id.toString() }
@@ -657,6 +658,7 @@ void migrateDeviceSettings() {
     if (codeOnly) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: codeOnly.collect { it.id.toString() }])
     else app.removeSetting('codeLocks')
     if (legacyIds) log.info "SignalBricks Telemetry: ${legacyIds.size()} lock(s) selected for lock code management moved to Devices as managed locks"
+    return true
 }
 
 // On Done: managed and full-control locks no longer selected are dropped, so a
