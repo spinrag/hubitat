@@ -435,6 +435,12 @@ app.paragraphs.clear(); app.mainPage()
 check('code management off: code endpoints 404', call('apiListLocks').status == 404 && call('apiSetCode', [lockId: '10'], [slot: 3, code: '13572468', name: 'SBA: Test']).status == 404)
 check('code management off: lock and device control still on', call('apiUnlock', [lockId: '10']).status == 202 && call('apiListDevices').status == 200)
 check('code management off: token kept', app.state.accessToken == tokenKept)
+// A switch read off (e.g. before the page runs) closes its endpoints even while its state says on
+app.deviceControlEnabled = false
+app.lockControlEnabled = false
+check('switch off, state still on: 404', call('apiListDevices').status == 404 && call('apiUnlock', [lockId: '10']).status == 404 && app.state.deviceControlOn == true)
+app.deviceControlEnabled = true
+app.lockControlEnabled = true
 reg = registers()[-1]
 check('code management off: registered with control only', reg.lockManagement == true && reg.codeManagement == false && reg.lockControl == true &&
     reg.deviceControl == true && reg.appAccessToken == tokenKept)
