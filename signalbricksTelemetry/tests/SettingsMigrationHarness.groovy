@@ -70,6 +70,8 @@ class FakeApp {
     List held = []
     // The run stops (e.g. the hub restarts) at the nth setting write from now
     int failAt = 0
+    // Writes to these settings never read back
+    Set ignored = [] as Set
     void write(String kind, Closure c) {
         if (failAt > 0 && --failAt == 0) throw new IllegalStateException('run interrupted')
         if (kind in deferred) held << c else c()
@@ -79,6 +81,7 @@ class FakeApp {
         write('remove') { hub.removedSettings << n; hub.setProperty(n, null) }
     }
     void updateSetting(String n, Map v) {
+        if (n in ignored) return
         Map devs = owner.devices
         // A device no longer on the hub is left out, as the hub does
         def value = v.type?.startsWith('capability.') ? v.value.collect { devs[it] }.findAll { it != null } : v.value
@@ -438,11 +441,51 @@ check('removed lock: update not finished yet, page says so', app.state.settingsM
     !stuck.contains('Click Done to turn it on'))
 app.updated()
 check('removed lock: Done meanwhile turns nothing on', app.state.lockControlOn == null)
-(1..3).each { page(app) }
-check('removed lock: finished after a bounded number of runs', app.state.settingsMigration == [done: true] && app.codeLocks == null &&
+(1..10).each { page(app) }
+check('removed lock: opening the page does not count toward giving up', app.state.settingsMigration?.done != true)
+(1..4).each { app.dailyCheckIn() }
+check('removed lock: finished after a bounded number of Done and check-in runs', app.state.settingsMigration == [done: true] &&
     ids(app.locks) == ['101', '102'] && app.logged.any { it.contains('settings update finished without every setting reading back') })
+check('removed lock: the earlier list is left as it was', ids(app.codeLocks) == ['101'])
 app.updated()
 check('removed lock: the next Done turns lock control on', app.state.lockControlOn == true)
+
+// --- Forced finish: a lock that never reached Locks stays managed through the earlier list ---
+app = hub17()
+app.app.ignored = ['locks'] as Set
+page(app)
+(1..5).each { app.dailyCheckIn() }
+check('forced finish, Locks never written: done, earlier list kept', app.state.settingsMigration == [done: true] && ids(app.codeLocks) == ['101', '103'] &&
+    ids(app.locks) == ['101', '102'])
+check('forced finish, Locks never written: the lock stays managed, its pending change kept', app.findCodeLock('103') != null && keptState(app) &&
+    app.fullControlAllowedIds() == ['101', '102', '103'])
+page(app)
+check('forced finish, Locks never written: the list shows under Devices', app.inputs.codeLocks?.type == 'capability.lockCodes')
+
+// --- Forced finish: a control switch that never took effect stays off ---
+app = hub18()
+app.lockManagementEnabled = false
+app.state.remove('lockMgmtLastEnabled')
+app.state.remove('lockControlOn')
+app.fullControlLocks = null
+app.state.remove('lockConfig'); app.state.remove('fingerprintKey'); app.approvedAdoptedSlots = null
+app.app.ignored = ['lockControlEnabled'] as Set
+page(app)
+check('control switch off never reads back: update still in progress', app.lockControlEnabled == true && app.state.settingsMigration?.done != true)
+(1..5).each { app.updated() }
+check('forced finish: done, the switch held off', app.state.settingsMigration == [done: true] && app.state.controlHeldOff == ['lockControlEnabled'] &&
+    app.state.lockControlOn == null)
+app.updated()
+app.params = [lockId: '101']
+check('forced finish: Done does not turn lock control on', app.state.lockControlOn == null && app.apiUnlock().status == 404 && app.endpointOn() == false)
+String held = page(app)
+check('forced finish: the page says so and does not ask for Done', held.contains('Lock and unlock: off after the update.') && !held.contains('Click Done to turn it on'))
+app.lockControlEnabled = false
+page(app)
+check('switched off: no longer held', app.state.controlHeldOff == null && !app.paragraphs.any { it.contains('off after the update') })
+app.lockControlEnabled = true
+app.updated()
+check('switched on again: Done turns it on', app.state.lockControlOn == true && app.apiUnlock().status == 202)
 
 // --- Keypads (code-only devices) keep their list, shown while it has any ---
 app = hub17()

@@ -415,6 +415,10 @@ Map mainPage() {
                 paragraph note
                 input(name: 'btnDismissSettingsNote', type: 'button', title: 'Dismiss')
             }
+            List heldOff = controlHeldOff()
+            if (heldOff) {
+                paragraph "<b>${heldOff.collect { it == 'lockControlEnabled' ? 'Lock and unlock' : 'Control the devices above' }.join(' and ')}: off after the update.</b> Switch it off, then on, and click Done to use it."
+            }
             paragraph '<small>Each is off by default and starts when you click Done. Every command is logged here and reported to SignalBricks.</small>'
             input(name: 'lockManagementEnabled', type: 'bool', title: 'Manage door codes on the locks above', defaultValue: false, submitOnChange: true)
             if (lockManagementEnabled) {
@@ -495,7 +499,7 @@ void updated() {
     logDebug 'updated'
     // Nothing turns on until the settings migration is done: settings it
     // wrote may not read back in the same run
-    Boolean migrating = migrateSettings() || atomicState.settingsMigration?.done != true
+    Boolean migrating = migrateSettings(true) || atomicState.settingsMigration?.done != true
     if (!migrating) atomicState.remove('settingsNote')
     initialize()
     // Re-register on every save, so turning features on and app upgrades reach
@@ -516,9 +520,10 @@ Boolean syncFeatures(Boolean applyOn) {
     Boolean wasOn = endpointOn()
     Boolean rotate = false
     Boolean turnedOff = false
+    List held = controlHeldOff()
     [[on: lockManagementEnabled, key: 'lockMgmtLastEnabled', label: 'door code management', times: CODE_LIMIT_KEYS],
-     [on: lockControlEnabled, key: 'lockControlOn', label: 'lock control', times: ['lockCommandTimes', 'lockCommandLockTimes']],
-     [on: deviceControlEnabled, key: 'deviceControlOn', label: 'device control', times: ['deviceCommandTimes', 'deviceCommandDeviceTimes']]].each { Map f ->
+     [on: lockControlEnabled && !('lockControlEnabled' in held), key: 'lockControlOn', label: 'lock control', times: ['lockCommandTimes', 'lockCommandLockTimes']],
+     [on: deviceControlEnabled && !('deviceControlEnabled' in held), key: 'deviceControlOn', label: 'device control', times: ['deviceCommandTimes', 'deviceCommandDeviceTimes']]].each { Map f ->
         Boolean wanted = f.on == true
         if (!wanted && state[f.key]) {
             state.remove(f.key)
@@ -579,8 +584,22 @@ Boolean endpointOn() {
 
 // A feature ticked that takes effect on the next Done
 Boolean featuresAwaitingDone() {
-    return (lockManagementEnabled == true && !state.lockMgmtLastEnabled) || (lockControlEnabled == true && !state.lockControlOn) ||
-        (deviceControlEnabled == true && !state.deviceControlOn)
+    List held = controlHeldOff()
+    return (lockManagementEnabled == true && !state.lockMgmtLastEnabled) || (lockControlEnabled == true && !state.lockControlOn && !('lockControlEnabled' in held)) ||
+        (deviceControlEnabled == true && !state.deviceControlOn && !('deviceControlEnabled' in held))
+}
+
+// Control switches the settings update turned off but that still read on:
+// held off until switched off. Dropped from the list once they read off.
+List controlHeldOff() {
+    List held = (atomicState.controlHeldOff ?: []) as List
+    if (!held) return []
+    List still = held.findAll { (it == 'lockControlEnabled' ? lockControlEnabled : deviceControlEnabled) == true }
+    if (still.size() != held.size()) {
+        if (still) atomicState.controlHeldOff = still
+        else atomicState.remove('controlHeldOff')
+    }
+    return still
 }
 
 // --- Devices ---
@@ -635,7 +654,7 @@ def findControlLock(lockId) {
 // not read back in that run), so it is safe to interrupt. Pending code
 // changes, approvals, slot rules and the fingerprint key are kept. Returns
 // whether it started in this call.
-Boolean migrateSettings() {
+Boolean migrateSettings(Boolean countRun = false) {
     Map m = atomicState.settingsMigration
     if (m?.done) return false
     Boolean started = false
@@ -675,20 +694,21 @@ Boolean migrateSettings() {
                 log.warn "SignalBricks Telemetry: registering the change failed (${e.class.simpleName})"
             }
         }
-    } else {
+    } else if (countRun) {
         m.runs = ((m.runs ?: 0) as int) + 1
         atomicState.settingsMigration = m
     }
-    // Gives up waiting for the new settings to read back
-    Boolean force = (m.runs as int) >= MIGRATION_MAX_RUNS
+    // Gives up waiting for the new settings to read back (Done and daily check-in runs only)
+    Boolean force = ((m.runs ?: 0) as int) >= MIGRATION_MAX_RUNS
     // Written (again) until it reads back
     if (m.add && deviceIds(locks) == m.locksBefore) app.updateSetting('locks', [type: 'capability.lock', value: (m.locksBefore + m.add).unique()])
     if (m.fullControl && fullControlEnabled == null) app.updateSetting('fullControlEnabled', [type: 'bool', value: true])
     if ('lockControlEnabled' in m.controlOff && lockControlEnabled == true) app.updateSetting('lockControlEnabled', [type: 'bool', value: false])
     if ('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true) app.updateSetting('deviceControlEnabled', [type: 'bool', value: false])
-    Boolean controlRead = force || (!('lockControlEnabled' in m.controlOff && lockControlEnabled == true) && !('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true))
-    Boolean locksRead = force || !m.add || deviceIds(locks) != m.locksBefore
-    Boolean fullRead = force || !m.fullControl || fullControlEnabled != null
+    List controlStillOn = m.controlOff.findAll { (it == 'lockControlEnabled' ? lockControlEnabled : deviceControlEnabled) == true }
+    Boolean controlRead = !controlStillOn
+    Boolean locksRead = !m.add || deviceIds(locks) != m.locksBefore
+    Boolean fullRead = !m.fullControl || fullControlEnabled != null
     if (managedLocks != null) app.removeSetting('managedLocks')
     if (fullRead && fullControlLocks != null) app.removeSetting('fullControlLocks')
     if (locksRead && legacyCodeLocks()) {
@@ -697,7 +717,17 @@ Boolean migrateSettings() {
         else app.removeSetting('codeLocks')
     }
     if (force || (locksRead && fullRead && controlRead && managedLocks == null && fullControlLocks == null && !legacyCodeLocks())) {
-        if (force) log.warn 'SignalBricks Telemetry: settings update finished without every setting reading back'
+        if (force) {
+            // The earlier lock lists stay (their locks stay managed and show
+            // under Devices). A control switch that never took effect stays
+            // off until it is switched off and on again.
+            log.warn 'SignalBricks Telemetry: settings update finished without every setting reading back'
+            if (controlStillOn) {
+                atomicState.controlHeldOff = controlStillOn
+                if ('lockControlEnabled' in controlStillOn) state.remove('lockControlOn')
+                if ('deviceControlEnabled' in controlStillOn) state.remove('deviceControlOn')
+            }
+        }
         atomicState.settingsMigration = [done: true]
     }
     return started
@@ -1430,7 +1460,7 @@ String checkInTime() {
 // daily hub report (#692) whether or not anything changed.
 void dailyCheckIn() {
     logDebug 'daily check-in'
-    migrateSettings()
+    migrateSettings(true)
     reregisterIfVersionChanged()
     ensureAppInfoSubscription()
     sendHubReport('daily')
