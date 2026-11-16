@@ -15,8 +15,8 @@
  * codes from Hubitat telemetry" policy is also on, and then only as a keyed
  * hash; otherwise it redacts it. Codes are still never logged.
  *
- * Optional "Lock code management" (off by default, signalbricks/platform#472):
- * when enabled, separately selected locks get access-token gated endpoints
+ * Optional "Manage door codes" (lock code management, off by default,
+ * signalbricks/platform#472): when enabled, the selected locks get access-token gated endpoints
  * that let SignalBricks list slots (never codes), set and delete codes and
  * reveal one code at a time. The hub enforces which slots may be touched:
  * admin/managed ranges and adopted slots come from SignalBricks (/lockConfig),
@@ -64,19 +64,21 @@
  * or a G:/GT: prefix, and unnamed slots, are never registered or touched.
  * Without these fields everything works exactly as before.
  *
- * Devices (#80): every device is picked once, under Devices. Lock code
- * management and lock control use the managed locks (`managedLocks`, ticked
- * from the Locks list); before 1.8.0 lock code management had its own lock
- * list (`codeLocks`), which migrateDeviceSettings folds into Locks (code-only
- * devices stay there).
+ * Devices (#80, #82): every device is picked once, under Devices, and every
+ * selected lock is managed. Full control above the ceiling is one switch
+ * (`fullControlEnabled`); SignalBricks still turns it on per lock. Earlier
+ * lists (`managedLocks`, `fullControlLocks`, and `codeLocks` before 1.8.0) are
+ * folded in once by migrateSettings; code-only devices (keypads) stay in
+ * `codeLocks`.
  *
- * Lock and device control (#80), each off by default and only while lock code
- * management is on: POST /locks/:id/lock|unlock|refresh and GET
- * /locks/:id/state on managed locks, and GET /devices and POST
- * /devices/:id/command on devices selected for control, with a fixed command
- * list per capability. Either takes effect on Done, which replaces the access
- * token first. Every command is logged (device and command only) and reported
- * as a `device_command` event.
+ * What SignalBricks may do (#82): manage door codes, lock and unlock, and
+ * control the selected devices, each off by default and independent of the
+ * others: POST /locks/:id/lock|unlock|refresh and GET /locks/:id/state on the
+ * selected locks, and GET /devices and POST /devices/:id/command on devices
+ * selected for control, with a fixed command list per capability. Each takes
+ * effect on Done, which replaces the access token first; the token is
+ * registered while any of them is on. Every command is logged (device and
+ * command only) and reported as a `device_command` event.
  *
  * Updates (#13): a daily check-in at a random per-hub time re-registers when
  * the version changed, since an HPM update doesn't run updated().
@@ -106,9 +108,9 @@
  * never runs longer than 10 minutes from the first click.
  *
  * While the app holds lock code management state (slot rules, fingerprint
- * key, approvals or full-control locks), the sign-in link says so
+ * key, approvals or full control), the sign-in link says so
  * (`lock_state=1`, signalbricks/platform#699), and SignalBricks only lets it
- * reconnect to the organization and hub it manages locks for. Turning lock
+ * reconnect to the organization and hub it manages locks for. Turning door
  * code management off wipes that state on the hub, whether or not
  * SignalBricks can be reached, so the hub can always be moved after that.
  *
@@ -124,7 +126,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.8.0'
+@Field static final String APP_VERSION = '1.9.0'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -172,6 +174,9 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int LOCK_COMMAND_LOCK_LIMIT_PER_MIN = 6
 @Field static final int DEVICE_COMMAND_LIMIT_PER_MIN = 30
 @Field static final int DEVICE_COMMAND_DEVICE_LIMIT_PER_MIN = 10
+// Rate-limit state of door code management, dropped when it is turned off
+@Field static final List<String> CODE_LIMIT_KEYS = ['revealTimes', 'retryTimes', 'writeTimes', 'fingerprintTimes', 'fingerprintBatchTimes',
+    'codeInUseTimes', 'codeInUseLockTimes', 'codeInUseLockDaily']
 // Device control: each selection input opts its devices in for these
 // capabilities (only those the device has), each with a fixed command list.
 @Field static final Map<String, List<String>> CONTROL_INPUTS = [
@@ -332,49 +337,88 @@ mappings {
 }
 
 Map mainPage() {
-    migrateDeviceSettings()
-    // Turning lock management or control off takes effect at once
-    // (submitOnChange), not only on Done.
-    syncLockManagementEnabled()
-    syncControlToggles(false)
+    migrateSettings()
+    // Turning a feature off takes effect at once (submitOnChange), not only on Done
+    syncFeatures(false)
     dynamicPage(name: 'mainPage', title: 'SignalBricks Telemetry', install: true, uninstall: true) {
         section() {
-            paragraph 'Sends device events to SignalBricks. Telemetry never sends lock codes (PINs). SignalBricks controls devices only when you turn on lock or device control below, and only the devices you select here.'
+            paragraph 'Sends device events to SignalBricks. Lock codes (PINs) are never sent. SignalBricks changes nothing on this hub unless you allow it below.'
         }
 
-        // Every device is picked here, once (#80)
+        // Every device is picked here, once
         section('<b>Devices</b>') {
-            input(name: 'locks', type: 'capability.lock', title: 'Locks (lock state, battery, last code name)', multiple: true, required: false, submitOnChange: true)
-            List lockList = locks ?: []
-            if (lockList) {
-                input(name: 'managedLocks', type: 'enum', title: 'Locks SignalBricks manages (lock code management and lock control)',
-                    options: lockList.collectEntries { [(it.id.toString()): escapeHtml(it.displayName?.toString())] }, multiple: true, required: false, submitOnChange: true)
-                input(name: 'btnSelectAllManagedLocks', type: 'button', title: 'Select all')
-                input(name: 'btnClearManagedLocks', type: 'button', title: 'Clear')
-                paragraph '<small>Lock code management and lock control only ever apply to the managed locks. Select all chooses every lock above; locks added later are not added until you click it again.</small>'
-            }
+            input(name: 'locks', type: 'capability.lock', title: 'Locks', multiple: true, required: false, submitOnChange: true)
             // Code-only devices (keypads) picked for lock code management before 1.8.0 stay here until cleared
             if (codeLocks) {
-                input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Code-only devices (keypads) SignalBricks manages codes on', multiple: true, required: false, submitOnChange: true)
+                input(name: 'codeLocks', type: 'capability.lockCodes', title: 'Keypads (from an earlier version)', multiple: true, required: false, submitOnChange: true)
             }
             input(name: 'contactSensors', type: 'capability.contactSensor', title: 'Contact sensors', multiple: true, required: false, submitOnChange: true)
             input(name: 'temperatureSensors', type: 'capability.temperatureMeasurement', title: 'Temperature sensors', multiple: true, required: false, submitOnChange: true)
             input(name: 'humiditySensors', type: 'capability.relativeHumidityMeasurement', title: 'Humidity sensors', multiple: true, required: false, submitOnChange: true)
-            paragraph '<b>Devices SignalBricks may control</b> (only while device control is on; their state is also sent as telemetry)'
-            input(name: 'controlSwitches', type: 'capability.switch', title: 'Switches, dimmers and outlets (on, off, level)', multiple: true, required: false, submitOnChange: true)
-            input(name: 'controlGarageDoors', type: 'capability.garageDoorControl', title: 'Garage doors (open, close)', multiple: true, required: false, submitOnChange: true)
-            input(name: 'controlDoors', type: 'capability.doorControl', title: 'Gates and other doors (open, close)', multiple: true, required: false, submitOnChange: true)
-            input(name: 'controlThermostats', type: 'capability.thermostat', title: 'Thermostats (mode, heating and cooling setpoints)', multiple: true, required: false, submitOnChange: true)
-            input(name: 'controlValves', type: 'capability.valve', title: 'Valves (open, close)', multiple: true, required: false, submitOnChange: true)
+            paragraph '<small>Devices SignalBricks may control (their state is also sent):</small>'
+            input(name: 'controlSwitches', type: 'capability.switch', title: 'Switches, dimmers and outlets', multiple: true, required: false, submitOnChange: true)
+            input(name: 'controlGarageDoors', type: 'capability.garageDoorControl', title: 'Garage doors', multiple: true, required: false, submitOnChange: true)
+            input(name: 'controlDoors', type: 'capability.doorControl', title: 'Gates and other doors', multiple: true, required: false, submitOnChange: true)
+            input(name: 'controlThermostats', type: 'capability.thermostat', title: 'Thermostats', multiple: true, required: false, submitOnChange: true)
+            input(name: 'controlValves', type: 'capability.valve', title: 'Valves', multiple: true, required: false, submitOnChange: true)
             List ignored = ignoredControlDevices()
             if (ignored) {
-                paragraph "<b>Locks are controlled under Lock control and are ignored here:</b> ${ignored.collect { escapeHtml(it.displayName?.toString()) }.join(', ')}"
+                paragraph "<b>Locks are ignored here</b> (use Lock and unlock): ${ignored.collect { escapeHtml(it.displayName?.toString()) }.join(', ')}"
             }
         }
 
-        section('<b>Door codes in telemetry (optional)</b>') {
-            paragraph 'Off by default: the code used to unlock a lock is removed before anything is sent; only its slot and name are. When on, the code of lock events is sent to SignalBricks, which keeps only a keyed hash of it, and only if an admin of your SignalBricks organization has also turned on <i>Hash door codes from Hubitat telemetry</i>. Otherwise SignalBricks removes it. Codes are never logged here, and lock code lists (<code>lockCodes</code>) are never sent: the daily hub report only counts the occupied slots.'
-            input(name: 'includeDoorCodes', type: 'bool', title: 'Include door codes (hashed by SignalBricks)', defaultValue: false, submitOnChange: true)
+        section('<b>What SignalBricks may do</b>') {
+            String note = settingsNoteText()
+            if (note) {
+                paragraph note
+                input(name: 'btnDismissSettingsNote', type: 'button', title: 'Dismiss')
+            }
+            paragraph '<small>Each is off by default and starts when you click Done. Every command is logged here and reported to SignalBricks.</small>'
+            input(name: 'lockManagementEnabled', type: 'bool', title: 'Manage door codes on the locks above', defaultValue: false, submitOnChange: true)
+            if (lockManagementEnabled) {
+                paragraph '<small>Only admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes, up to the slot below, plus codes you approve. Booking codes (names with <code>ORB</code> and a digit in any case, <code>ORB</code> starting a word, or <code>G:</code> or <code>GT:</code> first) are always refused. Codes are never logged.</small>'
+                input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may use (below the booking apps' first slot)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
+                input(name: 'fullControlEnabled', type: 'bool', title: 'Full control above that slot', defaultValue: false, submitOnChange: true)
+                paragraph '<small>Only codes SignalBricks registered, on locks it marks for full control. Never empty slots, booking codes or unnamed codes.</small>'
+                Map pending = pendingAdoptedOptions()
+                if (pending) {
+                    paragraph '<b>Codes above that slot SignalBricks asks to manage.</b> Approve only admin or managed codes you recognise.'
+                    input(name: 'approvedAdoptedSlots', type: 'enum', title: 'Approve these slots', options: pending, multiple: true, required: false, submitOnChange: true)
+                }
+                if (state.sbToken) {
+                    paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (code changes are refused until then)'}"
+                    if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set'}"
+                    Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
+                    if (fpPending) {
+                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}, key check <b>${fpPending.check}</b>). Approve only if SignalBricks shows the same key check. If not, reject it and rotate the access token."
+                        // The id ties the click to the request shown, so a newer request needs its own approval
+                        input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
+                        input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
+                    }
+                    Map changes = pendingCodeChanges()
+                    if (changes) {
+                        int failed = changes.values().count { it.status == 'failed' }
+                        paragraph "<b>Code changes awaiting the lock:</b> ${changes.size() - failed} in progress, ${failed} failed (SignalBricks can retry failed changes for 24 hours)"
+                    }
+                    input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
+                }
+            }
+            input(name: 'lockControlEnabled', type: 'bool', title: 'Lock and unlock the locks above', defaultValue: false, submitOnChange: true)
+            input(name: 'deviceControlEnabled', type: 'bool', title: 'Control the devices above', defaultValue: false, submitOnChange: true)
+            if (lockManagementEnabled || lockControlEnabled || deviceControlEnabled) {
+                if (!state.sbToken) {
+                    paragraph '<b>Connect to SignalBricks first.</b>'
+                } else if (state.lockMgmtReconnectRequired) {
+                    paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks)."
+                } else {
+                    if (featuresAwaitingDone()) {
+                        paragraph '<b>Click Done to turn it on.</b> The app replaces its access token first.'
+                    } else {
+                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                    }
+                    if (state.lockMgmtRegisterError) paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
+                }
+            }
         }
 
         section('<b>Connection</b>') {
@@ -393,21 +437,18 @@ Map mainPage() {
                 }
                 String retry = registerRetryStatus()
                 if (retry) paragraph retry
-                if (state.lockMgmtReconnectRequired) {
-                    paragraph "<b>Lock code management:</b> ${RECONNECT_MESSAGE}."
-                }
                 // The connect URL carries this app's access token in the OAuth
-                // state, and while lock management is on that token is the one
-                // SignalBricks holds for lock control. One click (#46): the link
-                // opens this app's /reconnect, which starts the 10-minute window
-                // and only then sends the browser to SignalBricks.
+                // state, and while a feature is on that token is the one
+                // SignalBricks holds. One click (#46): the link opens this app's
+                // /reconnect, which starts the 10-minute window and only then
+                // sends the browser to SignalBricks.
                 String until = connectLinkUntil()
                 href(name: 'hrefReconnect', title: 'Reconnect to SignalBricks', style: 'external', url: reconnectEntryUrl(),
                     description: (until ? "A sign-in started from here works until ${until} (hub time). " : '') +
                         'Sign in again in a new window. If you see a Hubitat error after signing in, click Reconnect again.')
-                paragraph '<small>The sign-in link works for 10 minutes. Whether you finish it or not, the app then replaces its access token and registers the new one, so an unused link can\'t be reused. Lock code management stays on, with its slot rules, approvals and pending code changes.</small>'
+                paragraph '<small>The sign-in link works for 10 minutes. Then the app replaces its access token, so an unused link can\'t be reused. Your settings stay.</small>'
                 input(name: 'btnDisconnect', type: 'button', title: 'Disconnect')
-                paragraph '<small>Disconnect stops sending immediately. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
+                paragraph '<small>Disconnect stops sending at once. To also revoke the token, remove it under Tokens in the SignalBricks portal.</small>'
             } else {
                 paragraph '<b>Status:</b> Not connected'
                 if (state.lastError) {
@@ -419,64 +460,9 @@ Map mainPage() {
             }
         }
 
-        section('<b>Lock code management (optional)</b>') {
-            paragraph 'Lets SignalBricks list code slots and manage admin (<code>SBA:</code>) and managed (<code>SBM:</code>) codes on the locks it manages (chosen under <b>Devices</b>). Off by default. SignalBricks can only touch slots up to the ceiling you set here, plus existing codes you approve below; booking codes (names with <code>ORB</code> followed by a digit in any letter case, <code>ORB</code> starting a word, or starting with <code>G:</code> or <code>GT:</code>) are always refused. Codes are never logged or sent as telemetry.'
-            input(name: 'lockManagementEnabled', type: 'bool', title: 'Enable lock code management', defaultValue: false, submitOnChange: true)
-            if (lockManagementEnabled) {
-                List managed = codeLockDevices()
-                if (!managed) paragraph '<b>No managed locks yet.</b> Choose them under <b>Devices</b> → <i>Locks SignalBricks manages</i>.'
-                input(name: 'maxManagedSlot', type: 'number', title: "Highest slot SignalBricks may manage (admin + managed codes; keep it below the booking apps' minimum code position)", range: "1..${MAX_SLOT}", defaultValue: DEFAULT_MAX_MANAGED_SLOT, required: true, submitOnChange: true)
-                if (managed) {
-                    paragraph '<b>Full lock control (optional).</b> On the locks chosen here, and only once SignalBricks also turns full control on for them, SignalBricks may reach codes above the ceiling that it registered by slot and name (codes an admin adopted in SignalBricks). It never writes into empty slots above the ceiling, and never touches booking codes (names with <code>ORB</code> followed by a digit in any letter case, <code>ORB</code> starting a word, or starting with <code>G:</code> or <code>GT:</code>) or codes without a name. Leave empty to keep everything above the ceiling behind the approvals below.'
-                    input(name: 'fullControlLocks', type: 'enum', title: 'Locks SignalBricks may fully control', options: managed.collectEntries { [(it.id.toString()): escapeHtml(it.displayName?.toString())] }, multiple: true, required: false, submitOnChange: true)
-                    input(name: 'btnSelectAllFullControl', type: 'button', title: 'Select all')
-                    input(name: 'btnClearFullControl', type: 'button', title: 'Clear')
-                    paragraph '<small>Select all chooses every lock above. Locks added later are not added until you click it again.</small>'
-                }
-                Map pending = pendingAdoptedOptions()
-                if (pending) {
-                    paragraph '<b>Existing codes above the ceiling that SignalBricks asks to manage.</b> Approve only codes you recognise as admin or managed codes; never booking codes.'
-                    input(name: 'approvedAdoptedSlots', type: 'enum', title: 'Approve these slots', options: pending, multiple: true, required: false, submitOnChange: true)
-                }
-                if (!state.sbToken) {
-                    paragraph '<b>Connect to SignalBricks first.</b> Lock code management registers with SignalBricks after Connect.'
-                } else {
-                    if (state.lockMgmtReconnectRequired) {
-                        paragraph "<b>Registration:</b> ${RECONNECT_MESSAGE} (click Reconnect to SignalBricks above)."
-                    } else {
-                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
-                    }
-                    if (state.lockMgmtRegisterError) {
-                        paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
-                    }
-                    paragraph "<b>Slot rules:</b> ${state.lockConfig ? 'set by SignalBricks' : 'not set yet (all code writes are refused until SignalBricks sends them)'}"
-                    if (state.lockConfig) paragraph "<b>Fingerprint key:</b> ${state.fingerprintKey ? 'set by SignalBricks' : 'not set (code fingerprints for onboarding are unavailable)'}"
-                    Map fpPending = state.fingerprintKeyPending instanceof Map ? state.fingerprintKeyPending : null
-                    if (fpPending) {
-                        paragraph "<b>SignalBricks asks to replace the fingerprint key</b> (requested ${fpPending.at}, key check <b>${fpPending.check}</b>). The current key stays in use until you approve. Approve only if SignalBricks shows the same key check for your organization. If not, reject it and rotate the access token below."
-                        // The id ties the click to the request shown, so a newer request needs its own approval
-                        input(name: "btnApproveFpKey_${fpPending.id}", type: 'button', title: 'Approve the new fingerprint key')
-                        input(name: 'btnRejectFpKey', type: 'button', title: 'Reject the new fingerprint key')
-                    }
-                    Map changes = pendingCodeChanges()
-                    if (changes) {
-                        int failed = changes.values().count { it.status == 'failed' }
-                        paragraph "<b>Code changes awaiting the lock:</b> ${changes.size() - failed} in progress, ${failed} failed (SignalBricks can retry failed changes for 24 hours)"
-                    }
-                    input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
-                }
-            }
-        }
-
-        section('<b>Lock and device control (optional)</b>') {
-            paragraph 'Lets SignalBricks lock, unlock and control the devices you select under <b>Devices</b>, without the Maker API. Off by default. Uses the lock code management connection, so lock code management must be on. Each command is logged here (device and command only) and reported to SignalBricks.'
-            input(name: 'lockControlEnabled', type: 'bool', title: 'Let SignalBricks lock and unlock the managed locks', defaultValue: false, submitOnChange: true)
-            input(name: 'deviceControlEnabled', type: 'bool', title: 'Let SignalBricks control the devices selected for control', defaultValue: false, submitOnChange: true)
-            if ((lockControlEnabled || deviceControlEnabled) && lockManagementEnabled != true) {
-                paragraph '<b>Turn on lock code management</b> above for lock or device control to take effect.'
-            } else if ((lockControlEnabled && !state.lockControlOn) || (deviceControlEnabled && !state.deviceControlOn)) {
-                paragraph '<b>Click Done</b> to turn it on. The app replaces its access token and registers the new one first.'
-            }
+        section('<b>Door codes in telemetry (optional)</b>') {
+            paragraph '<small>Off by default: the code used at a lock is removed before sending. When on, SignalBricks keeps only a keyed hash of it, and only if your organization also turned on <i>Hash door codes from Hubitat telemetry</i>. Codes are never logged, and code lists are never sent.</small>'
+            input(name: 'includeDoorCodes', type: 'bool', title: 'Include door codes (hashed by SignalBricks)', defaultValue: false, submitOnChange: true)
         }
 
         section('<b>Logging</b>') {
@@ -502,51 +488,76 @@ void installed() {
 
 void updated() {
     logDebug 'updated'
-    // Settings just written may not read back in the same run: prune on the next Done
-    if (!migrateDeviceSettings()) pruneLockSelections()
+    // A Done that starts the settings migration turns nothing on: settings it
+    // just wrote may not read back in the same run
+    Boolean migrating = migrateSettings()
+    if (!migrating) atomicState.remove('settingsNote')
     initialize()
-    Boolean disabled = syncLockManagementEnabled()
-    syncControlToggles(true)
-    if (!disabled) {
-        // Re-register on every save, so enabling and app upgrades reach the
-        // platform. Cheap: one request, only when connected and lock
-        // management is on or was registered.
-        registerWithPlatform()
-    }
+    // Re-register on every save, so turning features on and app upgrades reach
+    // the platform. Cheap: one request, only when connected and a feature is
+    // on or was registered.
+    if (!syncFeatures(!migrating)) registerWithPlatform()
     sendHubReport('updated')
 }
 
-// On an off -> on flip: rotate the access token before it is registered, so
-// an older token (e.g. from an abandoned Reconnect link) never becomes the
-// live lock token. On an on -> off flip: rotate it (the one SignalBricks holds
-// stops working), drop the slot rules and tell the platform. Returns true when
-// it just handled a disable (and so already registered).
-Boolean syncLockManagementEnabled() {
-    Boolean enabled = lockManagementEnabled == true
-    Boolean wasEnabled = state.lockMgmtLastEnabled == true
-    state.lockMgmtLastEnabled = enabled
-    if (!wasEnabled && enabled) {
-        log.info 'SignalBricks Telemetry: lock code management turned on; access token rotated'
+// --- What SignalBricks may do ---
+// Each feature has its setting and a state flag that says it took effect.
+// Turning one on takes effect on Done (applyOn), after the access token is
+// replaced, so a token handed out before (e.g. in a Reconnect link) can't use
+// it. Turning one off takes effect at once. The access token is registered
+// while any feature is on; turning the last one off replaces it and tells the
+// platform. Returns whether it registered.
+Boolean syncFeatures(Boolean applyOn) {
+    Boolean wasOn = endpointOn()
+    Boolean rotate = false
+    Boolean turnedOff = false
+    [[on: lockManagementEnabled, key: 'lockMgmtLastEnabled', label: 'door code management', times: CODE_LIMIT_KEYS],
+     [on: lockControlEnabled, key: 'lockControlOn', label: 'lock control', times: ['lockCommandTimes', 'lockCommandLockTimes']],
+     [on: deviceControlEnabled, key: 'deviceControlOn', label: 'device control', times: ['deviceCommandTimes', 'deviceCommandDeviceTimes']]].each { Map f ->
+        Boolean wanted = f.on == true
+        if (!wanted && state[f.key]) {
+            state.remove(f.key)
+            f.times.each { state.remove(it) }
+            turnedOff = true
+            log.info "SignalBricks Telemetry: ${f.label} turned off"
+            if (f.key == 'lockMgmtLastEnabled') stopCodeManagement()
+        } else if (wanted && !state[f.key] && applyOn) {
+            state[f.key] = true
+            rotate = true
+            log.info "SignalBricks Telemetry: ${f.label} turned on; access token rotated"
+        }
+    }
+    // Off, but lock state left from before (e.g. an older version's failed
+    // wipe): drop it, so the sign-in link doesn't send lock_state for a hub
+    // that manages no codes, and a later enable can't revive another
+    // organization's slot rules (platform#699).
+    if (lockManagementEnabled != true && !state.lockMgmtLastEnabled && holdsLockState()) {
+        log.info 'SignalBricks Telemetry: leftover door code management state cleared (it is off)'
+        wipeLockState()
+    }
+    if (wasOn && !endpointOn()) {
+        // Everything off: the token SignalBricks holds stops working
+        log.info 'SignalBricks Telemetry: everything SignalBricks may do is off; access token rotated'
+        rotate = true
+    }
+    if (rotate) {
         // An open Reconnect window carried the old token, so it is dead now (#46)
         clearConnectLink()
         createAccessToken()
-        return false
     }
-    if (!wasEnabled || enabled) {
-        // Off, but lock state left from before (e.g. an older version's failed
-        // wipe): drop it, so the sign-in link doesn't send lock_state for a hub
-        // that manages no locks, and a later enable can't revive another
-        // organization's slot rules (platform#699).
-        if (!enabled && holdsLockState()) {
-            log.info 'SignalBricks Telemetry: leftover lock code management state cleared (lock code management is off)'
-            wipeLockState()
-        }
-        return false
+    if (!turnedOff) return false
+    try {
+        registerWithPlatform()
+    } catch (Exception e) {
+        // Only the class name: the request body carries the access token.
+        log.warn "SignalBricks Telemetry: registering the change failed (${e.class.simpleName})"
     }
-    log.info 'SignalBricks Telemetry: lock code management turned off; access token rotated'
-    clearConnectLink()
-    // Reporting the abandoned changes may reach SignalBricks; the wipe below
-    // must happen even when it, or the registration, fails (platform#699).
+    return true
+}
+
+// Door code management turned off: pending changes are dropped and its state
+// wiped, whether or not SignalBricks can be reached (platform#699).
+void stopCodeManagement() {
     try {
         abandonPendingCodeChanges('lock_management_disabled')
     } catch (Exception e) {
@@ -554,59 +565,21 @@ Boolean syncLockManagementEnabled() {
         log.warn "SignalBricks Telemetry: reporting abandoned code changes failed (${e.class.simpleName})"
     }
     wipeLockState()
-    state.remove('revealTimes')
-    state.remove('retryTimes')
-    state.remove('writeTimes')
-    state.remove('fingerprintTimes')
-    state.remove('fingerprintBatchTimes')
-    state.remove('codeInUseTimes')
-    state.remove('codeInUseLockTimes')
-    state.remove('codeInUseLockDaily')
-    state.remove('lockCommandTimes')
-    state.remove('lockCommandLockTimes')
-    state.remove('deviceCommandTimes')
-    state.remove('deviceCommandDeviceTimes')
-    // Control needs a Done again after lock code management is back on
-    state.remove('lockControlOn')
-    state.remove('deviceControlOn')
-    createAccessToken()
-    try {
-        registerWithPlatform(false)
-    } catch (Exception e) {
-        // Only the class name: the request body carries the access token.
-        log.warn "SignalBricks Telemetry: registering lock code management off failed (${e.class.simpleName})"
-    }
-    return true
 }
 
-// Lock and device control (#80) take effect on Done (applyOn), after the access
-// token is replaced, so a token handed out before (e.g. in a Reconnect link)
-// can't use them. Turning either off, or lock code management off, takes
-// effect at once. Returns whether it replaced the token.
-Boolean syncControlToggles(Boolean applyOn) {
-    Boolean rotate = false
-    [[on: lockControlEnabled, key: 'lockControlOn', label: 'lock control'],
-     [on: deviceControlEnabled, key: 'deviceControlOn', label: 'device control']].each { Map c ->
-        Boolean wanted = c.on == true && lockManagementEnabled == true
-        if (!wanted && state[c.key]) {
-            state.remove(c.key)
-            log.info "SignalBricks Telemetry: ${c.label} turned off"
-        } else if (wanted && !state[c.key] && applyOn) {
-            state[c.key] = true
-            rotate = true
-            log.info "SignalBricks Telemetry: ${c.label} turned on; access token rotated"
-        }
-    }
-    if (rotate) {
-        clearConnectLink()
-        createAccessToken()
-    }
-    return rotate
+// Whether SignalBricks holds (or may hold) this app's access token: some feature took effect
+Boolean endpointOn() {
+    return state.lockMgmtLastEnabled == true || state.lockControlOn == true || state.deviceControlOn == true
 }
 
-// --- Devices (#80) ---
-// Locks are picked once, under Devices; the managed locks are ticked from
-// them. Before 1.8.0 lock code management had its own list (codeLocks).
+// A feature ticked that takes effect on the next Done
+Boolean featuresAwaitingDone() {
+    return (lockManagementEnabled == true && !state.lockMgmtLastEnabled) || (lockControlEnabled == true && !state.lockControlOn) ||
+        (deviceControlEnabled == true && !state.deviceControlOn)
+}
+
+// --- Devices ---
+// Every device is picked once, under Devices. Every selected lock is managed.
 
 // The ids in a multiple enum setting
 List settingIds(def v) {
@@ -614,20 +587,30 @@ List settingIds(def v) {
     return (v instanceof Collection ? v : [v]).collect { it.toString() }
 }
 
-// Every selected lock, once. Until migrateDeviceSettings has run (an HPM update
-// doesn't run updated()), the older codeLocks list counts too.
+List deviceIds(def devs) {
+    return (devs ?: []).collect { it.id.toString() }
+}
+
+// Every selected lock, once, with the keypads (and, until the settings
+// migration has finished, locks still in the pre-1.8.0 list)
 List allLocks() {
     return ((locks ?: []) + (codeLocks ?: [])).unique { it.id.toString() }
 }
 
-// Locks SignalBricks manages: lock code management and lock control use these
-// only. Code-only devices left in codeLocks (keypads) stay managed.
+// Until the settings migration has started (an HPM update doesn't run
+// updated()), the earlier lists still decide which locks are managed.
+Boolean legacySelections() {
+    return atomicState.settingsMigration == null && (managedLocks != null || codeLocks != null)
+}
+
+// Locks SignalBricks manages: door code management and lock control use these only
 List managedLockDevices() {
-    List ids = settingIds(managedLocks) + (codeLocks ?: []).collect { it.id.toString() }
+    if (!legacySelections()) return allLocks()
+    List ids = settingIds(managedLocks) + deviceIds(codeLocks)
     return allLocks().findAll { ids.contains(it.id.toString()) }
 }
 
-// Managed locks that hold codes: lock code management uses these only
+// Managed locks that hold codes: door code management uses these only
 List codeLockDevices() {
     return managedLockDevices().findAll { it.hasCapability('LockCodes') }
 }
@@ -637,47 +620,76 @@ def findControlLock(lockId) {
     return managedLockDevices().find { it.id.toString() == lockId?.toString() && it.hasCapability('Lock') }
 }
 
-// 1.8.0: the locks picked for lock code management join Locks and become the
-// managed locks, so nobody has to pick them again. Code-only devices (keypads)
-// can't be Locks: they stay in codeLocks, shown under Devices until cleared.
-// Runs on Done, on opening the app and at the daily check-in. Returns whether
-// it wrote any setting.
-Boolean migrateDeviceSettings() {
-    def legacy = codeLocks
-    if (legacy == null) return false
-    List lockable = (legacy ?: []).findAll { it.hasCapability('Lock') }
-    List codeOnly = (legacy ?: []).findAll { !it.hasCapability('Lock') }
-    if (legacy && !lockable) return false
-    List legacyIds = lockable.collect { it.id.toString() }
-    if (legacyIds) {
-        List lockIds = (locks ?: []).collect { it.id.toString() }
-        List all = (lockIds + legacyIds).unique()
-        if (all.size() != lockIds.size()) app.updateSetting('locks', [type: 'capability.lock', value: all])
-        app.updateSetting('managedLocks', [type: 'enum', value: (settingIds(managedLocks) + legacyIds).unique()])
+// 1.9.0: every selected lock is managed and full control is one switch.
+// The earlier lists are folded in once: managedLocks and fullControlLocks
+// (1.8.0), and codeLocks (before 1.8.0; keypads stay there). Runs on Done, on
+// opening the app and at the daily check-in. The first run records what
+// changed (for a note on the page) and writes the new settings; the earlier
+// lists are removed only once those read back (a setting written in a run may
+// not read back in that run), so it is safe to interrupt. Pending code
+// changes, approvals, slot rules and the fingerprint key are kept. Returns
+// whether it started in this call.
+Boolean migrateSettings() {
+    Map m = atomicState.settingsMigration
+    if (m?.done) return false
+    Boolean started = false
+    if (m == null) {
+        List lockIds = deviceIds(locks)
+        List legacyIds = deviceIds((codeLocks ?: []).findAll { it.hasCapability('Lock') })
+        List before = settingIds(managedLocks) + legacyIds
+        Boolean locksWereManaged = state.lockMgmtLastEnabled == true || state.lockControlOn == true
+        List newlyManaged = locksWereManaged ? (lockIds + legacyIds).unique().findAll { !before.contains(it) } : []
+        Boolean fullControl = !!fullControlLocks
+        // Lock and device control only ever took effect with code management on
+        List controlOff = lockManagementEnabled == true ? [] :
+            [lockControlEnabled == true && !state.lockControlOn ? 'lockControlEnabled' : null, deviceControlEnabled == true && !state.deviceControlOn ? 'deviceControlEnabled' : null].findAll()
+        m = [locksBefore: lockIds, add: legacyIds.findAll { !lockIds.contains(it) }, fullControl: fullControl, controlOff: controlOff]
+        Map note = [:]
+        if (newlyManaged) note.locks = newlyManaged
+        if (fullControl && fullControlEnabled == null) note.fullControl = true
+        if (note) atomicState.settingsNote = note
+        atomicState.settingsMigration = m
+        started = true
+        if (managedLocks != null || codeLocks != null || fullControl) {
+            log.info "SignalBricks Telemetry: settings moved to ${appNameAndVersion()}: ${newlyManaged.size()} lock(s) newly managed${fullControl ? ', full control is one switch' : ''}"
+        }
     }
-    if (codeOnly) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: codeOnly.collect { it.id.toString() }])
-    else app.removeSetting('codeLocks')
-    if (legacyIds) log.info "SignalBricks Telemetry: ${legacyIds.size()} lock(s) selected for lock code management moved to Devices as managed locks"
-    return true
+    // Written (again) until it reads back
+    if (m.add && deviceIds(locks) == m.locksBefore) app.updateSetting('locks', [type: 'capability.lock', value: (m.locksBefore + m.add).unique()])
+    if (m.fullControl && fullControlEnabled == null) app.updateSetting('fullControlEnabled', [type: 'bool', value: true])
+    if ('lockControlEnabled' in m.controlOff && lockControlEnabled == true) app.updateSetting('lockControlEnabled', [type: 'bool', value: false])
+    if ('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true) app.updateSetting('deviceControlEnabled', [type: 'bool', value: false])
+    Boolean controlRead = !('lockControlEnabled' in m.controlOff && lockControlEnabled == true) && !('deviceControlEnabled' in m.controlOff && deviceControlEnabled == true)
+    Boolean locksRead = !m.add || deviceIds(locks) != m.locksBefore
+    Boolean fullRead = !m.fullControl || fullControlEnabled != null
+    if (managedLocks != null) app.removeSetting('managedLocks')
+    if (fullRead && fullControlLocks != null) app.removeSetting('fullControlLocks')
+    if (locksRead && legacyCodeLocks()) {
+        List codeOnly = codeLocks.findAll { !it.hasCapability('Lock') }
+        if (codeOnly) app.updateSetting('codeLocks', [type: 'capability.lockCodes', value: deviceIds(codeOnly)])
+        else app.removeSetting('codeLocks')
+    }
+    if (locksRead && fullRead && controlRead && managedLocks == null && fullControlLocks == null && !legacyCodeLocks()) {
+        atomicState.settingsMigration = [done: true]
+    }
+    return started
 }
 
-// On Done: managed and full-control locks no longer selected are dropped, so a
-// lock removed and later added again isn't managed until ticked again.
-void pruneLockSelections() {
-    List lockIds = allLocks().collect { it.id.toString() }
-    List managed = settingIds(managedLocks)
-    List keptManaged = managed.findAll { lockIds.contains(it) }
-    if (keptManaged.size() != managed.size()) {
-        if (keptManaged) app.updateSetting('managedLocks', [type: 'enum', value: keptManaged])
-        else app.removeSetting('managedLocks')
-    }
-    List codeIds = keptManaged + (codeLocks ?: []).collect { it.id.toString() }
-    List full = settingIds(fullControlLocks)
-    List keptFull = full.findAll { codeIds.contains(it) }
-    if (keptFull.size() != full.size()) {
-        if (keptFull) app.updateSetting('fullControlLocks', [type: 'enum', value: keptFull])
-        else app.removeSetting('fullControlLocks')
-    }
+// codeLocks still holds locks (or is an empty list) the migration moves or removes
+Boolean legacyCodeLocks() {
+    def l = codeLocks
+    return l != null && (!l || l.any { it.hasCapability('Lock') })
+}
+
+// The one-time note about the settings migration, or null
+String settingsNoteText() {
+    Map n = atomicState.settingsNote
+    if (!n) return null
+    List parts = []
+    List names = allLocks().findAll { settingIds(n.locks).contains(it.id.toString()) }.collect { escapeHtml(it.displayName?.toString()) }
+    if (names) parts << "Every selected lock is now managed. Newly managed: ${names.join(', ')}."
+    if (n.fullControl) parts << 'Full control above the ceiling is now one switch, and it is on. SignalBricks still turns it on per lock.'
+    return parts ? "<b>Updated settings.</b> ${parts.join(' ')}" : null
 }
 
 // Locks and code devices are controlled under lock control only, never as a
@@ -685,7 +697,7 @@ void pruneLockSelections() {
 Boolean isLockDevice(dev) {
     if (dev.hasCapability('Lock') || dev.hasCapability('LockCodes')) return true
     String id = dev.id.toString()
-    return allLocks().any { it.id.toString() == id } || settingIds(managedLocks).contains(id)
+    return allLocks().any { it.id.toString() == id }
 }
 
 // Devices picked in a control list but ignored there because they are locks
@@ -764,7 +776,7 @@ void subscribeToEvents() {
 void appButtonHandler(String btn) {
     if (btn == 'btnDisconnect') {
         log.info 'Disconnected from SignalBricks'
-        // Tell the platform lock management is off (best effort), then
+        // Tell the platform everything is off (best effort), then
         // invalidate the access token it may hold. Neither SignalBricks call may
         // stop the token rotation or the local wipe below (platform#699).
         try {
@@ -788,6 +800,7 @@ void appButtonHandler(String btn) {
         // Control needs a Done again after the next Connect
         state.remove('lockControlOn')
         state.remove('deviceControlOn')
+        (CODE_LIMIT_KEYS + ['lockCommandTimes', 'lockCommandLockTimes', 'deviceCommandTimes', 'deviceCommandDeviceTimes']).each { state.remove(it) }
         state.remove('sbToken')
         state.remove('ingestUrl')
         state.remove('connectedAt')
@@ -816,20 +829,8 @@ void appButtonHandler(String btn) {
             state.remove('fingerprintKeyPending')
             log.info 'SignalBricks Telemetry: new fingerprint key rejected in the app'
         }
-    } else if (btn == 'btnSelectAllManagedLocks') {
-        // One-shot (#66): every lock selected under Devices at this moment
-        List ids = allLocks().collect { it.id.toString() }
-        if (ids) app.updateSetting('managedLocks', [type: 'enum', value: ids])
-    } else if (btn == 'btnClearManagedLocks') {
-        app.removeSetting('managedLocks')
-    } else if (btn == 'btnSelectAllFullControl') {
-        List ids = codeLockDevices().collect { it.id.toString() }
-        if (ids) {
-            app.updateSetting('fullControlLocks', [type: 'enum', value: ids])
-            log.info "SignalBricks Telemetry: full lock control allowed on all ${ids.size()} managed locks"
-        }
-    } else if (btn == 'btnClearFullControl') {
-        app.removeSetting('fullControlLocks')
+    } else if (btn == 'btnDismissSettingsNote') {
+        atomicState.remove('settingsNote')
     } else if (btn == 'btnRotateLockToken') {
         log.info 'SignalBricks Telemetry: access token rotated'
         // Any open Reconnect link carried the old token, so it is dead now
@@ -992,10 +993,11 @@ String connectUrl() {
     return "${SB_PORTAL_URL}/oauth/hubitat/authorize?${qs}&state=${stateRedirect}"
 }
 
-// Lock code management state a Reconnect keeps (#46), which ties this hub to
+// Door code management state a Reconnect keeps (#46), which ties this hub to
 // the organization and hub SignalBricks manages its locks for.
 Boolean holdsLockState() {
-    return state.lockConfig != null || state.fingerprintKey != null || state.fingerprintKeyPending != null || !!approvedAdoptedSlots || !!fullControlLocks
+    return state.lockConfig != null || state.fingerprintKey != null || state.fingerprintKeyPending != null || !!approvedAdoptedSlots ||
+        fullControlEnabled == true || !!fullControlLocks
 }
 
 // Drops that state. Local only, so it can't fail on SignalBricks.
@@ -1005,6 +1007,7 @@ void wipeLockState() {
     state.remove('fingerprintKeyPending')
     state.remove('fingerprintKeyWarned')
     app.removeSetting('approvedAdoptedSlots')
+    app.removeSetting('fullControlEnabled')
     app.removeSetting('fullControlLocks')
 }
 
@@ -1225,8 +1228,9 @@ Boolean isHttps(def url) {
     return url?.toString()?.startsWith('https://')
 }
 
+// Door code management took effect (on Done) and is still on
 Boolean lockManagementActive() {
-    return lockManagementEnabled == true && state.sbToken
+    return lockManagementEnabled == true && state.lockMgmtLastEnabled == true && state.sbToken
 }
 
 // True while SignalBricks may hold this app's endpoint: an enable was
@@ -1239,15 +1243,16 @@ Boolean lockMgmtPreviouslyRegistered() {
 
 // Registers this app's cloud endpoint and access token with SignalBricks,
 // authenticated with the ingestion token. The access token is sent only while
-// lock management is on; with it off, the platform drops what it stored. A
-// disable is sent only if an earlier registration may still be stored (#522).
+// some feature is on (`lockManagement`), with a flag per feature; with all off,
+// the platform drops what it stored. A disable is sent only if an earlier
+// registration may still be stored (#522).
 // SECURITY: the body carries the app access token; never log it.
 // Returns whether a registration was sent. A retry (#46) keeps its attempt count;
 // any other registration starts a fresh retry sequence.
 Boolean registerWithPlatform(Boolean enabledOverride = null, Boolean retry = false) {
     if (!retry) clearRegisterRetry()
     if (!state.sbToken || !isHttps(state.ingestUrl)) return false
-    Boolean enabled = enabledOverride != null ? enabledOverride : lockManagementEnabled == true
+    Boolean enabled = enabledOverride != null ? enabledOverride : endpointOn()
     if (!enabled && !lockMgmtPreviouslyRegistered()) return false
     if (enabled && !state.accessToken) ensureAccessToken()
     Map body = [
@@ -1258,6 +1263,7 @@ Boolean registerWithPlatform(Boolean enabledOverride = null, Boolean retry = fal
         version: APP_VERSION,
         hubFirmwareVersion: hubFirmwareVersion(),
         lockManagement: enabled,
+        codeManagement: enabled && state.lockMgmtLastEnabled == true,
         lockControl: enabled && state.lockControlOn == true,
         deviceControl: enabled && state.deviceControlOn == true,
         capabilities: CAPABILITIES,
@@ -1313,7 +1319,7 @@ void registerRetryRun() {
     Map r = atomicState.registerRetry
     if (!r || r.exhausted || r.inFlight) return
     atomicState.registerRetry = [attempt: r.attempt, inFlight: true, since: r.since]
-    // Nothing to send any more (disconnected, or lock management off and never registered)
+    // Nothing to send any more (disconnected, or everything off and never registered)
     if (!registerWithPlatform(null, true)) clearRegisterRetry()
 }
 
@@ -1352,7 +1358,7 @@ String hubFirmwareVersion() {
 void reregisterIfVersionChanged() {
     if (state.registeredVersion == APP_VERSION) return
     if (!state.sbToken || !isHttps(state.ingestUrl)) return
-    if (lockManagementEnabled != true && !lockMgmtPreviouslyRegistered()) return
+    if (!endpointOn() && !lockMgmtPreviouslyRegistered()) return
     if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
     state.reregisterAttemptAt = now()
     log.info "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}"
@@ -1391,7 +1397,7 @@ String checkInTime() {
 // daily hub report (#692) whether or not anything changed.
 void dailyCheckIn() {
     logDebug 'daily check-in'
-    migrateDeviceSettings()
+    migrateSettings()
     reregisterIfVersionChanged()
     ensureAppInfoSubscription()
     sendHubReport('daily')
@@ -1775,7 +1781,7 @@ void registerCallback(resp, Map data) {
     state.registeredVersion = APP_VERSION
     state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
-    log.info "SignalBricks Telemetry: registered ${appNameAndVersion()} with SignalBricks (lock management ${data?.enabled ? 'on' : 'off'})"
+    log.info "SignalBricks Telemetry: registered ${appNameAndVersion()} with SignalBricks (${data?.enabled ? 'on' : 'off'})"
 }
 
 Map jsonResponse(def data, int status = 200) {
@@ -1909,7 +1915,7 @@ Map validateLockConfig(def body) {
     if (!(locksIn instanceof Map)) return [error: 'locks must be an object keyed by lock id']
     for (entry in locksIn) {
         String lockId = entry.key.toString()
-        if (!findCodeLock(lockId)) return [error: "lock ${lockId} is not selected for lock code management"]
+        if (!findCodeLock(lockId)) return [error: "lock ${lockId} is not selected in the app"]
         def v = entry.value
         if (!(v instanceof Map)) return [error: "lock ${lockId}: must be an object"]
         if (v.containsKey('surveyOnly')) {
@@ -1996,12 +2002,12 @@ Boolean fullControlOn(String lockId) {
 
 // Lock ids the hub operator allowed full control on, in this app's UI only
 // (never via the API): registered codes above the ceiling are reachable there
-// when SignalBricks also turned full control on for the lock.
+// when SignalBricks also turned full control on for the lock. One switch for
+// every managed lock; before the settings migration, the earlier list.
 List fullControlAllowedIds() {
-    def v = fullControlLocks
-    if (!v) return []
-    List ids = (v instanceof Collection ? v : [v]).collect { it.toString() }
-    return ids.findAll { findCodeLock(it) }
+    if (legacySelections()) return settingIds(fullControlLocks).findAll { findCodeLock(it) }
+    Boolean on = fullControlEnabled == true || (fullControlEnabled == null && !!fullControlLocks)
+    return on ? codeLockDevices().collect { it.id.toString() } : []
 }
 
 Boolean fullControlAboveCeiling(String lockId) {
@@ -3199,11 +3205,11 @@ void reportCodeResult(Map p, String result, String reason) {
 // --- Lock and device control (#80) ---
 
 Boolean lockControlActive() {
-    return lockManagementActive() && lockControlEnabled == true && state.lockControlOn == true
+    return lockControlEnabled == true && state.lockControlOn == true && state.sbToken
 }
 
 Boolean deviceControlActive() {
-    return lockManagementActive() && deviceControlEnabled == true && state.deviceControlOn == true
+    return deviceControlEnabled == true && state.deviceControlOn == true && state.sbToken
 }
 
 // Optional requestId (a UUID) from the query or a JSON body; the body may be empty.
