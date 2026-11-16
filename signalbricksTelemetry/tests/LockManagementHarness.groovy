@@ -9,8 +9,20 @@ abstract class HubitatStub extends Script {
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    def codeLocks = []
-    def locks = null, contactSensors = null, temperatureSensors = null, humiditySensors = null
+    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
+    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
+    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
+    // codeLocks setting reads as gone.
+    def lockList = null
+    List managedDevices = []
+    def managedLocks = null
+    def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
+    void setLocks(def v) { lockList = v }
+    def getCodeLocks() { null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    def contactSensors = null, temperatureSensors = null, humiditySensors = null
+    def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
+    Boolean lockControlEnabled = false, deviceControlEnabled = false
     Boolean lockManagementEnabled = true
     Boolean includeDoorCodes = false
     List subscriptions = []
@@ -1328,7 +1340,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.7.0'
+String VERSION = '1.8.0'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1573,7 +1585,7 @@ check('codes on: failed post logged without the code', app.logged.any { it.toStr
 app.locks = [new FakeLock(id: '7', displayName: 'Front', name: 'Front', label: 'Front')]
 app.subscriptions.clear()
 app.subscribeToEvents()
-check('codes on: subscriptions unchanged, never lockCodes', app.subscriptions.sort() == ['battery', 'lastCodeName', 'lock'] && !app.subscriptions.contains('lockCodes'))
+check('codes on: subscriptions unchanged, never lockCodes', app.subscriptions.unique().sort() == ['battery', 'lastCodeName', 'lock'] && !app.subscriptions.contains('lockCodes'))
 app.includeDoorCodes = false
 app.subscriptions.clear()
 app.subscribeToEvents()
@@ -1663,42 +1675,47 @@ check('any-case: an ordinary adopted name is still written', ci('apiSetCode', [l
 String ciAll = (ciResponses.collect { it.data } + app.logged.collect { it.toString() } + app.posts.collect { it.params.body }).join('\n')
 check('any-case: no code in any response, log or post', !(ciCodes.values()*.code + ['80802222', '80802299', '12121212']).any { ciAll.contains(it) })
 
-// --- Select all / Clear for the code management and full control lists (#66) ---
+// --- Select all / Clear for the managed locks and full control lists (#66, #80) ---
 def selA = new FakeLock(id: '31', displayName: 'SelA', name: 'SelA', label: 'SelA')
 def selB = new FakeLock(id: '32', displayName: 'SelB', name: 'SelB', label: 'SelB')
 def selNoCodes = new FakeLock(id: '33', displayName: 'SelNoCodes', name: 'SelNoCodes', label: 'SelNoCodes', caps: ['Lock'])
 def selPicked = new FakeLock(id: '34', displayName: 'SelPicked', name: 'SelPicked', label: 'SelPicked')
-app.locks = [selA, selNoCodes]
-app.codeLocks = [selPicked]
+app.codeLocks = []
+app.locks = [selA, selNoCodes, selPicked]
+app.managedLocks = ['34']
 app.fullControlLocks = ['34']
 app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
 app.logged.clear()
 app.updated()
-check('select all: lists unchanged until a button is clicked', app.codeLocks*.id == ['34'] && app.fullControlLocks == ['34'])
-app.appButtonHandler('btnSelectAllCodeLocks')
-check('select all codes: hand-picked locks kept, Devices locks with codes added, others not', app.codeLocks == ['34', '31'])
-app.codeLocks = [selPicked, selA]
-app.locks = [selA, selNoCodes, selB]
-check('select all codes: a lock added under Devices later is not added by itself', app.codeLocks*.id == ['34', '31'] && app.findCodeLock('32') == null)
-app.appButtonHandler('btnSelectAllCodeLocks')
-check('select all codes: clicking again adds it', app.codeLocks == ['34', '31', '32'])
-app.codeLocks = [selPicked, selA, selB]
+check('select all: lists unchanged until a button is clicked', app.managedLocks == ['34'] && app.fullControlLocks == ['34'] && app.findCodeLock('31') == null)
+app.appButtonHandler('btnSelectAllManagedLocks')
+check('select all managed: every lock under Devices, with or without codes', app.managedLocks as Set == ['31', '33', '34'] as Set)
+app.managedLocks = ['34', '31']
+app.locks = [selA, selNoCodes, selPicked, selB]
+check('select all managed: a lock added under Devices later is not added by itself', app.findCodeLock('32') == null && app.findCodeLock('31') != null)
+app.appButtonHandler('btnSelectAllManagedLocks')
+check('select all managed: clicking again adds it', app.managedLocks as Set == ['31', '32', '33', '34'] as Set && app.findCodeLock('32') != null)
+app.managedLocks = ['34', '31', '32']
 app.appButtonHandler('btnSelectAllFullControl')
-check('select all full control: every lock selected for code management, once', app.fullControlLocks == ['34', '31', '32'])
-check('select all full control: logged without codes', app.logged.any { it.toString().contains('full lock control allowed on all 3 locks') })
+check('select all full control: every managed lock, once', app.fullControlLocks as Set == ['34', '31', '32'] as Set && app.fullControlLocks.size() == 3)
+check('select all full control: logged without codes', app.logged.any { it.toString().contains('full lock control allowed on all 3 managed locks') })
 def selD = new FakeLock(id: '35', displayName: 'SelD', name: 'SelD', label: 'SelD')
-app.codeLocks = [selPicked, selA, selB, selD]
+app.locks = [selA, selNoCodes, selPicked, selB, selD]
+app.managedLocks = ['34', '31', '32', '35']
 check('select all full control: a lock added later is not fully controlled until clicked again', !app.fullControlAllowedIds().contains('35'))
 app.appButtonHandler('btnClearFullControl')
 check('clear full control: list emptied', app.fullControlLocks == null && app.fullControlAllowedIds() == [])
-app.appButtonHandler('btnClearCodeLocks')
-check('clear codes: list emptied', app.codeLocks == null && app.findCodeLock('31') == null)
+app.appButtonHandler('btnClearManagedLocks')
+check('clear managed: list emptied', app.managedLocks == null && app.findCodeLock('31') == null)
+app.managedLocks = ['31']
 app.locks = [selNoCodes]
-app.appButtonHandler('btnSelectAllCodeLocks')
-app.appButtonHandler('btnSelectAllFullControl')
-check('select all with nothing eligible: lists stay empty', app.codeLocks == null && app.fullControlLocks == null)
+check('managed: a lock no longer selected under Devices is not managed', app.findCodeLock('31') == null)
 app.locks = null
+app.managedLocks = null
+app.appButtonHandler('btnSelectAllManagedLocks')
+app.appButtonHandler('btnSelectAllFullControl')
+check('select all with nothing eligible: lists stay empty', app.managedLocks == null && app.fullControlLocks == null)
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

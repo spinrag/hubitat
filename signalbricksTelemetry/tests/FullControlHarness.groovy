@@ -16,8 +16,20 @@ abstract class HubitatStub extends Script {
     Map settings = [:]
     Map params = [:]
     Map request = [:]
-    def codeLocks = []
-    def locks = null, contactSensors = null, temperatureSensors = null, humiditySensors = null
+    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
+    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
+    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
+    // codeLocks setting reads as gone.
+    def lockList = null
+    List managedDevices = []
+    def managedLocks = null
+    def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
+    void setLocks(def v) { lockList = v }
+    def getCodeLocks() { null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    def contactSensors = null, temperatureSensors = null, humiditySensors = null
+    def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
+    Boolean lockControlEnabled = false, deviceControlEnabled = false
     Boolean lockManagementEnabled = true
     Boolean includeDoorCodes = false
     Boolean debugLogging = false
@@ -77,6 +89,8 @@ class FakeApp {
 // throws with the code in its message.
 class FakeLock {
     String id; String displayName; String name; String label
+    List caps = ['Lock', 'LockCodes']
+    Boolean hasCapability(String c) { caps.contains(c) }
     Map attrs = [:]
     List calls = []
     int dropSets = 0, dropDeletes = 0, unreadableReads = 0

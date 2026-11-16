@@ -60,12 +60,13 @@ Syncs OwnerRez booking door codes from the SignalBricks dispatcher to Z-Wave / Z
 ---
 
 ### 🔹 [SignalBricks Telemetry](signalbricksTelemetry/README.md) — *app*
-Sends read-only lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app; the two are versioned separately.
+Sends lock, contact, temperature, humidity and battery events to SignalBricks. Runs alongside the SignalBricks Integration app; the two are versioned separately.
 
 - One-click **Connect to SignalBricks** (OAuth via Hubitat cloud). No tokens to paste. **Reconnect** works with lock code management on: its link lasts 10 minutes, then the token is replaced and registered again
-- Telemetry never subscribes to `lockCodes`, never controls devices, and doesn't send PINs unless you turn on *Include door codes* (1.3.5+, off by default; SignalBricks then keeps only a keyed hash, and only if your organization's admin also allows it)
+- Telemetry never subscribes to `lockCodes`, never controls devices by itself, and doesn't send PINs unless you turn on *Include door codes* (1.3.5+, off by default; SignalBricks then keeps only a keyed hash, and only if your organization's admin also allows it)
 - Non-blocking `asynchttpPost` delivery
 - Optional, off-by-default **lock code management** for admin (`SBA:`) and managed (`SBM:`) codes, limited to the locks and slots you allow
+- Optional, off-by-default **lock and device control** (1.8.0+): SignalBricks can lock, unlock and control the devices you select, without the Maker API. Devices are selected in one place
 - **Daily hub report**: app versions and slot settings, hub firmware and uptime, and lock health (battery, jammed, number of occupied slots; never codes or code names)
 
 📂 [`signalbricksTelemetry`](signalbricksTelemetry/)
