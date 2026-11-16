@@ -9,22 +9,22 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     Map getAtomicState() { state }
     Map settings = [:]
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -34,6 +34,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List logged = []
     List posts = []
     def log = [info: { logged << it.toString() }, warn: { logged << it.toString() }, debug: { logged << it.toString() }, error: { logged << it.toString() }]
@@ -473,14 +474,16 @@ app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.posts.clear()
 app.registerWithPlatform()
 def reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
-check('register: capabilities [relocate, registered_slots, full_control, code_in_use, lock_control, device_control], version 1.8.0', reg.capabilities == ['relocate', 'registered_slots', 'full_control', 'code_in_use', 'lock_control', 'device_control'] && reg.version == '1.8.0' && reg.lockManagement == true)
+check('register: capabilities [relocate, registered_slots, full_control, code_in_use, lock_control, device_control], version 1.9.0', reg.capabilities == ['relocate', 'registered_slots', 'full_control', 'code_in_use', 'lock_control', 'device_control'] && reg.version == '1.9.0' && reg.lockManagement == true)
 app.posts.clear()
 app.lockManagementEnabled = false
+app.state.remove('lockMgmtLastEnabled')
 app.state.lockMgmtRegistered = true
 app.registerWithPlatform()
 reg = new JsonSlurper().parseText(app.posts.find { it.cb == 'registerCallback' }.params.body)
 check('register: disable still well-formed', reg.lockManagement == false && reg.appAccessToken == null)
 app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
 
 // No fingerprint without a key
 app.request = [JSON: lockCfg - [fingerprintKey: KEY]]

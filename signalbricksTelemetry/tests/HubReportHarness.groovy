@@ -14,22 +14,22 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     // Same store as state here; the hub writes atomicState through immediately.
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -39,6 +39,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -187,7 +188,7 @@ check('doc example app info validates', appInfoErrors.isEmpty())
 List bad = validateReport(docReport + [extra: 1, locks: [[deviceId: '1', battery: '85', lockCodes: '{}']]])
 check('validator rejects extra keys and string numbers', bad.size() == 3)
 
-check('version is 1.8.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.8.0')
+check('version is 1.9.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.0')
 
 // --- Fake hub: connected, two booking apps, locks with codes ---
 String INGEST = 'sbit_fakeingesttokenfakeingesttoken00'
@@ -262,8 +263,10 @@ app.state.appInfos['388'].lastSeenAt = 1_793_311_200_000L
 app.posts.clear()
 app.lockManagementEnabled = true
 app.decrypted.clear()
+app.state.lockMgmtLastEnabled = true
 app.dailyCheckIn()
 app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
 check('daily: one report posted', reports().size() == 1)
 check('lockCodes: plain JSON never passed to decrypt()', app.decrypted && !app.decrypted.any { it.trim().startsWith('{') } && app.decrypted.every { it.startsWith('ENC:') || it == 'not json' })
 def post = reports()[0]
@@ -278,7 +281,7 @@ check('daily: other booking app field names match the doc', r.apps.find { it.app
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
-check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.8.0', maxManagedSlot: 25])
+check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.9.0', maxManagedSlot: 25])
 check('daily: hub firmware, uptime, time zone', r.hub == [firmwareVersion: '2.4.3.152', uptimeSec: 864000, timeZone: 'America/New_York'])
 check('daily: apps as collected, with lastSeenAt', r.apps.find { it.appId == '412' } == docReport.apps[0] && r.apps.find { it.appId == '388' } == docReport.apps[1].findAll { k, v -> k != 'version' } + [version: '1.4.6'])
 // The doc's example rebuilt from this fake hub: same apps, the same front door
@@ -309,10 +312,14 @@ app.posts.clear()
 3.times { app.clock += 24L * 3600 * 1000; app.dailyCheckIn() }
 check('daily: a report every day, version unchanged', reports().size() == 3 && reports().every { bodyOf(it).reason == 'daily' })
 check('daily: no registration on a telemetry-only hub', !app.posts.any { it.cb == 'registerCallback' })
-check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.8.0'] })
+check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.9.0'] })
 app.maxManagedSlot = '40'
 app.posts.clear(); app.dailyCheckIn()
-check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.8.0'] && validateReport(lastReport()).isEmpty())
+check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.0'] && validateReport(lastReport()).isEmpty())
+app.lockManagementEnabled = true
+app.posts.clear(); app.dailyCheckIn()
+check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.0'])
+app.lockManagementEnabled = false
 app.maxManagedSlot = '25'
 
 // lockCodes that parse to something other than an object: no count
@@ -392,7 +399,7 @@ app.dailyCheckIn()
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 400, body: ''), [reason: 'daily'])
 check('400: not retried', retryJob() == null)
-check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.8.0')
+check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.9.0')
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 503, body: ''), [reason: 'daily'])
 check('503: version not recorded (retried instead)', app.state.reportedVersion == '1.5.3')
@@ -404,7 +411,7 @@ app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 408, body: ''), [reason: 'daily'])
 check('408 (timeout): retried', retryJob()?.secs == 30)
 app.reportCallback(new FakeResp(status: 202, body: '{"received":true}'), [reason: 'daily'])
-check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.8.0' && app.state.lastReportError == null)
+check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.9.0' && app.state.lastReportError == null)
 check('page: last sent shown', app.reportStatus()?.contains('last sent'))
 app.throwOnPost = true
 app.sendHubReport('daily')

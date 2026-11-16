@@ -2,7 +2,7 @@
 
 A Hubitat Elevation app that sends device telemetry to [SignalBricks](https://app.signalbricks.co): lock state, contact sensors, temperature, humidity, and battery levels. Optionally, it lets SignalBricks manage door codes and lock, unlock and control the devices you select.
 
-It runs alongside the [**SignalBricks Integration**](../signalbricksIntegration/README.md) app (booking door codes). The two apps are independent and versioned separately; each shows its own name next to its version. Telemetry never controls devices unless you turn on the optional [lock code management](#lock-code-management-optional) or [lock and device control](#lock-and-device-control-optional).
+It runs alongside the [**SignalBricks Integration**](../signalbricksIntegration/README.md) app (booking door codes). The two apps are independent and versioned separately; each shows its own name next to its version. Telemetry never controls devices unless you turn on the optional features under [What SignalBricks may do](#what-signalbricks-may-do-optional).
 
 Highlights by version:
 
@@ -15,7 +15,8 @@ Highlights by version:
 - **1.5.0** custom code names and full lock control, per lock and opt-in on the hub.
 - **1.6.0** a [daily hub report](#daily-hub-report): app versions and slot settings, hub firmware and uptime, and lock health, counts only.
 - **1.7.0** a check SignalBricks uses to avoid creating a door code that's already on a lock.
-- **1.8.0** optional [lock and device control](#lock-and-device-control-optional): SignalBricks can lock, unlock and control devices you select, without the Maker API. Devices are now selected in one place, under **Devices**; your existing selections carry over.
+- **1.8.0** optional [lock and device control](#lock-and-device-control): SignalBricks can lock, unlock and control devices you select, without the Maker API. Devices are now selected in one place, under **Devices**; your existing selections carry over.
+- **1.9.0** simpler settings: one **Locks** list (every selected lock is managed) and [one switch per feature](#what-signalbricks-may-do-optional); lock and device control no longer need door code management. Your selections [carry over](#updating-to-190).
 
 ## Requirements
 
@@ -48,9 +49,9 @@ Highlights by version:
 
 ### Reconnect
 
-**Reconnect to SignalBricks** works whether or not lock code management is on. Click it and sign in, as for Connect. The sign-in link works for 10 minutes; whether it is used or not, the app then replaces its access token and registers the new one. Lock code management stays on and its settings are kept.
+**Reconnect to SignalBricks** works with any feature on. Click it and sign in, as for Connect. The sign-in link works for 10 minutes; whether it is used or not, the app then replaces its access token and registers the new one. Your settings are kept.
 
-To move the hub to another property or organization while lock code management is on, turn **Enable lock code management** off first, then Reconnect. SignalBricks tells you when this is needed.
+To move the hub to another property or organization while door code management is on, turn **Manage door codes on the locks above** off first, then Reconnect. SignalBricks tells you when this is needed.
 
 **Don't share the app page's links**, or screenshots or saved copies of the page, with anyone you wouldn't give the hub's admin login to.
 
@@ -142,56 +143,55 @@ Since 1.6.0 the app sends SignalBricks a short report about the hub once a day, 
 
 It never contains codes, code names or guest names. SignalBricks raises alerts from it, for example when a booking app's slots overlap the ones SignalBricks manages, a lock is jammed or low on battery, or the hub stops reporting. A report that fails is retried a few times, and the **Connection** section shows the error.
 
-## Lock code management (optional)
+## What SignalBricks may do (optional)
 
-Off by default. When enabled, SignalBricks can list each selected lock's code slots (slot number, name, set or empty, never the code), set and delete **admin** (`SBA: …`) and **managed** (`SBM: …`) codes, and reveal one code at a time for an authorized user. Booking codes are never touched.
+Under **Devices**, pick each device once: **Locks**, sensors, and the devices SignalBricks may control. Every selected lock is managed. Under **What SignalBricks may do**, each feature has one switch, off by default:
 
-### Enable it
+- **Manage door codes on the locks above**
+- **Full control above that slot** (shown while door code management is on)
+- **Lock and unlock the locks above**
+- **Control the devices above**
 
-Already-connected hubs need only an app update:
+Turning a feature on takes effect when you click **Done**: the app replaces its access token and registers it first. Turning one off takes effect at once, even before **Done**. The features are independent: lock and device control don't need door code management. After a Reconnect, lock and device control need a **Done** again.
 
-1. Update **SignalBricks Telemetry** to the latest version (HPM **Update**).
-2. Open the app. Under **Lock code management (optional)**, turn on **Enable lock code management**.
-3. Under **Devices**, tick the locks in **Locks SignalBricks manages**. Since 1.8.0 these are picked from the **Locks** list, and lock control uses the same locks. **Select all** ticks every lock selected above it, and **Clear** empties the list. Locks you add later are never added automatically: click **Select all** again.
-4. Check **Highest slot SignalBricks may manage** (default 25). Keep it below every booking app's **Minimum code position**.
-5. Click **Done**. Reopen the app and check **Registration: registered …**.
-6. Nothing can be written yet: SignalBricks first sends the slot rules during lock onboarding in the portal. If it asks to manage existing codes above the ceiling, they are listed in the app under **Approve these slots**. Approve only codes you recognise as admin or managed codes.
-7. If SignalBricks asks to replace its fingerprint key (rare), the app shows **Approve the new fingerprint key** and **Reject the new fingerprint key**. The request shows a short **key check**: approve only if SignalBricks shows the same key check for your organization; otherwise reject it and click **Rotate access token and re-register**.
+### Manage door codes
 
-New hubs: install, **Connect to SignalBricks** first, then follow steps 2 to 5.
+SignalBricks can list each selected lock's code slots (slot number, name, set or empty, never the code), set and delete **admin** (`SBA: …`) and **managed** (`SBM: …`) codes, and reveal one code at a time for an authorized user.
 
-To turn it off, switch off **Enable lock code management**. This takes effect immediately, even before you click **Done**, and even when SignalBricks can't be reached: the app replaces its access token and clears its lock code management settings. **Disconnect** does the same.
+1. **Connect to SignalBricks** first.
+2. Turn on **Manage door codes on the locks above**.
+3. Check **Highest slot SignalBricks may use** (default 25). Keep it below every booking app's **Minimum code position**.
+4. Click **Done**. Reopen the app and check **Registration: registered …**.
+5. Nothing can be written yet: SignalBricks first sends the slot rules during lock onboarding in the portal. If it asks to manage existing codes above that slot, they are listed under **Approve these slots**. Approve only admin or managed codes you recognise.
+6. If SignalBricks asks to replace its fingerprint key (rare), approve only if SignalBricks shows the same **key check**; otherwise reject it and click **Rotate access token and re-register**.
 
-### What the hub enforces
+Turning it off clears its settings on the hub, even when SignalBricks can't be reached. **Disconnect** does the same.
 
-The hub decides which slots may be touched, using the settings you choose in the app:
+What the hub enforces:
 
-- SignalBricks can only reach the locks you selected as managed locks, and on each of them only the slots its onboarding set up, at or below **Highest slot SignalBricks may manage**.
-- Existing codes above that ceiling stay out of reach until you approve them under **Approve these slots**.
-- A new fingerprint key from SignalBricks is used only once you approve it in the app (1.6.3).
-- **Locks SignalBricks may fully control** is a separate, per-lock opt-in in the app. Its **Select all** (1.6.5) chooses the managed locks at that moment; locks added later need another click.
-- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:` or `GT:` (1.6.4).
+- Only the selected locks, and on each only the slots onboarding set up, at or below **Highest slot SignalBricks may use**.
+- Existing codes above that slot stay out of reach until you approve them, or until you turn on **Full control above that slot** and SignalBricks marks the lock for full control.
+- A new fingerprint key is used only once you approve it.
+- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:` or `GT:`.
 - Codes are never logged, and never sent as telemetry or in results.
 
-### Upgrading from 1.7 or earlier
+Some lock drivers can store their code list encrypted. If the hub can't read it, that lock's codes show as unreadable: turn off code encryption in the lock's driver preferences.
 
-Before 1.8.0, lock code management had its own lock list. On update, the locks on it are added to **Locks** (if they weren't there already) and ticked as managed locks, so you don't need to select anything again. Those locks now also send their lock state as telemetry. Code-only devices such as keypads stay in their own list under **Devices**, with lock code management unchanged.
+### Lock and device control
 
-### Locks with encrypted codes
+SignalBricks can lock and unlock the selected locks, and control the devices selected under **Devices SignalBricks may control**: switches, dimmers and outlets; garage doors; gates and other doors; thermostats; valves. Each device only accepts the commands of its list, for example on, off and level for switches. Locks are only controlled with **Lock and unlock**: a lock picked in another list is ignored there, and the app says so. This needs no Maker API.
 
-Some lock drivers can store their code list encrypted. The app decrypts it when the hub allows. If it can't, lock code management reports that lock's codes as unreadable: turn off code encryption in that lock's driver preferences, or leave that lock out of lock code management.
+Each command is logged on the hub (device and command) and reported to SignalBricks.
 
-## Lock and device control (optional)
+### Updating to 1.9.0
 
-Added in 1.8.0, off by default. Lets SignalBricks lock, unlock and control the devices you select, without the Maker API. It uses the lock code management connection, so lock code management must be on.
+Your selections carry over.
 
-1. Update **SignalBricks Telemetry** and open the app.
-2. Under **Devices**, check **Locks SignalBricks manages**. Lock control applies to those locks only. A lock you remove from **Locks** is no longer managed, also if you add it back later, until you tick it again.
-3. For other devices, select them under **Devices SignalBricks may control**: switches, dimmers and outlets; garage doors; gates and other doors; thermostats; valves. A device only accepts the commands of the list you selected it in, for example on, off and level for switches and dimmers, or open and close for garage doors. Locks are only ever controlled with lock control: a lock picked in one of these lists is ignored there, and the app says so.
-4. Under **Lock and device control (optional)**, turn on **Let SignalBricks lock and unlock the managed locks**, **Let SignalBricks control the devices selected for control**, or both.
-5. Click **Done**. Control starts only then: the app replaces its access token and registers the new one first.
-
-Each command is logged on the hub (device and command) and reported to SignalBricks, so it shows up in the portal. Devices you haven't selected can't be controlled. To stop, turn the setting off: this takes effect at once, even before you click **Done**. Turning lock code management off or **Disconnect** stops control too.
+- Every lock under **Locks** is now managed. The app shows a one-time note listing locks that newly became managed. Dismiss it, or it clears after the next **Done**.
+- If any lock had full control, **Full control above that slot** is on. SignalBricks still decides per lock.
+- Code-only devices such as keypads stay in their own list under **Devices** while it has any.
+- Pending code changes, approvals, slot rules and the fingerprint key are kept.
+- Lock and device control stay on if they were on. If a lock became managed, lock control is paused until you click **Done**, and the note says so. A control switch that never took effect (door code management was off) is turned off.
 
 ## Development
 
@@ -220,16 +220,16 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) before opening an issue or pull reques
 
 - **By default, door codes (PINs) are never sent**, only the name of the code used. The app removes every code field from events before sending them, and the [daily hub report](#daily-hub-report) only counts occupied slots.
 - **Include door codes (optional, off by default).** When you and your organization's admin both turn it on, SignalBricks keeps only a keyed hash of the code used. See [Door codes in telemetry](#door-codes-in-telemetry-optional).
-- **Control is opt-in.** SignalBricks changes codes only when lock code management is on, and only for the locks and slots you allow; it controls devices only when lock or device control is on, and only those you select.
+- **Control is opt-in.** SignalBricks changes codes only when door code management is on, and only for the locks and slots you allow; it controls devices only when lock or device control is on, and only those you select.
 - **No shared secret.** Connect uses OAuth with PKCE, so the app stores no client secret. The hub's access token is replaced after every Connect and Reconnect.
 - Events go only to the SignalBricks ingestion address returned during Connect. Nothing is sent until the hub is connected.
 
 ## Troubleshooting
 
 - **"OAuth is not enabled for this app"**: enable OAuth for the app code (see Manual install, step 2).
-- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** and sign in. Lock code management can stay on.
-- **"Reconnect to SignalBricks to enable lock management"**: click **Reconnect to SignalBricks** and sign in; lock code management can stay on. Telemetry keeps working meanwhile.
-- **Registration error** under Lock code management: check the hub is connected, then click **Rotate access token and re-register**.
+- **"SignalBricks rejected the token"**: the token was revoked in the portal. Click **Reconnect to SignalBricks** and sign in. Your settings can stay on.
+- **"Reconnect to SignalBricks to enable lock management"**: click **Reconnect to SignalBricks** and sign in; your settings can stay on. Telemetry keeps working meanwhile.
+- **Registration error** under What SignalBricks may do: check the hub is connected, then click **Rotate access token and re-register** (shown while any feature is on).
 - **A code change failed**: check the lock is awake and in range of the hub, then retry from SignalBricks. `Code changes awaiting the lock` in the app shows how many are in progress or failed. Since 1.6.6, a change also counts as done when the lock shows its name in a different letter case.
 - **A lock's codes are unreadable**: see [Locks with encrypted codes](#locks-with-encrypted-codes).
 - Turn on **debug logging** to see each event as it is sent. Debug logging turns itself off after 30 minutes.

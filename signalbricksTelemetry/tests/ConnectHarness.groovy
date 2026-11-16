@@ -12,7 +12,8 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     Map getAtomicState() { state }
     Map settings = [:]
     Map params = [:]
@@ -25,6 +26,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List logged = []
     List posts = []
     List http = []
@@ -83,7 +85,7 @@ List secrets = []
 String INGEST_TOKEN = 'sbit_fakeingesttokenfakeingesttoken00'
 secrets << INGEST_TOKEN
 
-check('version is 1.8.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.8.0')
+check('version is 1.9.0', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.0')
 
 def callback = { Map p ->
     String before = app.state.accessToken
@@ -140,7 +142,7 @@ headlines.each { k, h ->
     String html = pages[k]
     String status = k == 'connected' ? 'ok' : 'err'
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Telemetry: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
-    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.8.0</p>'))
+    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.9.0</p>'))
     check("page ${k}: inline CSS only, light and dark, wraps long text", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && html.contains('overflow-wrap:anywhere') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
     check("page ${k}: no back link (it opened in its own window); says to close it and return to the app", !html.contains('<a ') && !html.contains('installedapp') && !html.contains('Back to the app') &&
         html.contains("If this window doesn't close, close it yourself and return to the app; it's still open in your other tab."))

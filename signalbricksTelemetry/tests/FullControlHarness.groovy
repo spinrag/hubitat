@@ -11,22 +11,22 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     Map getAtomicState() { state }
     Map settings = [:]
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -36,6 +36,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List logged = []
     List posts = []
     def log = [info: { logged << it.toString() }, warn: { logged << it.toString() }, debug: { logged << it.toString() }, error: { logged << it.toString() }]
@@ -201,19 +202,19 @@ check('old config: no lock commands', lock.calls.isEmpty())
 
 // fullControl alone (nothing registered) reaches nothing new
 def r1 = push(['9': [fullControl: true]])
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 check('fullControl alone: accepted, stored', r1.status == 200 && lockCfg() == [adopted: [], fullControl: true])
 check('fullControl alone: unregistered slots stay refused', [3, 28, 22, 33].every { body(reveal(it)).error in ['slot_not_managed', 'slot_not_allowed', 'slot_empty'] } &&
     body(setCode(22, 'Anything', '60600099')).error == 'slot_not_allowed' && body(setCode(33, 'Anything', '60600099')).error == 'slot_not_allowed')
 check('fullControl alone: no lock commands', lock.calls.isEmpty())
-app.fullControlLocks = null
+app.fullControlEnabled = null
 
 // fullControl: false grants nothing and isn't stored
 check('fullControl false: accepted, not stored', push(['9': [registered: [[slot: 22, name: 'Dog Walker']], fullControl: false]]).status == 200 &&
     lockCfg() == [adopted: [], registered: [[slot: 22, name: 'Dog Walker']]])
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 check('fullControl false: empty registered slot outside the ranges refused', body(setCode(22, 'Dog Walker', '60600099')).error == 'slot_not_allowed' && slotOf(22) == null)
-app.fullControlLocks = null
+app.fullControlEnabled = null
 check('fullControl false: no lock commands', lock.calls.isEmpty())
 
 // --- Config validation ---
@@ -257,7 +258,7 @@ Map bookingRegs = ['9': [registered: bookingSlots.collect { [slot: it, name: "In
     String mode = fc ? 'full control on + allowed on the hub' : 'full control off'
     Map regs = ['9': bookingRegs['9'] + (fc ? [fullControl: true] : [:])]
     check("${mode}: booking registrations stored", push(regs).status == 200)
-    app.fullControlLocks = fc ? ['9'] : null
+    app.fullControlEnabled = fc ? true : null
     if (!fc) app.approvedAdoptedSlots = bookingSlots.findAll { it > 25 }.collect { "9:${it}".toString() }
     fresh()
     bookingSlots.each { Integer s ->
@@ -272,7 +273,7 @@ Map bookingRegs = ['9': [registered: bookingSlots.collect { [slot: it, name: "In
     check("${mode}: every booking code still on the lock as it was", bookingSlots.every { slotOf(it) == initial[it.toString()] })
     app.approvedAdoptedSlots = null
 }
-app.fullControlLocks = null
+app.fullControlEnabled = null
 
 // A booking app wrote into a registered slot after SignalBricks deleted its code: refused.
 push(['9': [registered: [[slot: 22, name: 'Cleaner Two']], fullControl: true]])
@@ -308,7 +309,7 @@ lock.edit { it.remove('19') }
 
 // --- A booking code at or under the ceiling blocks writes outside the ranges (fail closed) ---
 push(['9': [registered: [[slot: 22, name: 'Dog Walker'], [slot: 18, name: 'Cleaner Two']], fullControl: true]])
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 fresh()
 def ov = setCode(22, 'Dog Walker', '60600097')
 check('overlap: booking code in slot 5 refuses empty writes outside the ranges', ov.status == 409 && body(ov).error == 'booking_region_overlap' && slotOf(22) == null && lock.calls.isEmpty())
@@ -323,7 +324,7 @@ lock.edit { it.remove('7') }
 
 // --- Full control: empty slots outside the ranges, never above the ceiling ---
 push(['9': [registered: [[slot: 18, name: 'Cleaner Two'], [slot: 22, name: 'Dog Walker'], [slot: 33, name: 'Painter']], fullControl: true]])
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 fresh()
 check('full control: empty registered slot outside the ranges writable', setCode(22, 'Dog Walker', '60600097').status == 202)
 settle()
@@ -333,18 +334,18 @@ check('full control: /slots says so for the empty slot above the ceiling', slots
 
 // --- Above the ceiling: the hub-local switch or an approval ---
 push(['9': [registered: [[slot: 28, name: 'Owner']]]])
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 fresh()
 check('above ceiling, full control off: refused even with the hub switch', body(reveal(28)).error == 'slot_not_allowed' && body(lockConfigCall = { app.apiGetLockConfig() }()).pendingApproval == ['9:28'])
 push(['9': [registered: [[slot: 28, name: 'Owner']], fullControl: true]])
-app.fullControlLocks = null
+app.fullControlEnabled = null
 check('above ceiling, full control on but not allowed on the hub: refused, needs approval', body(reveal(28)).error == 'slot_not_allowed' && body(app.apiGetLockConfig()).pendingApproval == ['9:28'])
 app.approvedAdoptedSlots = ['9:28']
 check('above ceiling, slot approved instead: reachable', reveal(28).status == 200)
 app.approvedAdoptedSlots = null
-app.fullControlLocks = ['9', '404']
+app.fullControlEnabled = true
 def gc = body(app.apiGetLockConfig())
-check('above ceiling, full control on + allowed: no approval asked, unknown lock ids ignored', gc.pendingApproval == [] && gc.fullControlAllowed == ['9'])
+check('above ceiling, full control on + allowed: no approval asked, every selected lock allowed', gc.pendingApproval == [] && gc.fullControlAllowed == ['9', '8'])
 check('above ceiling, full control on + allowed: reveal ok', body(reveal(28)).code == '60600028')
 check('above ceiling: a move is refused', body(relocate(28, [name: 'Owner', toSlot: 21])).error == 'move_not_supported')
 check('above ceiling: fingerprinted', fps().contains(28))
@@ -481,27 +482,27 @@ check('approval labels: booking codes flagged under both rules', ['9:26', '9:27'
     approvalLabels['9:28'] == 'Side: slot 28 (Owner)')
 
 // --- Turning lock management off, or disconnecting, drops the hub switch ---
-app.fullControlLocks = ['9']
+app.fullControlEnabled = true
 app.lockManagementEnabled = false
-app.syncLockManagementEnabled()
-check('disable: full control switch cleared with the approvals', app.fullControlLocks == null && app.state.lockConfig == null)
+app.syncFeatures(false)
+check('disable: full control switch cleared with the approvals', app.fullControlEnabled == null && app.state.lockConfig == null)
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
-app.fullControlLocks = ['9']
+app.syncFeatures(true)
+app.fullControlEnabled = true
 app.appButtonHandler('btnDisconnect')
-check('disconnect: full control switch cleared', app.fullControlLocks == null)
+check('disconnect: full control switch cleared', app.fullControlEnabled == null)
 
-// --- The app page offers the switch per selected lock ---
+// --- The app page offers one switch, off by default ---
 app.state.sbToken = 'ingest-fake'
 app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
 app.inputs.clear(); app.paragraphs.clear()
 app.mainPage()
-check('page: full control switch lists the selected locks, nothing selected by default', app.inputs.fullControlLocks?.options == ['9': 'Side', '8': 'Back'] &&
-    app.inputs.fullControlLocks.multiple == true && app.inputs.fullControlLocks.defaultValue == null)
-app.codeLocks = []
+check('page: one full control switch, off by default', app.inputs.fullControlEnabled?.type == 'bool' && app.inputs.fullControlEnabled.defaultValue == false &&
+    !app.inputs.containsKey('fullControlLocks'))
+app.lockManagementEnabled = false
 app.inputs.clear()
 app.mainPage()
-check('page: no switch without locks', !app.inputs.containsKey('fullControlLocks'))
+check('page: no switch while door code management is off', !app.inputs.containsKey('fullControlEnabled'))
 
 // --- No code anywhere it shouldn't be ---
 def leaks = { String s -> fakeCodes.findAll { s?.contains(it) } }

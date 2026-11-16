@@ -4,22 +4,22 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     // Same store as state here; the hub writes atomicState through immediately.
     Map getAtomicState() { state }
     Map params = [:]
     Map request = [:]
-    // 1.8.0 settings (#80): locks are picked once (locks) and the managed ones
-    // ticked from them (managedLocks). `app.codeLocks = [...]` in this harness is
-    // shorthand for "these locks are selected and managed"; the app's pre-1.8.0
-    // codeLocks setting reads as gone.
+    // 1.9.0 settings (#82): every lock picked under Locks is managed.
+    // `app.codeLocks = [...]` in this harness is shorthand for "these locks are
+    // selected"; the app's pre-1.8.0 codeLocks setting reads as gone.
     def lockList = null
     List managedDevices = []
     def managedLocks = null
     def getLocks() { List all = ((lockList ?: []) + managedDevices).unique { it.id.toString() }; all ?: lockList }
     void setLocks(def v) { lockList = v }
     def getCodeLocks() { null }
-    void setCodeLocks(def v) { managedDevices = (v ?: []) as List; managedLocks = v ? v.collect { it.id.toString() } : null }
+    void setCodeLocks(def v) { managedDevices = (v ?: []) as List }
     def contactSensors = null, temperatureSensors = null, humiditySensors = null
     def controlSwitches = null, controlGarageDoors = null, controlDoors = null, controlThermostats = null, controlValves = null
     Boolean lockControlEnabled = false, deviceControlEnabled = false
@@ -31,6 +31,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -132,6 +133,7 @@ lock2.attrs.lockCodes = '{"1":{"name":"SBA: Owner","code":"66666666"},"12":{"nam
 app.codeLocks = [lock, lock2]
 app.state.sbToken = 'ingest-fake'
 app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.state.lockMgmtLastEnabled = true
 
 def body = { Map r -> r.data ? new JsonSlurper().parseText(r.data) : null }
 int fails = 0
@@ -336,13 +338,15 @@ check('no codes logged', !app.logged.any { it.toString() =~ /1111|2222|3333|4444
 app.lockManagementEnabled = false
 check('disabled -> 404', app.apiListLocks().status == 404)
 
-// Off -> on flip rotates the token before any registration
-app.state.lockMgmtLastEnabled = false
+// Off -> on takes effect on Done and rotates the token before any registration
+app.state.remove('lockMgmtLastEnabled')
 app.lockManagementEnabled = true
 app.state.accessToken = 'tok-abandoned-reconnect'
 int postsBefore = app.posts.size()
-check('enable handled without registering', app.syncLockManagementEnabled() == false && app.posts.size() == postsBefore)
-check('token rotated on enable', app.state.accessToken != 'tok-abandoned-reconnect')
+check('ticked, page only: not on yet, token kept', app.syncFeatures(false) == false && app.state.lockMgmtLastEnabled == null &&
+    app.state.accessToken == 'tok-abandoned-reconnect' && app.apiListLocks().status == 404)
+check('enable handled without registering', app.syncFeatures(true) == false && app.posts.size() == postsBefore)
+check('token rotated on enable', app.state.accessToken != 'tok-abandoned-reconnect' && app.state.lockMgmtLastEnabled == true)
 
 // Disable without Done (submitOnChange): rotate, clear rules, notify
 app.lockManagementEnabled = true
@@ -353,16 +357,17 @@ app.state.accessToken = oldToken
 app.lockManagementEnabled = false
 int before = app.posts.findAll { it.cb == 'registerCallback' }.size()
 check('in-flight changes exist before disable', app.state.pendingCodeChanges?.values()?.any { it.status == 'pending' })
-check('sync handled disable', app.syncLockManagementEnabled() == true)
+check('sync handled disable', app.syncFeatures(false) == true)
 check('pending changes (and codes) dropped on disable', app.state.pendingCodeChanges == null && !app.scheduled.any { it.handler == 'verifyCodeChanges' })
 check('in-flight changes reported failed on disable', app.posts.any { it.params.body?.contains('lock_management_disabled') })
 check('token rotated on disable', app.state.accessToken != oldToken)
 check('rules cleared on disable', app.state.lockConfig == null && app.approvedAdoptedSlots == null)
 def reg = new JsonSlurper().parseText(app.posts[-1].params.body)
-check('disable notified', app.posts.findAll { it.cb == 'registerCallback' }.size() == before + 1 && reg.lockManagement == false && reg.appAccessToken == null)
-check('second sync no-op', app.syncLockManagementEnabled() == false)
+check('disable notified', app.posts.findAll { it.cb == 'registerCallback' }.size() == before + 1 && reg.lockManagement == false && reg.codeManagement == false && reg.appAccessToken == null)
+check('second sync no-op', app.syncFeatures(false) == false)
 
 app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
 lock.attrs.lockCodes = 'ENCRYPTEDBLOB'
 app.params = [lockId: '7']
 check('encrypted unreadable -> 409', app.apiListSlots().status == 409)
@@ -370,7 +375,7 @@ check('encrypted unreadable -> 409', app.apiListSlots().status == 409)
 app.registerWithPlatform()
 reg = new JsonSlurper().parseText(app.posts[-1].params.body)
 check('register url', app.posts[-1].params.uri == 'https://ingest.test/v1/webhooks/hubitat/register')
-check('register payload', reg.lockManagement == true && reg.appAccessToken && reg.appId == '42')
+check('register payload', reg.lockManagement == true && reg.codeManagement == true && reg.lockControl == false && reg.deviceControl == false && reg.appAccessToken && reg.appId == '42')
 app.state.ingestUrl = 'http://ingest.test/v1/webhooks/hubitat'
 before = app.posts.size()
 app.registerWithPlatform()
@@ -1310,11 +1315,11 @@ app.params = [lockId: '10']
 
 // Disable clears the key; re-enabling needs a new one
 app.state.lockMgmtLastEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(false)
 check('fp: key cleared on disable', app.state.fingerprintKey == null && app.state.fingerprintTimes == null && app.state.fingerprintBatchTimes == null)
 check('fpkey: pending request cleared on disable', app.state.fingerprintKeyPending == null)
 app.lockManagementEnabled = true
-app.syncLockManagementEnabled()
+app.syncFeatures(true)
 app.request = [JSON: fpCfg]
 fcall('apiSetLockConfig')
 check('fp: after re-enable -> 409 fingerprint_key_missing', body(fcall('apiListFingerprints')).error == 'fingerprint_key_missing')
@@ -1340,7 +1345,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.8.0'
+String VERSION = '1.9.0'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1372,7 +1377,7 @@ app.verifyCodeChanges()
 check('version: scheduled check retries after 30 minutes', registers().size() == 2)
 app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true])
 check('version: success records the registered version', app.state.registeredVersion == VERSION)
-check('version: registered log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: registered SignalBricks Telemetry ${VERSION} with SignalBricks (lock management on)" })
+check('version: registered log names the app and version', app.logged.any { it.toString() == "SignalBricks Telemetry: registered SignalBricks Telemetry ${VERSION} with SignalBricks (on)" })
 app.fakeNow += 60L * 60 * 1000
 event()
 check('version: same version never re-registers', registers().size() == 2)
@@ -1675,47 +1680,24 @@ check('any-case: an ordinary adopted name is still written', ci('apiSetCode', [l
 String ciAll = (ciResponses.collect { it.data } + app.logged.collect { it.toString() } + app.posts.collect { it.params.body }).join('\n')
 check('any-case: no code in any response, log or post', !(ciCodes.values()*.code + ['80802222', '80802299', '12121212']).any { ciAll.contains(it) })
 
-// --- Select all / Clear for the managed locks and full control lists (#66, #80) ---
+// --- Every selected lock is managed; full control is one switch (#82) ---
 def selA = new FakeLock(id: '31', displayName: 'SelA', name: 'SelA', label: 'SelA')
-def selB = new FakeLock(id: '32', displayName: 'SelB', name: 'SelB', label: 'SelB')
 def selNoCodes = new FakeLock(id: '33', displayName: 'SelNoCodes', name: 'SelNoCodes', label: 'SelNoCodes', caps: ['Lock'])
-def selPicked = new FakeLock(id: '34', displayName: 'SelPicked', name: 'SelPicked', label: 'SelPicked')
 app.codeLocks = []
-app.locks = [selA, selNoCodes, selPicked]
-app.managedLocks = ['34']
-app.fullControlLocks = ['34']
+app.locks = [selA, selNoCodes]
+app.fullControlLocks = null
+app.fullControlEnabled = null
 app.lockManagementEnabled = true
 app.state.lockMgmtLastEnabled = true
-app.logged.clear()
 app.updated()
-check('select all: lists unchanged until a button is clicked', app.managedLocks == ['34'] && app.fullControlLocks == ['34'] && app.findCodeLock('31') == null)
-app.appButtonHandler('btnSelectAllManagedLocks')
-check('select all managed: every lock under Devices, with or without codes', app.managedLocks as Set == ['31', '33', '34'] as Set)
-app.managedLocks = ['34', '31']
-app.locks = [selA, selNoCodes, selPicked, selB]
-check('select all managed: a lock added under Devices later is not added by itself', app.findCodeLock('32') == null && app.findCodeLock('31') != null)
-app.appButtonHandler('btnSelectAllManagedLocks')
-check('select all managed: clicking again adds it', app.managedLocks as Set == ['31', '32', '33', '34'] as Set && app.findCodeLock('32') != null)
-app.managedLocks = ['34', '31', '32']
-app.appButtonHandler('btnSelectAllFullControl')
-check('select all full control: every managed lock, once', app.fullControlLocks as Set == ['34', '31', '32'] as Set && app.fullControlLocks.size() == 3)
-check('select all full control: logged without codes', app.logged.any { it.toString().contains('full lock control allowed on all 3 managed locks') })
-def selD = new FakeLock(id: '35', displayName: 'SelD', name: 'SelD', label: 'SelD')
-app.locks = [selA, selNoCodes, selPicked, selB, selD]
-app.managedLocks = ['34', '31', '32', '35']
-check('select all full control: a lock added later is not fully controlled until clicked again', !app.fullControlAllowedIds().contains('35'))
-app.appButtonHandler('btnClearFullControl')
-check('clear full control: list emptied', app.fullControlLocks == null && app.fullControlAllowedIds() == [])
-app.appButtonHandler('btnClearManagedLocks')
-check('clear managed: list emptied', app.managedLocks == null && app.findCodeLock('31') == null)
-app.managedLocks = ['31']
+check('every selected lock with codes is managed', app.findCodeLock('31') != null && app.findCodeLock('33') == null && app.findControlLock('33') != null)
+check('full control off by default', app.fullControlAllowedIds() == [])
+app.fullControlEnabled = true
+check('full control on: every managed lock with codes', app.fullControlAllowedIds() == ['31'])
 app.locks = [selNoCodes]
-check('managed: a lock no longer selected under Devices is not managed', app.findCodeLock('31') == null)
+check('a lock no longer selected is not managed', app.findCodeLock('31') == null && app.fullControlAllowedIds() == [])
 app.locks = null
-app.managedLocks = null
-app.appButtonHandler('btnSelectAllManagedLocks')
-app.appButtonHandler('btnSelectAllFullControl')
-check('select all with nothing eligible: lists stay empty', app.managedLocks == null && app.fullControlLocks == null)
+app.fullControlEnabled = null
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

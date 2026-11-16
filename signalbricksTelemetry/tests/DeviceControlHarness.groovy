@@ -8,7 +8,8 @@ import groovy.json.JsonSlurper
 import org.codehaus.groovy.control.CompilerConfiguration
 
 abstract class HubitatStub extends Script {
-    Map state = [:]
+    // A hub whose 1.9.0 settings migration has finished
+    Map state = [settingsMigration: [done: true]]
     Map getAtomicState() { state }
     Map params = [:]
     def request = [:]
@@ -22,6 +23,7 @@ abstract class HubitatStub extends Script {
     def maxManagedSlot = null
     def approvedAdoptedSlots = null
     def fullControlLocks = null
+    Boolean fullControlEnabled = null
     List removedSettings = []
     List logged = []
     List posts = []
@@ -134,8 +136,8 @@ def thermo = new FakeDevice(id: '24', displayName: 'Thermostat', label: 'Thermos
     attrs: [thermostatMode: 'heat', heatingSetpoint: 68, coolingSetpoint: 76, temperature: 70.5, thermostatOperatingState: 'idle'])
 def valve = new FakeDevice(id: '25', displayName: 'Main valve', label: 'Main valve', caps: ['Valve'], attrs: [valve: 'open'])
 def sensor = new FakeDevice(id: '26', displayName: 'Door sensor', label: 'Door sensor', caps: ['ContactSensor'], attrs: [contact: 'closed'])
-app.locks = [lockA, lockB, lockC, lockD, lockE]
-app.managedLocks = ['10', '12', '13', '14']
+// Every selected lock is managed; Shed (11) is not selected
+app.locks = [lockA, lockC, lockD, lockE]
 app.contactSensors = [sensor]
 app.controlSwitches = [sw, dim]
 app.controlGarageDoors = [garage]
@@ -161,15 +163,17 @@ app.lockControlEnabled = true
 app.paragraphs.clear(); app.mainPage()
 check('lock control on, before Done: 404', call('apiUnlock', [lockId: '10']).status == 404 && lockA.calls.isEmpty())
 check('page: says to click Done', app.paragraphs.any { it.contains('Click Done') })
-check('page: one Devices section with every selection', ['locks', 'managedLocks', 'contactSensors', 'temperatureSensors', 'humiditySensors', 'controlSwitches',
+check('page: one Devices section with every selection', ['locks', 'contactSensors', 'temperatureSensors', 'humiditySensors', 'controlSwitches',
     'controlGarageDoors', 'controlDoors', 'controlThermostats', 'controlValves'].every { app.inputs.containsKey(it) } && !app.inputs.containsKey('codeLocks'))
-check('page: managed locks are picked from the Locks list', app.inputs.managedLocks.type == 'enum' && app.inputs.managedLocks.options.keySet() == ['10', '11', '12', '13', '14'] as Set)
+check('page: no managed-lock or full-control lists', !app.inputs.containsKey('managedLocks') && !app.inputs.containsKey('fullControlLocks'))
+check('page: one switch per feature', ['lockManagementEnabled', 'lockControlEnabled', 'deviceControlEnabled'].every { app.inputs[it]?.type == 'bool' } &&
+    app.inputs.fullControlEnabled?.type == 'bool')
 String tokenBefore = app.state.accessToken
 app.updated()
 check('Done: access token replaced', app.state.accessToken != tokenBefore && app.state.lockControlOn == true && app.state.deviceControlOn == null)
 Map reg = registers()[-1]
 check('Done: registers lockControl on, deviceControl off, with the new token', reg.lockControl == true && reg.deviceControl == false && reg.appAccessToken == app.state.accessToken &&
-    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.8.0')
+    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.0')
 check('token replaced is logged without the token', app.logged.any { it == 'SignalBricks Telemetry: lock control turned on; access token rotated' } && !app.logged.any { it.contains('fake-app-token') })
 String tokenOn = app.state.accessToken
 app.updated()
@@ -203,11 +207,11 @@ check('state: jammed lock without battery or activity', body(call('apiLockState'
 check('state: no code, code name or lockCodes', !lockA.reads.any { it[0] in ['lockCodes', 'lastCodeName'] })
 ['apiLock', 'apiUnlock', 'apiLockRefresh', 'apiLockState'].each { h ->
     def nm = call(h, [lockId: '11'])
-    check("${h}: lock selected but not managed -> 404", nm.status == 404 && body(nm) == [error: 'lock_not_found'])
+    check("${h}: lock not selected -> 404", nm.status == 404 && body(nm) == [error: 'lock_not_found'])
     check("${h}: unknown lock -> 404", call(h, [lockId: '999']).status == 404)
     check("${h}: a device selected for control is not a lock -> 404", call(h, [lockId: '20']).status == 404)
 }
-check('unmanaged lock: nothing sent', lockB.calls.isEmpty())
+check('lock not selected: nothing sent', lockB.calls.isEmpty())
 lockD.throwOnCommand = true
 r = call('apiUnlock', [lockId: '13'])
 check('driver throws -> 502 send_error', r.status == 502 && body(r).error == 'send_error')
@@ -362,21 +366,21 @@ def lockSwitch = new FakeDevice(id: '40', displayName: 'Lock switch', label: 'Lo
 def lockDoor = new FakeDevice(id: '41', displayName: 'Lock door', label: 'Lock door', caps: ['Lock', 'DoorControl'], attrs: [door: 'closed', lock: 'locked'])
 def keypadSwitch = new FakeDevice(id: '42', displayName: 'Keypad', label: 'Keypad', caps: ['LockCodes', 'Switch'], attrs: [switch: 'off'])
 // Switch-only device whose id is a selected lock's
-def sameIdSwitch = new FakeDevice(id: '11', displayName: 'Shed switch', label: 'Shed switch', caps: ['Switch'], attrs: [switch: 'off'])
+def sameIdSwitch = new FakeDevice(id: '12', displayName: 'Shed switch', label: 'Shed switch', caps: ['Switch'], attrs: [switch: 'off'])
 app.controlSwitches = [sw, dim, lockSwitch, keypadSwitch, sameIdSwitch]
 app.controlDoors = [gate, lockDoor]
 [true, false].each { lockOn ->
     if (!lockOn) { app.lockControlEnabled = false; app.paragraphs.clear(); app.mainPage() }
     String when = lockOn ? 'lock control on' : 'lock control off'
-    [['40', 'on'], ['40', 'off'], ['41', 'open'], ['41', 'close'], ['42', 'on'], ['11', 'on']].each { id, c ->
+    [['40', 'on'], ['40', 'off'], ['41', 'open'], ['41', 'close'], ['42', 'on'], ['12', 'on']].each { id, c ->
         def res = cmd(id, [command: c])
         check("${when}: lock-like device ${id} ${c} -> 404", res.status == 404 && body(res) == [error: 'device_not_found'])
     }
-    check("${when}: lock-like devices not listed", !body(call('apiListDevices')).devices*.id.any { it in ['40', '41', '42', '11'] })
+    check("${when}: lock-like devices not listed", !body(call('apiListDevices')).devices*.id.any { it in ['40', '41', '42', '12'] })
 }
 check('lock-like devices: nothing sent', lockSwitch.calls.isEmpty() && lockDoor.calls.isEmpty() && keypadSwitch.calls.isEmpty() && sameIdSwitch.calls.isEmpty())
 app.paragraphs.clear(); app.inputs.clear(); app.mainPage()
-check('page: locks picked under a control list are named as ignored', app.paragraphs.any { it.contains('Locks are controlled under Lock control and are ignored here:') &&
+check('page: locks picked under a control list are named as ignored', app.paragraphs.any { it.contains('Locks are ignored here') &&
     ['Lock switch', 'Lock door', 'Keypad', 'Shed switch'].every { n -> it.contains(n) } && !it.contains('Porch light') })
 app.subscriptions.clear()
 app.subscribeToEvents()
@@ -395,15 +399,11 @@ def noCodes = call('apiSetCode', [lockId: '12'], [slot: 3, code: '13572468', nam
 check('code write on a managed lock without codes -> 404', noCodes.status == 404 && !lockC.calls.any { it[0] == 'setCode' })
 check('lock control still works on it', call('apiLock', [lockId: '12']).status == 202)
 
-// Done prunes managed and full-control locks no longer under Locks
-app.fullControlLocks = ['10', '13']
-app.locks = [lockA, lockB, lockC, lockE]
-app.updated()
-check('Done: a lock removed from Locks is no longer managed or fully controlled', app.managedLocks == ['10', '12', '14'] && app.fullControlLocks == ['10'])
-app.locks = [lockA, lockB, lockC, lockD, lockE]
-check('added back: not managed until ticked again', call('apiLock', [lockId: '13']).status == 404 && app.managedLocks == ['10', '12', '14'])
-app.managedLocks = ['10', '12', '13', '14']
-app.updated()
+// A lock removed from Locks is no longer managed; added back, it is again
+app.locks = [lockA, lockC, lockE]
+check('a lock removed from Locks is no longer controlled', call('apiLock', [lockId: '13']).status == 404)
+app.locks = [lockA, lockC, lockD, lockE]
+check('added back: controlled again', call('apiLock', [lockId: '13']).status == 202)
 resetLimits()
 
 // Telemetry for controlled devices
@@ -412,7 +412,7 @@ app.subscribeToEvents()
 Map subs = app.subscriptions.groupBy { it.id }.collectEntries { k, v -> [(k): v*.attribute as Set] }
 check('telemetry: controlled devices report what their commands change', subs['20'] == ['switch', 'battery'] as Set &&
     subs['21'].containsAll(['switch', 'level']) && subs['22'].contains('door') && subs['24'].containsAll(['thermostatMode', 'heatingSetpoint', 'coolingSetpoint']) && subs['25'].contains('valve'))
-check('telemetry: managed and unmanaged locks report lock state, never lockCodes', subs['10'].contains('lock') && subs['11'].contains('lock') && !app.subscriptions.any { it.attribute == 'lockCodes' })
+check('telemetry: every selected lock reports lock state, never lockCodes', ['10', '12', '13', '14'].every { subs[it].contains('lock') } && !app.subscriptions.any { it.attribute == 'lockCodes' })
 check('telemetry: battery once per device', app.subscriptions.findAll { it.attribute == 'battery' }*.id.size() == app.subscriptions.findAll { it.attribute == 'battery' }*.id.unique().size())
 
 // No code anywhere
@@ -428,19 +428,57 @@ check('device control off: 404 at once', call('apiListDevices').status == 404 &&
 check('lock control still on', call('apiLock', [lockId: '10']).status == 202)
 app.deviceControlEnabled = true
 app.updated()
+
+// Door code management off: lock and device control carry on, same token (#82)
+String tokenKept = app.state.accessToken
 app.lockManagementEnabled = false
 app.paragraphs.clear(); app.mainPage()
-check('lock code management off: lock and device control 404', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404)
-check('lock code management off: control state and limits cleared', app.state.lockControlOn == null && app.state.deviceControlOn == null && app.state.lockCommandLockTimes == null)
-check('lock code management off: registered off', registers()[-1].lockManagement == false && registers()[-1].lockControl == false && registers()[-1].appAccessToken == null)
-check('page: control needs lock code management', app.paragraphs.any { it.contains('Turn on lock code management') })
+check('code management off: code endpoints 404', call('apiListLocks').status == 404 && call('apiSetCode', [lockId: '10'], [slot: 3, code: '13572468', name: 'SBA: Test']).status == 404)
+check('code management off: lock and device control still on', call('apiUnlock', [lockId: '10']).status == 202 && call('apiListDevices').status == 200)
+check('code management off: token kept', app.state.accessToken == tokenKept)
+// A switch read off (e.g. before the page runs) closes its endpoints even while its state says on
+app.deviceControlEnabled = false
+app.lockControlEnabled = false
+check('switch off, state still on: 404', call('apiListDevices').status == 404 && call('apiUnlock', [lockId: '10']).status == 404 && app.state.deviceControlOn == true)
+app.deviceControlEnabled = true
+app.lockControlEnabled = true
+reg = registers()[-1]
+check('code management off: registered with control only', reg.lockManagement == true && reg.codeManagement == false && reg.lockControl == true &&
+    reg.deviceControl == true && reg.appAccessToken == tokenKept)
 app.updated()
-check('Done with lock code management off: control stays off', app.state.lockControlOn == null && call('apiUnlock', [lockId: '10']).status == 404)
+check('Done with code management off: control stays on', call('apiLock', [lockId: '10']).status == 202 && app.state.accessToken == tokenKept)
+resetLimits()
+
+// Control without code management from the start: register, then Done turns it on
+app.lockControlEnabled = false
+app.deviceControlEnabled = false
+app.paragraphs.clear(); app.mainPage()
+check('everything off: control 404', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404)
+check('everything off: control state and limits cleared', app.state.lockControlOn == null && app.state.deviceControlOn == null && app.state.lockCommandLockTimes == null &&
+    app.state.deviceCommandTimes == null)
+check('everything off: token rotated, registered off', app.state.accessToken != tokenKept && registers()[-1].lockManagement == false &&
+    registers()[-1].lockControl == false && registers()[-1].deviceControl == false && registers()[-1].codeManagement == false && registers()[-1].appAccessToken == null)
+app.updated()
+check('Done with everything off: nothing on', app.state.lockControlOn == null && app.state.lockMgmtLastEnabled == null && app.endpointOn() == false)
+app.deviceControlEnabled = true
+app.paragraphs.clear(); app.inputs.clear(); app.mainPage()
+check('device control alone, before Done: 404, says Done', call('apiListDevices').status == 404 && app.paragraphs.any { it.contains('Click Done') })
+check('page: no code management controls while it is off', !app.inputs.containsKey('maxManagedSlot') && !app.inputs.containsKey('fullControlEnabled') &&
+    !app.inputs.containsKey('btnRotateLockToken'))
+tokenBefore = app.state.accessToken
+app.updated()
+reg = registers()[-1]
+check('device control alone: on after Done with a new token', call('apiListDevices').status == 200 && app.state.accessToken != tokenBefore &&
+    reg.lockManagement == true && reg.codeManagement == false && reg.deviceControl == true && reg.lockControl == false && reg.appAccessToken == app.state.accessToken)
+check('device control alone: code endpoints and lock control 404', call('apiListLocks').status == 404 && call('apiGetLockConfig').status == 404 &&
+    call('apiUnlock', [lockId: '10']).status == 404)
 app.lockManagementEnabled = true
 app.paragraphs.clear(); app.mainPage()
-check('lock code management back on: control waits for Done', call('apiUnlock', [lockId: '10']).status == 404)
+check('code management ticked, before Done: still 404', call('apiListLocks').status == 404)
 app.updated()
-check('after Done: control back on', call('apiUnlock', [lockId: '10']).status == 202 && call('apiListDevices').status == 200)
+check('after Done: code management on too', call('apiListLocks').status == 200 && registers()[-1].codeManagement == true)
+app.lockControlEnabled = true
+app.updated()
 app.appButtonHandler('btnDisconnect')
 check('Disconnect: 404, control state cleared', call('apiUnlock', [lockId: '10']).status == 404 && call('apiListDevices').status == 404 &&
     app.state.lockControlOn == null && app.state.deviceControlOn == null)
