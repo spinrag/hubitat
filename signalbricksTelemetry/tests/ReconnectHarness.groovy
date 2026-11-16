@@ -548,7 +548,8 @@ app.oauthCallback()
 check('control only, Reconnect: control needs a Done again', app.state.lockControlOn == null && app.state.deviceControlOn == null &&
     registers().size() == 1 && regBody(registers()[0]).lockControl == false && regBody(registers()[0]).appAccessToken == null)
 mainPage()
-check('control only, Reconnect: page asks for Done', app.paragraphs.any { it.contains('Click Done to turn it on') })
+check('control only, Reconnect: page asks for Done, no rotate button until then', app.paragraphs.any { it.contains('Click Done to turn it on') } &&
+    !app.inputs.containsKey('btnRotateLockToken'))
 String beforeDone = app.state.accessToken
 app.updated()
 check('control only, Reconnect then Done: on again with a new token', app.state.lockControlOn == true && app.state.deviceControlOn == true && app.state.accessToken != beforeDone)

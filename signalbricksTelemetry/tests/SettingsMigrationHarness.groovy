@@ -249,6 +249,8 @@ app.dailyCheckIn()
 app.state.lockControlOn = true
 app.params = [lockId: '101']
 check('1.8: lock control refused while the pause note is up', app.apiUnlock().status == 404)
+app.appButtonHandler('btnDismissSettingsNote')
+check('1.8: dismissing the note then does not let it through either', app.state.lockControlOn == null && app.apiUnlock().status == 404)
 
 // 1.8 with no managed locks ticked: all of them become managed and are listed; lock control paused
 app = hub18()
