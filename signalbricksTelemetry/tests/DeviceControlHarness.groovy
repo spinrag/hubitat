@@ -173,7 +173,7 @@ app.updated()
 check('Done: access token replaced', app.state.accessToken != tokenBefore && app.state.lockControlOn == true && app.state.deviceControlOn == null)
 Map reg = registers()[-1]
 check('Done: registers lockControl on, deviceControl off, with the new token', reg.lockControl == true && reg.deviceControl == false && reg.appAccessToken == app.state.accessToken &&
-    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.0')
+    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.1')
 check('token replaced is logged without the token', app.logged.any { it == 'SignalBricks Telemetry: lock control turned on; access token rotated' } && !app.logged.any { it.contains('fake-app-token') })
 String tokenOn = app.state.accessToken
 app.updated()
@@ -257,6 +257,18 @@ check('list: thermostat, opted in as a thermostat only', devs['24'].capabilities
     devs['24'].commands == ['setHeatingSetpoint', 'setCoolingSetpoint', 'setThermostatMode'] &&
     devs['24'].state == [thermostatMode: 'heat', heatingSetpoint: 68, coolingSetpoint: 76, thermostatOperatingState: 'idle', temperature: 70.5])
 check('list: valve', devs['25'].capabilities == ['valve'] && devs['25'].commands == ['open', 'close'] && devs['25'].state == [valve: 'open'])
+check('list: temperatureScale F at the top level', body(r).temperatureScale == 'F' && body(r).keySet() == ['temperatureScale', 'devices'] as Set)
+check('list: no supportedThermostatModes when the thermostat has none', !devs['24'].state.containsKey('supportedThermostatModes'))
+check('list: state read from the device, not the cache', [sw, dim, garage, gate, thermo, valve].every { d -> d.reads && d.reads.every { it[1] == true } })
+app.location.temperatureScale = 'C'
+check('list: temperatureScale C', body(call('apiListDevices')).temperatureScale == 'C')
+app.location.temperatureScale = 'F'
+thermo.attrs.supportedThermostatModes = '["heat","cool","off"]'
+check('list: supportedThermostatModes as a list', body(call('apiListDevices')).devices.find { it.id == '24' }.state.supportedThermostatModes == ['heat', 'cool', 'off'])
+thermo.attrs.supportedThermostatModes = '[heat, auto]'
+check('list: supportedThermostatModes in the unquoted form', body(call('apiListDevices')).devices.find { it.id == '24' }.state.supportedThermostatModes == ['heat', 'auto'])
+check('list: only thermostats report supportedThermostatModes', !body(call('apiListDevices')).devices.findAll { it.id != '24' }.any { it.state.containsKey('supportedThermostatModes') })
+thermo.attrs.remove('supportedThermostatModes')
 
 def okCmd = { String id, Map json, def device, List expectCall ->
     def res = cmd(id, json)

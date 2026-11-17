@@ -126,7 +126,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.9.0'
+@Field static final String APP_VERSION = '1.9.1'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -3373,20 +3373,25 @@ Boolean hasDeviceCommand(dev, String command) {
     }
 }
 
-// GET /devices: devices selected for control, with what may be sent to each.
+// GET /devices: the hub's temperatureScale and the devices selected for
+// control, with what may be sent to each and their current state.
 Map apiListDevices() {
     if (!deviceControlActive()) return notEnabled()
     List out = controlledDevices().values().collect { Map c ->
         def dev = c.device
         Map current = [:]
         c.caps.collectMany { CONTROL_ATTRIBUTES[it] }.unique().each { String a ->
-            def v = dev.currentValue(a)
+            def v = dev.currentValue(a, true)
             if (v != null) current[a] = v
+        }
+        if (c.caps.contains('thermostat')) {
+            List modes = supportedThermostatModes(dev, true)
+            if (modes != null) current.supportedThermostatModes = modes
         }
         [id: dev.id.toString(), label: (dev.label ?: dev.displayName)?.toString(), capabilities: c.caps,
          commands: c.caps.collectMany { CONTROL_COMMANDS[it] }.unique(), state: current]
     }
-    return jsonResponse([devices: out])
+    return jsonResponse([temperatureScale: location?.temperatureScale == 'C' ? 'C' : 'F', devices: out])
 }
 
 // POST /devices/:deviceId/command {command, args?, requestId?}: only a command
@@ -3467,9 +3472,9 @@ BigDecimal plainNumber(def a) {
 
 // The thermostat's supportedThermostatModes (a JSON list, or "[heat, off]"), or
 // null when it doesn't report them.
-List supportedThermostatModes(dev) {
+List supportedThermostatModes(dev, boolean skipCache = false) {
     try {
-        String raw = dev.currentValue('supportedThermostatModes')?.toString()?.trim()
+        String raw = dev.currentValue('supportedThermostatModes', skipCache)?.toString()?.trim()
         if (!raw) return null
         def parsed
         try {
