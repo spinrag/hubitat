@@ -37,6 +37,8 @@ Codes already on the locks keep their name until their booking ends; only codes 
 4. Check the [Bookings page](#bookings-page): no current booking should be *not on lock*.
 5. Once the bookings that were on the locks at the change have checked out, run **Refresh door codes now** and check that the Bookings page shows no code with the old prefix and no orphans. Only then clear **Previous prefix for code name**.
 
+Example: the recommended pair is OwnerRez `GO: ` and SignalBricks Integration `G: `. To move from OwnerRez `G: ` and this app `GT: `, change the OwnerRez app first: turn its codes off, remove them while its prefix is still `G: `, then set it to `GO: `. Only then set this app to `G: ` with previous prefix `GT: `. Otherwise this app treats the OwnerRez app's `G: ` codes as its own and removes them.
+
 ## Connect to SignalBricks
 
 Added in 1.4.0.

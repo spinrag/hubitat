@@ -126,7 +126,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.9.1'
+@Field static final String APP_VERSION = '1.9.2'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -1915,11 +1915,11 @@ Boolean isBookingName(String name) {
 // The stricter booking rule for registered slots and full lock control
 // (signalbricks/platform#684), mirrored by the platform's isBookingSlotName:
 // "orb" followed by a digit in any case, an upper-case "ORB" at the start of a
-// word (the pre-1.3.4 guard), or a name starting with the booking apps' G: or
-// GT: prefix (any case, spaces allowed before the colon). An unnamed slot
+// word (the pre-1.3.4 guard), or a name starting with the booking apps' G:,
+// GT: or GO: prefix (any case, spaces allowed before the colon). An unnamed slot
 // isn't a booking name, but it can never be registered (it could be a booking
 // code on a driver that drops names), so it is never reached either.
-@Field static final java.util.regex.Pattern STRICT_BOOKING_NAME = ~/(?i:orb\d)|(^|[\s-])ORB|^\s*(?i:gt?)\s*:/
+@Field static final java.util.regex.Pattern STRICT_BOOKING_NAME = ~/(?i:orb\d)|(^|[\s-])ORB|^\s*(?i:g[to]?)\s*:/
 @Field static final java.util.regex.Pattern CLASS_PREFIX_NAME = ~/^\s*(?i:sb[am])\s*:/
 
 Boolean isStrictBookingName(String name) {

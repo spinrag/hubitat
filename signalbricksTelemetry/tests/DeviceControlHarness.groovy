@@ -173,7 +173,7 @@ app.updated()
 check('Done: access token replaced', app.state.accessToken != tokenBefore && app.state.lockControlOn == true && app.state.deviceControlOn == null)
 Map reg = registers()[-1]
 check('Done: registers lockControl on, deviceControl off, with the new token', reg.lockControl == true && reg.deviceControl == false && reg.appAccessToken == app.state.accessToken &&
-    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.1')
+    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.2')
 check('token replaced is logged without the token', app.logged.any { it == 'SignalBricks Telemetry: lock control turned on; access token rotated' } && !app.logged.any { it.contains('fake-app-token') })
 String tokenOn = app.state.accessToken
 app.updated()

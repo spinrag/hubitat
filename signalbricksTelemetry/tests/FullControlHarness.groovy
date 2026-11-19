@@ -223,7 +223,7 @@ def bad = { String label, Map lockEntry ->
     def r = push(['9': lockEntry])
     check("config refused: ${label}", r.status == 400 && body(r).error == 'invalid_config' && app.state.lockConfig == before)
 }
-['GT:ORB1-x', 'G:ORB2-x', 'Guest -ORB3', 'orb4', 'Orb5 x', 'G: Gardener', 'gt : x', 'g:x', 'ORBIT', 'x ORBy'].each { n ->
+['GT:ORB1-x', 'G:ORB2-x', 'Guest -ORB3', 'orb4', 'Orb5 x', 'G: Gardener', 'gt : x', 'g:x', 'GO: Gardener', 'go:x', 'ORBIT', 'x ORBy'].each { n ->
     bad("booking-looking registered name '${n}'", [registered: [[slot: 3, name: n]]])
 }
 bad('blank name', [registered: [[slot: 3, name: '']]])
