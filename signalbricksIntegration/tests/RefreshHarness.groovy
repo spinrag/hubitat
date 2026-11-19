@@ -112,7 +112,7 @@ app.settings = [locks: ['1', '2', '3'] as String[]]
 Date now = new Date()
 Map bookings = ['88': [id: '88', guest: 'Ann', code: '24681357', lockId: ['1'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.16', app.sbAppVersion == '1.4.16')
+check('version is 1.4.17', app.sbAppVersion == '1.4.17')
 
 // Saving the app code runs the main page with no state and no settings
 def savedState = app.state, savedAtomic = app.atomicState, savedSettings = app.settings
@@ -156,11 +156,6 @@ app.settings.codeRefreshCadence = 'daily'
 app.scheduled.clear()
 app.updated()
 check('Done (daily): no lock read, no run started', calls.isEmpty() && app.atomicState.codeRefresh == null && !pending('codeRefreshNext'))
-app.request = [JSON: [sbId: 'sb-fake']]
-app.apiRegister()
-check('/register: no lock read, no run started', calls.isEmpty() && app.atomicState.codeRefresh == null && !pending('codeRefreshNext'))
-app.state.sbId = null
-app.atomicState.sbId = null
 
 // --- Cadence ---
 def cronOf = { pending('codeRefreshScheduled')?.cron }

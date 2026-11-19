@@ -104,7 +104,7 @@ def body = { Map p -> new JsonSlurper().parseText(p.body) }
 def CREDENTIAL = 'sbhi.00000000-0000-4000-8000-000000000001.fakecredentialfakecredentialfakecredential00'
 List secrets = []
 
-check('version is 1.4.16', app.sbAppVersion == '1.4.16')
+check('version is 1.4.17', app.sbAppVersion == '1.4.17')
 
 // Saving the app code runs the main page with no state and no settings (#28)
 def savedState = app.state
@@ -139,7 +139,7 @@ check('authorize: client id, redirect uri, response type', q.client_id == 'signa
 String verifier = app.state.sbPkceVerifier
 secrets << verifier
 check('authorize: PKCE S256 challenge of the stored verifier', q.code_challenge_method == 'S256' && q.code_challenge == b64url(verifier) && verifier ==~ /[0-9a-f]{96}/)
-check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.16' && q.location == 'Example Org')
+check('authorize: hub uid, app id, version, location', q.hub_uid == app.hubUID && q.app_id == '42' && q.version == '1.4.17' && q.location == 'Example Org')
 check('authorize: state is the stateredirect callback with the access token', q.state == "${app.hubUID}/apps/42/oauthCallback?access_token=${firstToken}".toString())
 mainPage()
 check('authorize: the verifier survives page re-renders', app.state.sbPkceVerifier == verifier)
@@ -162,30 +162,21 @@ secrets << app.state.accessToken
 Map reg = body(registerCall)
 check('register: in the background (SignalBricks calls back /info), Bearer credential over https',
     registerCall.async == 'sbRegisterCallback' && registerCall.uri.startsWith('https://') && registerCall.headers.Authorization == "Bearer ${CREDENTIAL}".toString())
-check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.16', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
+check('register: hub uid, app id, version, hub name, URLs and the new token', reg == [hubUid: app.hubUID, appId: '42', version: '1.4.17', hubName: 'Main Hub', localUrl: 'http://192.168.1.10/apps/api/42', cloudUrl: app.fullApiServerUrl, appAccessToken: app.state.accessToken])
 check('callback: verifier is single use', app.state.sbPkceVerifier == null)
 page = mainPage()
 check('callback: authorized, not connected until the registration answers', !app.state.sbConnected && page.contains('<b>Status:</b> Authorized, not registered yet') && oneStatus(page))
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([status: 'connected', organization_name: 'Example Org', hub_name: 'Main', slug: 'main'])], null)
-check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Example Org' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.16')
+check('register 200: state connected with names', app.state.sbConnected == true && app.state.sbOrgName == 'Example Org' && app.state.sbHubName == 'Main' && app.state.sbRegisteredVersion == '1.4.17')
 
 page = mainPage()
 check('page: Connected to org and hub', page.contains('<b>Status:</b> Connected to Example Org &rarr; Main') && oneStatus(page))
 app.paragraphs.clear(); app.hrefs.clear(); app.debug()
 String debugPage = (app.paragraphs + app.hrefs.collect { "${it.title} ${it.url}" }).join('\n')
 check('debug page: no access token while connected', !debugPage.contains(app.state.accessToken) && !debugPage.contains('access_token=') && debugPage.contains('Hidden while connected'))
-// Legacy /register (#36): logs no request body; Done and Reset State clear the sbId
-app.logged.clear()
-app.request = [JSON: [sbId: 'sb-legacy-fake', accessToken: 'fake-legacy-token']]
-app.apiRegister()
-check('legacy register: sbId stored, request body not logged', app.atomicState.sbId == 'sb-legacy-fake' && !app.logged.any { it.contains('sb-legacy-fake') || it.contains('fake-legacy-token') })
-app.state.sbId = 'sb-legacy-fake'
-check('page: a legacy sbId adds no second status or Disconnect', oneStatus(mainPage()))
-app.updated()
-check('legacy sbId: cleared by Done (updated)', app.state.sbId == null && app.atomicState.sbId == null)
-app.state.sbId = 'sb-legacy-fake'; app.atomicState.sbId = 'sb-legacy-fake'
-app.appButtonHandler('btnReset')
-check('legacy sbId: cleared by Reset State', app.state.sbId == null && app.atomicState.sbId == null)
+// The legacy registration is gone (#86): no /register endpoint or handlers
+check('legacy register: no apiRegister or apiUnregister', !new File(args[0]).text.contains('apiRegister') && !new File(args[0]).text.contains('apiUnregister'))
+check('page: one status and no legacy Disconnect', oneStatus(mainPage()))
 mainPage()
 check('page: Reconnect goes through the app\'s own /reconnect (#46), never straight to SignalBricks; Disconnect when connected',
     app.hrefs.find { it.name == 'hrefSbReconnect' }?.url == "${app.fullApiServerUrl}/reconnect?access_token=${app.state.accessToken}".toString() &&
@@ -401,7 +392,7 @@ secrets << app.state.accessToken
 
 // --- Re-register: on Done, and once after an update ---
 app.state.sbCredential = CREDENTIAL
-app.state.sbRegisteredVersion = '1.4.16'
+app.state.sbRegisteredVersion = '1.4.17'
 app.http.clear()
 app.updated()
 check('updated: re-registers in the background', app.http.any { it.async == 'sbRegisterCallback' && it.uri.endsWith('/register') })
@@ -413,11 +404,11 @@ app.apiSync()
 app.apiSync()
 check('apiSync: re-registers once after a version change', app.http.count { it.async == 'sbRegisterCallback' } == 1)
 app.sbRegisterCallback([status: 200, data: JsonOutput.toJson([organization_name: 'Example Org', hub_name: 'Main'])], null)
-check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.16' && app.state.sbConnected == true)
+check('register callback: version recorded', app.state.sbRegisteredVersion == '1.4.17' && app.state.sbConnected == true)
 
 // --- Existing endpoints are still mapped ---
 String src = new File(args[0]).text
-check('mappings: /oauthCallback added, /register and /sync kept', src.contains("path('/oauthCallback')") && src.contains("path('/register')") && src.contains("path('/sync')"))
+check('mappings: /oauthCallback and /sync kept, legacy /register removed', src.contains("path('/oauthCallback')") && !src.contains("path('/register')") && src.contains("path('/sync')"))
 
 // --- Nothing secret in any log line ---
 String logs = app.logged.join('\n')

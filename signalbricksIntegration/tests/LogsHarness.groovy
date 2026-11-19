@@ -92,9 +92,8 @@ def check = { String label, boolean ok -> println((ok ? 'PASS ' : 'FAIL ') + lab
 
 // Fake codes and token, distinct enough not to appear by accident
 String TOKEN = 'fake-access-token-0001'
-String LEGACY_TOKEN = 'fake-legacy-token-0002'
 List CODES = ['80001188', '80002277', '80003366', '80004455', '80005544', '80006633', '80007722', '80008811']
-List secrets = CODES + [TOKEN, LEGACY_TOKEN]
+List secrets = CODES + [TOKEN]
 
 app.state.accessToken = TOKEN
 app.settings = [locks: ['1'] as String[]]
@@ -160,10 +159,6 @@ step('GET /devices/<id>') {
     app.params = [deviceId: '1', access_token: TOKEN]
     app.apiGetDevice()
 }
-step('POST /register') {
-    app.request = [JSON: [sbId: 'sb-fake', accessToken: LEGACY_TOKEN]]
-    app.apiRegister()
-}
 step('reconcile') {
     app.scheduled.clear()
     app.reconcileDoorCodes()
@@ -178,10 +173,8 @@ step('duplicate code check') {
     Map bookings = app.helperGetBookings(app.atomicState.bookings)
     app.helperHasDuplicateCode('1', bookings['88'], bookings)
 }
-step('lock events (lockCodes webhook, failed code)') {
-    app.state.sbId = 'sb-fake'
-    app.webhook([name: 'lockCodes', value: front.attrs.lockCodes, deviceId: '1', displayName: 'Front'])
-    app.state.sbId = null
+step('lock events (lockCodes, failed code)') {
+    app.lockCodesHandler([name: 'lockCodes', value: front.attrs.lockCodes, deviceId: '1', displayName: 'Front', device: [id: '1']])
     def pos = app.atomicState.codeAssignments['1']?.keySet()?.first()
     app.codeChangedHandler([name: 'codeChanged', value: 'failed', data: JsonOutput.toJson([codeNumber: pos as int]), device: [id: '1']])
 }

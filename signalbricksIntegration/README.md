@@ -90,10 +90,6 @@ Codes are shown masked, with only their last 2 digits, and no log line carries a
 
 - **Don't run Hubitat's Lock Code Manager on the same locks.** It can rename or delete codes this app and other apps wrote.
 
-## The old registration and the outbound webhook
-
-With trace logging the log may show `webhook: No SignalBricks ID — skipping outbound POST`. That is expected and harmless: it belongs to an old outbound registration that was never used. Lock events reach SignalBricks through the [SignalBricks Telemetry](../signalbricksTelemetry/README.md) app instead.
-
 ## Requirements
 
 - Hubitat Elevation platform **2.5.0** or later

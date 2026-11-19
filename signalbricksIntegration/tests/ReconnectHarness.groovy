@@ -110,7 +110,7 @@ def CREDENTIAL_2 = CREDENTIAL.replace('00', '22')
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.4.16', app.sbAppVersion == '1.4.16')
+check('version is 1.4.17', app.sbAppVersion == '1.4.17')
 
 // --- A connected hub with bookings, slot assignments and a pending code write ---
 app.settings = [locks: ['1'] as String[], codeNamePrefix: 'GT:', minCodePosition: 50]
@@ -119,7 +119,7 @@ app.state.sbCredential = CREDENTIAL
 app.state.sbConnected = true
 app.state.sbOrgName = 'Test Org'
 app.state.sbHubName = 'Main'
-app.state.sbRegisteredVersion = '1.4.16'
+app.state.sbRegisteredVersion = '1.4.17'
 app.atomicState.bookings = ['101': [id: 101, guest: 'Fake Guest', code: '9876', lockId: '1', checkIn: '2030-01-01T16:00:00Z', checkOut: '2030-01-03T11:00:00Z']]
 app.atomicState.codeAssignments = ['1': ['101': 51]]
 app.atomicState.lastSync = [at: app.clock, source: 'PUT /sync']
@@ -275,8 +275,6 @@ app.clock += 600_000
 app.request = [JSON: [:]]
 app.apiSync()
 check('unattended: a booking sync re-arms the 30-minute retry for the time left', app.scheduled.find { it.handler == 'sbRegisterRetryRun' }?.secs == 1200)
-app.apiUnregister()
-check('unattended: the legacy DELETE /register (app-wide unschedule) re-arms it too', app.scheduled.find { it.handler == 'sbRegisterRetryRun' }?.secs == 1200)
 app.state.accessToken = t6
 app.clock += 1_200_000
 app.http.clear()
@@ -313,16 +311,6 @@ check('disconnect: link closed and no expiry left', app.atomicState.sbConnectLin
 // Not connected: /reconnect opens nothing
 def notConnected = app.apiReconnect()
 check('not connected: /reconnect says so and opens no window', notConnected.data.contains('Not connected') && !notConnected.data.contains('http-equiv') && app.atomicState.sbConnectLink == null && !expiryJob())
-
-// The legacy DELETE /register (app-wide unschedule) keeps an open window's expiry
-app.state.sbCredential = CREDENTIAL_2
-app.state.sbConnected = true
-app.apiReconnect()
-app.clock += 60_000
-app.apiUnregister()
-check('legacy unregister: the open window\'s expiry is re-armed for the time left', expiryJob()?.secs == 540)
-app.state.accessToken = app.createAccessToken(); track()
-app.sbConnectLinkClear()
 
 // Refresh Access Token (Debug) closes an open link: it carried the old token
 app.state.sbCredential = CREDENTIAL_2
