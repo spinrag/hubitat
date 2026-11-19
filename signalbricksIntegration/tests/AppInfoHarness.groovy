@@ -3,8 +3,8 @@
 // event carries exactly the contract keys (docs/hub-reporting.md) and no code,
 // code name, token, booking id or guest name; it is sent on install, on Done and
 // by a daily job at a random 04:00-23:59 time that survives every app-wide
-// unschedule() (install, Reset State, booking syncs and reconcile, DELETE
-// /register); announcing makes no network call. Fake values only.
+// unschedule() (install, Reset State, booking syncs and reconcile); announcing
+// makes no network call. Fake values only.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.text.SimpleDateFormat
@@ -128,7 +128,7 @@ app.settings = [locks: ['57'] as String[]]
 Date now = new Date(app.clock)
 Map bookings = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'], checkIn: new Date(now.time + 86400_000), checkOut: new Date(now.time + 2 * 86400_000)]]
 
-check('version is 1.4.16', app.sbAppVersion == '1.4.16')
+check('version is 1.4.17', app.sbAppVersion == '1.4.17')
 
 // --- Install ---
 app.installed()
@@ -137,7 +137,7 @@ Map ev = app.locationEvents[0]
 check('install: event name signalbricksAppInfo, isStateChange true', ev.name == 'signalbricksAppInfo' && ev.isStateChange == true && ev.value instanceof String)
 Map info = lastInfo()
 check("payload: exactly the contract keys (${info.keySet()})", info.keySet() as List == ['schemaVersion', 'appId', 'name', 'version', 'minCodePosition', 'codeNamePrefix', 'previousCodeNamePrefix'])
-check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.16')
+check('payload: schemaVersion 1, appId a string, name and version', info.schemaVersion == 1 && info.appId == '388' && info.name == 'SignalBricks Integration' && info.version == '1.4.17')
 check('payload: minCodePosition a number, prefix the setting', info.minCodePosition == 50 && info.minCodePosition instanceof Integer && info.codeNamePrefix == 'GT:')
 check('payload: no manageDoorCodes', !info.containsKey('manageDoorCodes'))
 check('payload: under 255 characters', ev.value.length() < 255)
@@ -173,7 +173,7 @@ app.atomicState.bookings = bookings
 app.state.accessToken = 'tok-fake-access-0001'
 app.locationEvents.clear()
 app.updated()
-check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.16')
+check('Done: announced once', app.locationEvents.size() == 1 && lastInfo().version == '1.4.17')
 check('Done: daily job kept, same time', jobs().size() == 1 && job().cron == cron)
 app.minCodePosition = 60
 app.locationEvents.clear()
@@ -199,8 +199,6 @@ rearmed('one booking sync') { app.params = [bookingId: BOOKING, lockId: '57']; a
 rearmed('a booking delete') { app.params = [bookingId: BOOKING, lockId: '57']; app.apiDeleteBookingByLock() }
 rearmed('scheduleEvents (reconcile done)') { app.scheduleEvents([:]) }
 rearmed('Reset State') { app.appButtonHandler('btnReset') }
-rearmed('POST /register') { app.request = [JSON: [sbId: 'sb-fake']]; app.apiRegister() }
-rearmed('DELETE /register') { app.apiUnregister() }
 rearmed('Done') { app.updated() }
 rearmed('install') { app.installed() }
 check('install again: time picked once per install', job().cron == cron)
@@ -227,9 +225,27 @@ check('random time: still a single job', jobs().size() == 1)
 app.state.appInfoVersion = '1.4.5'
 app.locationEvents.clear()
 app.scheduleEvents([:])
-check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.16')
+check('HPM update: first re-arm announces the new version', app.locationEvents.size() == 1 && lastInfo().version == '1.4.17')
 app.scheduleEvents([:])
 check('HPM update: not again on the next re-arm', app.locationEvents.size() == 1)
+
+// --- Lock subscriptions: only what code confirmation and refresh use (#86) ---
+app.subscriptions.clear()
+app.subscribeToEvents()
+check('subscriptions: lockCodes and codeChanged only', app.subscriptions.collect { it[1] } == ['lockCodes', 'codeChanged'])
+// After an HPM update (no Done) the first booking sync subscribes again, once
+app.subscriptions.clear()
+app.state.lastVersion = '1.4.16'
+app.state.sbId = 'sb-legacy-fake'
+app.request = [JSON: [:]]
+app.apiSync()
+check('HPM update: first sync subscribes again and drops the legacy sbId', app.subscriptions.collect { it[1] } == ['lockCodes', 'codeChanged'] && app.state.lastVersion == '1.4.17' && !app.state.containsKey('sbId'))
+app.state.sbId = 'sb-legacy-fake'
+app.updated()
+check('Done drops the legacy sbId', !app.state.containsKey('sbId'))
+app.subscriptions.clear()
+app.apiSync()
+check('HPM update: not again on the next sync', app.subscriptions.isEmpty())
 
 // --- No network, no lock, no subscription change ---
 app.network.clear(); calls.clear()
@@ -271,8 +287,8 @@ Map syncBody = [(BOOKING): [id: BOOKING, guest: GUEST, code: CODE, lockId: ['57'
     try { app.updated() } catch (e) { err = e.class.simpleName }
     check("${label}: Done still runs SyncState (subscriptions and reconcile)", err == null && reconciles().size() == 1 && app.subscriptions.any { it[1] == 'codeChanged' })
     err = null
-    try { app.installed(); app.appButtonHandler('btnReset'); app.apiUnregister(); app.sbAppInfoDaily() } catch (e) { err = e.class.simpleName }
-    check("${label}: install, Reset State, DELETE /register and the daily job don't throw", err == null)
+    try { app.installed(); app.appButtonHandler('btnReset'); app.sbAppInfoDaily() } catch (e) { err = e.class.simpleName }
+    check("${label}: install, Reset State and the daily job don't throw", err == null)
     check("${label}: logged by class name only", app.logged.any { it.contains('(IllegalStateException)') } && !app.logged.any { it.contains(CODE) })
 }
 app.throwOnLocationEvent = false; app.throwOnAppInfoSchedule = false

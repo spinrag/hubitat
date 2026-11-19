@@ -1,9 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbBaseSecureUrl() { 'https://app.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbBaseFastUrl() { 'https://api.signalbricks.com' } // TODO: update to SignalBricks backend URL
-String getSbAppVersion() { '1.4.16' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.17' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -305,7 +303,6 @@ def debug() {
     dynamicPage(name: 'debug', title: 'Debug') {
         section(title: '<h2>Actions</h2>') {
             input(name: 'btbAccessToken', type: 'button', title: 'Refresh Access Token')
-            input(name: 'btnTest', type: 'button', title: 'Test Webhook')
             input(name: 'btnReconcile', type: 'button', title: 'Reconcile Door Codes')
             input(name: 'btnRefreshCodes', type: 'button', title: 'Refresh Door Codes (one lock at a time)')
             input(name: 'btnReset', type: 'button', title: 'Reset State')
@@ -380,7 +377,6 @@ void appButtonHandler(String btnName) {
             atomicState.reconcileRetries = 0
             atomicState.codeRefresh = null
             atomicState.lastSync = null
-            clearLegacySbId()
             scheduleCodeRefresh()
             sbRegisterRetryRearm()
             sbConnectLinkRearm()
@@ -388,23 +384,6 @@ void appButtonHandler(String btnName) {
             // for any locks the user touches manually after the reset.
             subscribeToEvents()
             sbScheduleAppInfo()
-            break
-        // Send a test webhook
-        case 'btnTest':
-            Map testEvent = [
-                name: 'test',
-                value: 'test',
-                displayName: 'Test Webhook',
-                deviceId: null,
-                descriptionText: null,
-                unit: null,
-                type: null,
-                data: null
-            ]
-
-            sbHttpPostJson('/hubitat', testEvent, { r ->
-                log.debug "Test Webhook: HTTP ${r.status}"
-            })
             break
     }
 }
@@ -424,14 +403,6 @@ mappings {
     path('/reconnect') {
         action: [
             GET: 'apiReconnect',
-        ]
-    }
-
-    // Set (or unset) the SignalBricks Id (ORLACT) state variable
-    path('/register') {
-        action: [
-            POST: 'apiRegister',
-            DELETE: 'apiUnregister',
         ]
     }
 
@@ -505,9 +476,6 @@ void installed() {
     // The API Key
     state.accessToken = createAccessToken()
 
-    // The SignalBricks Id (ORLACT)
-    state.sbId = null
-
     // Unlikely any reason to call, but just in case, clear out any old hooks
     unsubscribe()
     unschedule()
@@ -537,8 +505,7 @@ void updated() {
     if (state.lastVersion != sbAppVersion) {
         state.lastVersion = sbAppVersion
     }
-
-    clearLegacySbId()
+    state.remove('sbId') // left by the registration removed in 1.4.17
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
@@ -560,10 +527,8 @@ void SyncState()
 
 void SyncState(Map bookings)
 {
-    // Subscriptions and schedules drive local door-code reconciliation and
-    // must run regardless of SignalBricks registration. Outbound posting is
-    // gated separately inside webhook().
-    // No door code refresh here: clicking Done or /register must not start a full
+    // Subscriptions and schedules drive local door-code reconciliation.
+    // No door code refresh here: clicking Done must not start a full
     // read of every lock (#24). It runs on its cadence or from the app page.
     subscribeToEvents()
     scheduleEvents(bookings)
@@ -576,14 +541,17 @@ void subscribeToEvents() {
     // Remove old subscriptions from potentially removed locks
     unsubscribe()
 
-    // Separate handler for each event for future flexibility
-    subscribe(locks, 'lock', lockHandler)
-    subscribe(locks, 'unlock', lockHandler)
-    subscribe(locks, 'lastCodeName', lastCodeNameHandler)
     subscribe(locks, 'lockCodes', lockCodesHandler)
     subscribe(locks, 'codeChanged', codeChangedHandler)
-    subscribe(locks, 'maxCodes', maxCodesHandler)
-    subscribe(locks, 'codeLength', codeLengthHandler)
+}
+
+// After any version change (HPM doesn't run updated()), the first booking sync
+// subscribes again once, so locks never call handlers an update removed
+void sbResubscribeIfVersionChanged() {
+    if (state.lastVersion == sbAppVersion) return
+    state.lastVersion = sbAppVersion
+    state.remove('sbId') // left by the registration removed in 1.4.17
+    subscribeToEvents()
 }
 
 // Setup scheduled tasks for all bookings
@@ -1452,54 +1420,8 @@ void tryDeleteCode(Map data) {
     }
 }
 
-// Send outbound webhook to the SignalBricks platform.
-// When the hub isn't registered with SignalBricks (no sbId — current default
-// in the dispatcher-only deployment), we silently skip posting. We must NOT
-// unsubscribe()/unschedule() here: those operate app-wide and would also tear
-// down lock event subscriptions (codeChangedHandler — which confirms/retries
-// failed setCode calls) and any pending trySetCode/tryDeleteCode runIn jobs.
-// That bug caused atomicState.codeAssignments to drift optimistic while the
-// underlying locks never received the codes.
-void webhook(e) {
-    log.debug "webhook: ${e.name}"
-
-    if (!state.sbId) {
-        log.trace "webhook: No SignalBricks ID — skipping outbound POST (subscriptions/schedules preserved)"
-        return
-    }
-
-    // Normalize the event payload
-    Map payload = [
-        id: e.id,
-        deviceId: e.deviceId,
-        name: e.name,
-        displayName: e.displayName,
-        source: e.source,
-        value: e.value,
-        data: e.jsonData,
-        descriptionText: e.descriptionText,
-        isStateChange: e.isStateChange,
-        type: e.type,
-        date: e.date,
-        unit: e.unit,
-    ]
-
-    sbHttpPostJson('/hubitat', payload, { r ->
-        log.debug "Webhook: HTTP ${r.status}"
-    })
-}
-
-void lockHandler(e) {
-    webhook(e)
-}
-
-void lastCodeNameHandler(e) {
-    webhook(e)
-}
-
 void lockCodesHandler(e) {
     codeRefreshOnLockCodes(e)
-    webhook(e)
 }
 
 void codeChangedHandler(e) {
@@ -1586,60 +1508,6 @@ void codeChangedHandler(e) {
         // Class only: the message can carry the assignment, code included (#38)
         log.debug "codeChangedHandler: ${ex.class.simpleName}"
     }
-
-    webhook(e)
-}
-
-void maxCodesHandler(e) {
-    webhook(e)
-}
-
-void codeLengthHandler(e) {
-    webhook(e)
-}
-
-// Get the Connect to SignalBricks URL
-// This endpoint will create/update the LinkedAccount for this hub,
-// And will reach back out to the hub's /register endpoint to set the SignalBricks Id (ORLACT) state variable
-String getSbConnectUrl() {
-    String connectUrl = sbBaseSecureUrl + '/settings/locks/HubitatConnect'
-
-    if (state.accessToken) {
-        connectUrl += '?'
-        connectUrl += '&hubId=' + URLEncoder.encode(hubUID)
-        connectUrl += '&appId=' + URLEncoder.encode(app.id.toString())
-        connectUrl += '&accessToken=' + URLEncoder.encode(state.accessToken)
-        connectUrl += '&version=' + URLEncoder.encode(sbAppVersion)
-        connectUrl += '&hub=' + URLEncoder.encode(location.hub.name)
-    }
-
-    return connectUrl
-}
-
-// Send API request to SignalBricks FastApi application
-void sbHttpPostJson(String uri, Map body, Closure closure) {
-    log.debug "sbHttpPostJson: $uri"
-    log.debug "sbBaseFastUrl: $sbBaseFastUrl"
-
-    Map params = [
-        uri: sbBaseFastUrl, // Base URL
-        path: uri, // Uri appended to base URL
-        contentType: 'application/json',
-        body: body,
-        headers: [
-            // Headers used for matching to the correct LinkedAccount,
-            // And for authentication
-            'X-Hubitat-SB-Id': state.sbId,
-            'X-Hubitat-Hub-Id': hubUID,
-            'X-Hubitat-App-Id': app.id,
-            'X-Hubitat-Access-Token': state.accessToken,
-            'X-Hubitat-SB-Version': sbAppVersion,
-        ]
-    ]
-
-    // Do the request. The closure will be called when the request completes
-    // Hubitat appears to do this synchronously, so we don't have to worry about concurrency
-    httpPostJson(params, closure)
 }
 
 // Create a response for the API request
@@ -1666,67 +1534,12 @@ String sbApiError(String handler, Exception ex) {
     return error
 }
 
-// The old /register sbId (never used since Connect to SignalBricks) turns on the
-// outbound webhook to a placeholder URL; Done and Reset State clear it (#36)
-void clearLegacySbId() {
-    state.sbId = null
-    atomicState.sbId = null
-}
-
-// Register the SignalBricks account with this hub
-// SignalBricks needs to already have the hub's Id and Access Token
-// So just accept whatever is passed in at face value
-Map apiRegister() {
-    log.debug 'apiRegister: registration received'
-
-    try {
-        atomicState.sbId = request.JSON.sbId
-
-        // Now that we have the SignalBricks Id, we can setup the webhook subscriptions
-        // And schedule the reconcileDoorCodes tasks
-        Map bookings = helperGetBookings(atomicState.bookings)
-        SyncState(bookings)
-
-        return apiGetInfo()
-    } catch (Exception ex) {
-        return sbHttpResponseJson([ error: sbApiError('apiRegister', ex) ], 500)
-    }
-}
-
-// Disassociate the SignalBricks account from this hub
-Map apiUnregister() {
-    log.debug 'apiUnregister'
-
-    try {
-        atomicState.sbId = null
-
-        // This will break the connection until the user reconnects
-        atomicState.accessToken = null
-
-        // Unsubscribe from events and unschedule tasks
-        unschedule()
-        unsubscribe()
-        atomicState.codeRefresh = null
-        // A pending registration retry and an open Reconnect window keep their timers (#46),
-        // and the daily app info announcement its schedule (#692)
-        sbRegisterRetryRearm()
-        sbConnectLinkRearm()
-        sbScheduleAppInfo()
-        verifySetCodeRearm()
-
-        return sbHttpResponseJson(null)
-    } catch (Exception ex) {
-        return sbHttpResponseJson([ error: sbApiError('apiUnregister', ex) ], 500)
-    }
-}
-
  // Get basic hub info, including bookings
 Map apiGetInfo() {
     log.debug 'apiGetInfo'
 
     try {
         return sbHttpResponseJson([
-            sbId: atomicState.sbId,
             hubId: hubUID,
             appId: app.id,
             endpoint: fullApiServerUrl,
@@ -1883,6 +1696,7 @@ Map apiSync() {
         atomicState.bookings = helperGetBookings(request.JSON)
         atomicState.lastSync = [at: now(), source: 'PUT /sync']
         sbReregisterIfVersionChanged()
+        sbResubscribeIfVersionChanged()
         atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 

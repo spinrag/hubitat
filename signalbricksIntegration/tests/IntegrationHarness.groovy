@@ -1124,8 +1124,6 @@ app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(
 app.scheduleEvents(booking77())
 rearmed = app.scheduled.findAll { it.handler == 'verifySetCode' }
 check('scheduleEvents: only unconfirmed writes are re-armed (not deletes), with their backoff', rearmed.size() == 1 && rearmed[0].data.codePosition == 51 && rearmed[0].data.attempt == 3 && rearmed[0].secs == 150)
-app.apiUnregister()
-check('unregister: unschedule() then the unconfirmed write\'s verify is re-armed', app.scheduled.count { it.handler == 'verifySetCode' && it.data.codePosition == 51 } == 1)
 
 // --- A retry stops once its booking is gone, confirms from the lock's list, and never writes over another code ---
 def retryCycles = { int n ->
