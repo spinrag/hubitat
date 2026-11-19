@@ -18,6 +18,7 @@ Highlights by version:
 - **1.8.0** optional [lock and device control](#lock-and-device-control): SignalBricks can lock, unlock and control devices you select, without the Maker API. Devices are now selected in one place, under **Devices**; your existing selections carry over.
 - **1.9.0** simpler settings: one **Locks** list (every selected lock is managed) and [one switch per feature](#what-signalbricks-may-do-optional); lock and device control no longer need door code management. Your selections [carry over](#updating-to-190).
 - **1.9.1** device control reports the hub's temperature scale and each thermostat's supported modes, and reads current device state.
+- **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well, and the daily hub report includes SignalBricks Integration's previous code name prefix.
 
 ## Requirements
 
@@ -173,7 +174,7 @@ What the hub enforces:
 - Only the selected locks, and on each only the slots onboarding set up, at or below **Highest slot SignalBricks may use**.
 - Existing codes above that slot stay out of reach until you approve them, or until you turn on **Full control above that slot** and SignalBricks marks the lock for full control.
 - A new fingerprint key is used only once you approve it.
-- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:` or `GT:`.
+- Booking codes are always refused: names with `ORB` followed by a digit in any letter case, `ORB` starting a word, or starting with `G:`, `GT:` or `GO:`.
 - Codes are never logged, and never sent as telemetry or in results.
 
 Some lock drivers can store their code list encrypted. If the hub can't read it, that lock's codes show as unreadable: turn off code encryption in the lock's driver preferences.

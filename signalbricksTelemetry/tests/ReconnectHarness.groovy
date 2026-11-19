@@ -144,7 +144,7 @@ String INGEST_2 = 'sbit_fakeingesttokenfakeingesttoken22'
 List tokens = []
 def track = { tokens << app.state.accessToken; app.state.accessToken }
 
-check('version is 1.9.1', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.1')
+check('version is 1.9.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.2')
 
 // --- A connected hub with lock code management on: slot rules, fingerprint key,
 // approvals, full control and a pending code change ---

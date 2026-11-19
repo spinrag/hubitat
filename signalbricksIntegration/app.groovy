@@ -41,7 +41,7 @@ preferences {
                 'It writes new codes only into empty slots from the minimum code position up. ' +
                 'Do not run Hubitat Lock Code Manager on the same locks.'
             paragraph 'Runs alongside the OwnerRez app. Give the two apps <b>different, non-empty</b> code name prefixes, neither the start of the other ' +
-                '(e.g. OwnerRez <code>G:</code>, SignalBricks Integration <code>GT:</code>) and minimum code positions above the Telemetry slots ' +
+                '(e.g. OwnerRez <code>GO: </code>, SignalBricks Integration <code>G: </code>) and minimum code positions above the Telemetry slots ' +
                 "(e.g. OwnerRez 30, this app 50; a minimum is a lower bound, not a separate range). <a href='https://github.com/spinrag/hubitat/blob/main/signalbricksIntegration/README.md' target='_blank'>Documentation</a>"
         }
 
@@ -53,12 +53,13 @@ preferences {
             input(name: 'idAtEnd', type: 'bool', title: 'Booking ID at End?', submitOnChange: true)
             input(name: 'codeNamePrefix', type: 'string', title: 'Prefix for code name', submitOnChange: true, defaultValue: '')
             if (!settings?.codeNamePrefix) {
-                paragraph '<b>Set a code name prefix</b> (e.g. <code>GT:</code>) that differs from the OwnerRez app\'s prefix. Without one this app treats every <code>ORB</code> booking code on the selected locks as its own.'
+                paragraph '<b>Set a code name prefix</b> (e.g. <code>G: </code>) that differs from the OwnerRez app\'s prefix. Without one this app treats every <code>ORB</code> booking code on the selected locks as its own.'
             }
             input(name: 'previousCodeNamePrefix', type: 'string', title: 'Previous prefix for code name (optional)', submitOnChange: true, defaultValue: '')
             paragraph '<small>Only when you change the prefix above: enter the old one here so codes already on the locks with the old prefix stay this app\'s and are still removed at checkout. ' +
                 'Existing codes keep their old name until their booking ends; new codes get the new prefix. Clear it once the bookings that were on the locks at the change have checked out. ' +
-                'Never enter a prefix another app on this hub still uses.</small>'
+                'Never enter a prefix another app on this hub still uses. ' +
+                'To move from <code>GT: </code> to <code>G: </code> while the OwnerRez app uses <code>G: </code>: first turn the OwnerRez app\'s door codes off, remove its codes while its prefix is unchanged, then change it to <code>GO: </code>. Only then set this prefix to <code>G: </code> with previous prefix <code>GT: </code>.</small>'
             String prevProblem = previousPrefixProblem()
             if (prevProblem) {
                 paragraph "<b>Previous prefix for code name is not used:</b> ${prevProblem}."

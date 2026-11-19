@@ -1345,7 +1345,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.9.1'
+String VERSION = '1.9.2'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1600,10 +1600,10 @@ app.debugLogging = false
 
 // --- Booking codes in any letter case (spinrag/hubitat-internal#2) ---
 // Some drivers report code names lower-cased. Made-up codes only.
-['gt:orb77-cy', 'g:orb88-di', 'Gt:Cy-orb99', 'guest-orb12345', 'GT:ORB123-x', 'Guest -ORB12345'].each { nm ->
+['gt:orb77-cy', 'g:orb88-di', 'Gt:Cy-orb99', 'guest-orb12345', 'GT:ORB123-x', 'Guest -ORB12345', 'GO: Gardener', 'go : x', 'Go:x'].each { nm ->
     check("any-case guard: '${nm}' booking", app.isAnyBookingName(nm))
 }
-['Corbin', 'Orbit', 'Forbes', 'SBA: Forbes', 'SBA: Corbin', 'Old Code', null].each { nm ->
+['Corbin', 'Orbit', 'Forbes', 'SBA: Forbes', 'SBA: Corbin', 'Old Code', 'GTX: a', 'GOX: a', 'Gold', 'Go away', null].each { nm ->
     check("any-case guard: '${nm}' not booking", !app.isAnyBookingName(nm))
 }
 app.state.sbToken = 'ingest-fake'
