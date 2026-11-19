@@ -505,6 +505,7 @@ void updated() {
     if (state.lastVersion != sbAppVersion) {
         state.lastVersion = sbAppVersion
     }
+    state.remove('sbId') // left by the registration removed in 1.4.17
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
@@ -544,11 +545,12 @@ void subscribeToEvents() {
     subscribe(locks, 'codeChanged', codeChangedHandler)
 }
 
-// After an update (HPM doesn't run updated()), subscribe again once so locks stop
-// calling handlers that no longer exist (1.4.17)
+// After any version change (HPM doesn't run updated()), the first booking sync
+// subscribes again once, so locks never call handlers an update removed
 void sbResubscribeIfVersionChanged() {
     if (state.lastVersion == sbAppVersion) return
     state.lastVersion = sbAppVersion
+    state.remove('sbId') // left by the registration removed in 1.4.17
     subscribeToEvents()
 }
 

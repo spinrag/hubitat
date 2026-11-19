@@ -1,7 +1,7 @@
 // No door code, PIN or access token in any log line (#36) for SignalBricks
 // Integration with a stubbed Hubitat sandbox: drives the sync endpoints
 // (PUT/PATCH /sync, /sync/<id>, /sync/<id>/<lock>, their deletes), the device
-// command and detail endpoints, /register, reconcile and its set/verify/delete
+// command and detail endpoints, reconcile and its set/verify/delete
 // jobs, the duplicate-code check and the lock event handlers with fake codes,
 // and checks every captured log level. Guest names and booking ids may be logged.
 // Fake values only; nothing is sent to a hub.

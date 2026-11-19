@@ -3,8 +3,8 @@
 // event carries exactly the contract keys (docs/hub-reporting.md) and no code,
 // code name, token, booking id or guest name; it is sent on install, on Done and
 // by a daily job at a random 04:00-23:59 time that survives every app-wide
-// unschedule() (install, Reset State, booking syncs and reconcile, DELETE
-// /register); announcing makes no network call. Fake values only.
+// unschedule() (install, Reset State, booking syncs and reconcile); announcing
+// makes no network call. Fake values only.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.text.SimpleDateFormat
@@ -236,9 +236,13 @@ check('subscriptions: lockCodes and codeChanged only', app.subscriptions.collect
 // After an HPM update (no Done) the first booking sync subscribes again, once
 app.subscriptions.clear()
 app.state.lastVersion = '1.4.16'
+app.state.sbId = 'sb-legacy-fake'
 app.request = [JSON: [:]]
 app.apiSync()
-check('HPM update: first sync subscribes again', app.subscriptions.collect { it[1] } == ['lockCodes', 'codeChanged'] && app.state.lastVersion == '1.4.17')
+check('HPM update: first sync subscribes again and drops the legacy sbId', app.subscriptions.collect { it[1] } == ['lockCodes', 'codeChanged'] && app.state.lastVersion == '1.4.17' && !app.state.containsKey('sbId'))
+app.state.sbId = 'sb-legacy-fake'
+app.updated()
+check('Done drops the legacy sbId', !app.state.containsKey('sbId'))
 app.subscriptions.clear()
 app.apiSync()
 check('HPM update: not again on the next sync', app.subscriptions.isEmpty())
