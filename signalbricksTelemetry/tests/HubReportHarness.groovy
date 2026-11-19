@@ -142,7 +142,7 @@ def intIn = { int min, int max -> { v -> isInt(v) && (v as long) >= min && (v as
 def bool = { v -> v instanceof Boolean }
 def epochMs = { v -> isInt(v) && (v as long) >= 0 }
 Map APP_INFO_RULES = [schemaVersion: intIn(1, 1000), appId: str(32), name: str(64), version: str(32), minCodePosition: intIn(0, 1000),
-    codeNamePrefix: { v -> v instanceof String && v.length() <= 16 }, manageDoorCodes: bool]
+    codeNamePrefix: { v -> v instanceof String && v.length() <= 16 }, previousCodeNamePrefix: { v -> v instanceof String && v.length() <= 16 }, manageDoorCodes: bool]
 Map APP_RULES = APP_INFO_RULES + [lastSeenAt: epochMs]
 Map LOCK_RULES = [deviceId: str(32), name: str(64), battery: { v -> isNum(v) && (v as BigDecimal) >= 0 && (v as BigDecimal) <= 100 },
     lock: { v -> v instanceof String && v.trim().toLowerCase() in ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed'] },
@@ -242,9 +242,12 @@ announce([name: 'No id', version: '1'])
 app.appInfoHandler([name: 'signalbricksAppInfo', value: 'not json'])
 app.appInfoHandler([name: 'signalbricksAppInfo', value: '[1,2]'])
 check('collect: no appId, bad JSON or a non-object ignored', app.state.appInfos.size() == 2)
-announce([appId: 77, schemaVersion: '1', name: 'X' * 65, version: 3, minCodePosition: '30', codeNamePrefix: 'P' * 17, manageDoorCodes: 'yes'])
+announce([appId: 77, schemaVersion: '1', name: 'X' * 65, version: 3, minCodePosition: '30', codeNamePrefix: 'P' * 17, previousCodeNamePrefix: 'P' * 17, manageDoorCodes: 'yes'])
 check('collect: bad field types and lengths dropped, numeric appId as a string', app.state.appInfos['77'] == [appId: '77', lastSeenAt: app.clock])
 app.state.appInfos.remove('77')
+announce([schemaVersion: 1, appId: '78', name: 'SignalBricks Integration', version: '1.4.9', minCodePosition: 50, codeNamePrefix: 'G: ', previousCodeNamePrefix: 'GT:'])
+check('collect: previousCodeNamePrefix kept', app.state.appInfos['78'].codeNamePrefix == 'G: ' && app.state.appInfos['78'].previousCodeNamePrefix == 'GT:')
+app.state.appInfos.remove('78')
 // Changes go out within a minute; a repeat of the same info doesn't
 app.scheduled.removeAll { it.handler == 'sendAppInfoReport' }
 announce([schemaVersion: 1, appId: '388', name: 'SignalBricks Integration', version: '1.4.7', minCodePosition: 50, codeNamePrefix: 'GT: '])

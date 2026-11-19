@@ -1546,6 +1546,7 @@ Map parseAppInfo(def value) {
     Integer minCodePosition = reportInt(v.minCodePosition, 0, MAX_SLOT)
     if (minCodePosition != null) out.minCodePosition = minCodePosition
     if (v.codeNamePrefix instanceof String && v.codeNamePrefix.length() <= 16) out.codeNamePrefix = v.codeNamePrefix
+    if (v.previousCodeNamePrefix instanceof String && v.previousCodeNamePrefix.length() <= 16) out.previousCodeNamePrefix = v.previousCodeNamePrefix
     if (v.manageDoorCodes instanceof Boolean) out.manageDoorCodes = v.manageDoorCodes
     return out
 }

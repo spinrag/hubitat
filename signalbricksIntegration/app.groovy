@@ -59,7 +59,7 @@ preferences {
             paragraph '<small>Only when you change the prefix above: enter the old one here so codes already on the locks with the old prefix stay this app\'s and are still removed at checkout. ' +
                 'Existing codes keep their old name until their booking ends; new codes get the new prefix. Clear it once the bookings that were on the locks at the change have checked out. ' +
                 'Never enter a prefix another app on this hub still uses. ' +
-                'To move from <code>GT: </code> to <code>G: </code> while the OwnerRez app uses <code>G: </code>: first change the OwnerRez app to <code>GO: </code> and remove its codes, then set this prefix to <code>G: </code> with previous prefix <code>GT: </code>.</small>'
+                'To move from <code>GT: </code> to <code>G: </code> while the OwnerRez app uses <code>G: </code>: first turn the OwnerRez app\'s door codes off, remove its codes while its prefix is unchanged, then change it to <code>GO: </code>. Only then set this prefix to <code>G: </code> with previous prefix <code>GT: </code>.</small>'
             String prevProblem = previousPrefixProblem()
             if (prevProblem) {
                 paragraph "<b>Previous prefix for code name is not used:</b> ${prevProblem}."

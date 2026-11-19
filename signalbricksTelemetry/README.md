@@ -18,7 +18,7 @@ Highlights by version:
 - **1.8.0** optional [lock and device control](#lock-and-device-control): SignalBricks can lock, unlock and control devices you select, without the Maker API. Devices are now selected in one place, under **Devices**; your existing selections carry over.
 - **1.9.0** simpler settings: one **Locks** list (every selected lock is managed) and [one switch per feature](#what-signalbricks-may-do-optional); lock and device control no longer need door code management. Your selections [carry over](#updating-to-190).
 - **1.9.1** device control reports the hub's temperature scale and each thermostat's supported modes, and reads current device state.
-- **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well.
+- **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well, and the daily hub report includes SignalBricks Integration's previous code name prefix.
 
 ## Requirements
 
