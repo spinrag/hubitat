@@ -213,6 +213,9 @@ import javax.crypto.spec.SecretKeySpec
 // An HPM update replaces the code without calling updated(), so the app
 // re-registers itself once the version changes, at most this often (#539).
 @Field static final long REREGISTER_INTERVAL_MS = 30L * 60 * 1000
+// After a restart with no local address yet (#91): check again this often, this many times.
+@Field static final int LOCAL_CHECK_RETRY_SECONDS = 600
+@Field static final int LOCAL_CHECK_RETRIES = 3
 // Reconnect link (#46): a click on Reconnect opens a sign-in link for this long.
 @Field static final int CONNECT_LINK_SECONDS = 600
 // Automatic retries of a registration that failed for a reason that may pass
@@ -880,6 +883,8 @@ void appButtonHandler(String btn) {
         state.remove('registeredVersion')
         state.remove('registeredLocalEndpoint')
         state.remove('lockMgmtLocalEndpoint')
+        state.remove('localCheckRetries')
+        unschedule('localEndpointCheck')
         state.remove('reregisterAttemptAt')
         state.remove('reportedVersion')
         state.remove('reportAttemptAt')
@@ -1442,13 +1447,16 @@ String hubFirmwareVersion() {
 // registering is otherwise allowed, and at most every REREGISTER_INTERVAL_MS.
 // With checkLocal (daily check-in, after a hub restart), also when the local
 // endpoint differs from the one last registered while a feature is on (#91).
-void reregisterIfVersionChanged(Boolean checkLocal = false) {
+// Returns the backoff left in ms when only the backoff held it back, else 0.
+long reregisterIfVersionChanged(Boolean checkLocal = false) {
     Boolean versionChanged = state.registeredVersion != APP_VERSION
     Boolean localChanged = checkLocal && endpointOn() && state.registeredLocalEndpoint != localEndpointBase()
-    if (!versionChanged && !localChanged) return
-    if (!state.sbToken || !isHttps(state.ingestUrl)) return
-    if (!endpointOn() && !lockMgmtPreviouslyRegistered()) return
-    if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
+    if (!versionChanged && !localChanged) return 0L
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return 0L
+    if (!endpointOn() && !lockMgmtPreviouslyRegistered()) return 0L
+    if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) {
+        return (state.reregisterAttemptAt as long) + REREGISTER_INTERVAL_MS - now()
+    }
     state.reregisterAttemptAt = now()
     log.info(versionChanged ? "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}" : 'SignalBricks Telemetry: re-registering, local endpoint changed')
     try {
@@ -1457,6 +1465,7 @@ void reregisterIfVersionChanged(Boolean checkLocal = false) {
         // Only the class name: the request body carries the access token.
         log.warn "SignalBricks Telemetry: re-registration failed (${e.class.simpleName})"
     }
+    return 0L
 }
 
 // Schedules dailyCheckIn at this hub's time of day, picked at random once and
@@ -1527,13 +1536,31 @@ void ensureAppInfoSubscription() {
     subscribeToAppInfo()
 }
 
-// Two minutes, so the hub's network is up before reading its address
+// Two minutes, so the hub's network is up before reading its address.
+// Several restarts in a row collapse into one check.
 void systemStartHandler(evt) {
-    runIn(120, 'localEndpointCheck')
+    state.remove('localCheckRetries')
+    runIn(120, 'localEndpointCheck', [overwrite: true])
 }
 
+// No address yet after a restart while one is registered: the hub may still be
+// starting, so try again later rather than clear it on the platform. After the
+// retries, the daily check-in takes over.
 void localEndpointCheck() {
-    reregisterIfVersionChanged(true)
+    if (!localEndpointBase() && state.registeredLocalEndpoint) {
+        int n = (state.localCheckRetries ?: 0) as int
+        if (n < LOCAL_CHECK_RETRIES) {
+            state.localCheckRetries = n + 1
+            runIn(LOCAL_CHECK_RETRY_SECONDS, 'localEndpointCheck', [overwrite: true])
+        } else {
+            state.remove('localCheckRetries')
+        }
+        return
+    }
+    state.remove('localCheckRetries')
+    long wait = reregisterIfVersionChanged(true)
+    // Held back by the re-register backoff: check again when it ends
+    if (wait > 0) runIn(Math.max((long) (wait / 1000) + 1, 5L), 'localEndpointCheck', [overwrite: true])
 }
 
 void appInfoHandler(evt) {

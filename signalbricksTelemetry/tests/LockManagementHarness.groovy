@@ -1524,6 +1524,8 @@ check('check-in: nothing rescheduled while disconnected', checkInJobs().isEmpty(
 check('check-in: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
 
 // --- Local endpoint in the registration (#91) ---
+// In a closure: the script's run() method is at the JVM size limit
+def localEndpointTests = { ->
 String LOCAL = 'http://192.168.1.10/apps/api/42'
 app.state.sbToken = 'ingest-fake'
 app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
@@ -1596,10 +1598,46 @@ app.subscribeToAppInfo()
 check('local: subscribes to systemStart', app.subscriptions.contains('systemStart'))
 app.localEndpointCheck()
 check('local: restart check re-registers with the new endpoint', registers().size() == 1 && regBody().localEndpointBase == LOCAL)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"local_endpoint":true}'), registers()[-1].data)
+def localChecks = { app.scheduled.findAll { it.handler == 'localEndpointCheck' } }
+app.scheduled.clear()
+3.times { app.systemStartHandler([name: 'systemStart']) }
+check('local: several restarts collapse to one check', localChecks().size() == 1)
+
+// Slow boot: no address yet while one is registered, retried, never cleared
+app.localUrl = null
+app.fakeNow += 24L * 3600 * 1000
+app.posts.clear(); app.scheduled.clear()
+app.localEndpointCheck()
+check('local: no address after a restart, no register, retry in 10 minutes', registers().isEmpty() && localChecks().size() == 1 && localChecks()[0].secs == 600)
+app.localUrl = LOCAL
+app.localEndpointCheck()
+check('local: address back unchanged, nothing sent, no retry left', registers().isEmpty() && app.state.localCheckRetries == null)
+app.localUrl = null
+app.scheduled.clear()
+4.times { app.localEndpointCheck() }
+check('local: retries stop after 3, still not cleared', registers().isEmpty() && app.state.registeredLocalEndpoint == LOCAL && app.state.localCheckRetries == null)
+app.scheduled.clear()
+app.localEndpointCheck()
+check('local: the next restart check retries again', localChecks().size() == 1)
+app.localUrl = LOCAL
+
+// Held back by the 30-minute backoff: checked again when it ends
+app.state.reregisterAttemptAt = app.fakeNow - 20L * 60 * 1000
+app.localUrl = 'http://192.168.1.88/apps/api/42'
+app.scheduled.clear(); app.posts.clear()
+app.localEndpointCheck()
+check('local: backoff, no register, check again when it ends', registers().isEmpty() && localChecks().size() == 1 && localChecks()[0].secs == 601)
+app.fakeNow += 10L * 60 * 1000 + 1000
+app.localEndpointCheck()
+check('local: after the backoff, re-registers with the new endpoint', registers().size() == 1 && regBody().localEndpointBase == 'http://192.168.1.88/apps/api/42')
+app.localUrl = LOCAL
 
 app.appButtonHandler('btnDisconnect')
-check('local: disconnect clears it', app.state.registeredLocalEndpoint == null && app.state.lockMgmtLocalEndpoint == null)
+check('local: disconnect clears it', app.state.registeredLocalEndpoint == null && app.state.lockMgmtLocalEndpoint == null && localChecks().isEmpty())
 app.localUrl = null
+}
+localEndpointTests()
 
 // --- Door codes in telemetry: "Include door codes" (signalbricks/platform#388) ---
 // Made-up PINs only.
