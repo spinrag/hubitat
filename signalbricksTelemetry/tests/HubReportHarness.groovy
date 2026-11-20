@@ -118,6 +118,16 @@ class FakeLock {
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
 }
 
+// A device the app can't read: reportLock throws
+class UnreadableLock extends FakeLock {
+    def currentValue(String a, Boolean skipCache = false) { throw new IllegalStateException('unreadable') }
+}
+
+// A device whose capabilities can't be read
+class NoCapsLock extends FakeLock {
+    Boolean hasCapability(String c) { throw new IllegalStateException('no capabilities') }
+}
+
 def cfg = new CompilerConfiguration()
 cfg.scriptBaseClass = HubitatStub.name
 def shell = new GroovyShell(this.class.classLoader, new Binding(), cfg)
@@ -146,7 +156,8 @@ Map APP_INFO_RULES = [schemaVersion: intIn(1, 1000), appId: str(32), name: str(6
 Map APP_RULES = APP_INFO_RULES + [lastSeenAt: epochMs]
 Map LOCK_RULES = [deviceId: str(32), name: str(64), battery: { v -> isNum(v) && (v as BigDecimal) >= 0 && (v as BigDecimal) <= 100 },
     lock: { v -> v instanceof String && v.trim().toLowerCase() in ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed'] },
-    jammed: bool, maxCodes: intIn(0, 1000), codeLength: intIn(0, 32), driver: str(64), occupiedSlots: intIn(0, 1000)]
+    jammed: bool, maxCodes: intIn(0, 1000), codeLength: intIn(0, 32), driver: str(64), occupiedSlots: intIn(0, 1000),
+    managed: bool, codeLock: bool]
 Map TELEMETRY_RULES = [version: str(32), maxManagedSlot: intIn(0, 1000)]
 Map HUB_RULES = [firmwareVersion: str(32), uptimeSec: { v -> isInt(v) && (v as long) >= 0 }, timeZone: str(64)]
 def validateObject = { String where, def obj, Map rules, List errors ->
@@ -188,7 +199,7 @@ check('doc example app info validates', appInfoErrors.isEmpty())
 List bad = validateReport(docReport + [extra: 1, locks: [[deviceId: '1', battery: '85', lockCodes: '{}']]])
 check('validator rejects extra keys and string numbers', bad.size() == 3)
 
-check('version is 1.9.2', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.2')
+check('version is 1.9.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.3')
 
 // --- Fake hub: connected, two booking apps, locks with codes ---
 String INGEST = 'sbit_fakeingesttokenfakeingesttoken00'
@@ -284,7 +295,7 @@ check('daily: other booking app field names match the doc', r.apps.find { it.app
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
-check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.9.2', maxManagedSlot: 25])
+check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.9.3', maxManagedSlot: 25])
 check('daily: hub firmware, uptime, time zone', r.hub == [firmwareVersion: '2.4.3.152', uptimeSec: 864000, timeZone: 'America/New_York'])
 check('daily: apps as collected, with lastSeenAt', r.apps.find { it.appId == '412' } == docReport.apps[0] && r.apps.find { it.appId == '388' } == docReport.apps[1].findAll { k, v -> k != 'version' } + [version: '1.4.6'])
 // The doc's example rebuilt from this fake hub: same apps, the same front door
@@ -297,10 +308,12 @@ check('locks: label truncated to 64', backL.name == longLabel.take(64) && backL.
 check('locks: string attributes coerced to numbers', r.locks[0].battery == 85 && r.locks[0].maxCodes == 250 && r.locks[0].codeLength == 4 && backL.maxCodes == 30 && backL.battery == 15.5)
 check('locks: lock lower-cased; jammed exactly when lock is jammed', backL.lock == 'jammed' && backL.jammed == true && r.locks[0].jammed == false)
 check('locks: unknown lock value dropped, not jammed', !oddL.containsKey('lock') && oddL.jammed == false)
-check('locks: unparseable numbers, no driver, unreadable lockCodes left out', oddL == [deviceId: '59', name: 'Shed', jammed: false])
+check('locks: unparseable numbers, no driver, unreadable lockCodes left out', oddL == [deviceId: '59', name: 'Shed', jammed: false, managed: true, codeLock: true])
 check('locks: plain lockCodes counted', r.locks[0].occupiedSlots == 12)
 check('locks: encrypted lockCodes decrypted and counted', backL.occupiedSlots == 3)
 check('locks: empty lockCodes is 0, unlocked with timeout kept', sideL.occupiedSlots == 0 && sideL.lock == 'unlocked with timeout' && !sideL.containsKey('battery'))
+check('codeLock: every selected keypad lock is managed and a code lock', r.locks.every { it.managed == true && it.codeLock == true })
+check('codeLock: the locks flagged are exactly codeLockDevices()', r.locks.findAll { it.codeLock }*.deviceId == app.codeLockDevices()*.id)
 check('locks: counts only, no slot or code keys', !allKeys(r.locks).any { it in ['code', 'codes', 'lockCodes', 'codeName', 'slots', 'pin'] || it ==~ /\d+/ })
 
 // --- Nothing secret in the body or the log ---
@@ -315,13 +328,13 @@ app.posts.clear()
 3.times { app.clock += 24L * 3600 * 1000; app.dailyCheckIn() }
 check('daily: a report every day, version unchanged', reports().size() == 3 && reports().every { bodyOf(it).reason == 'daily' })
 check('daily: no registration on a telemetry-only hub', !app.posts.any { it.cb == 'registerCallback' })
-check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.9.2'] })
+check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.9.3'] })
 app.maxManagedSlot = '40'
 app.posts.clear(); app.dailyCheckIn()
-check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.2'] && validateReport(lastReport()).isEmpty())
+check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.3'] && validateReport(lastReport()).isEmpty())
 app.lockManagementEnabled = true
 app.posts.clear(); app.dailyCheckIn()
-check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.2'])
+check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.3'])
 app.lockManagementEnabled = false
 app.maxManagedSlot = '25'
 
@@ -341,6 +354,36 @@ check("lockCodes '[1,2]' and '\"x\"': no occupiedSlots", !arrL.containsKey('occu
 check("encrypted lockCodes decrypting to '[1,2]' or '\"x\"': no occupiedSlots", lastReport().locks.findAll { it.deviceId in ['63', '64'] }.every { !it.containsKey('occupiedSlots') } && lastReport().locks.count { it.deviceId in ['61', '62', '63', '64'] } == 4)
 check('lock state trimmed; fractional maxCodes left out, 4.0 is 4', arrL.lock == 'locked' && arrL.jammed == false && !arrL.containsKey('maxCodes') && arrL.codeLength == 4)
 app.locks = savedLocks
+
+// --- codeLock: managed and LockCodes, also when the lock can't be read ---
+def gate = new FakeLock(id: '65', displayName: 'Gate', typeName: 'Z', caps: ['Lock'], attrs: [lock: 'locked', maxCodes: '30'])
+def bare = new FakeLock(id: '66', displayName: 'Bare keypad', typeName: 'Z')
+def broken = new UnreadableLock(id: '67', displayName: 'Broken', typeName: 'Z')
+def brokenPlain = new UnreadableLock(id: '68', displayName: 'Broken plain', typeName: 'Z', caps: ['Lock'])
+def noCaps = new NoCapsLock(id: '69', displayName: 'No caps', typeName: 'Z', attrs: [lock: 'locked'])
+def unmanagedBroken = new UnreadableLock(id: '70', displayName: 'Unmanaged', typeName: 'Z')
+List savedManaged = app.managedDevices
+app.codeLocks = []
+app.locks = [gate, bare, broken, brokenPlain, noCaps, unmanagedBroken]
+app.posts.clear(); app.dailyCheckIn()
+Map cl = lastReport().locks.collectEntries { [(it.deviceId): it] }
+check("codeLock: report still validates (${validateReport(lastReport())})", validateReport(lastReport()).isEmpty() && cl.size() == 6)
+check('codeLock: managed lock without LockCodes is not a code lock, even with maxCodes', cl['65'].managed == true && cl['65'].codeLock == false && cl['65'].maxCodes == 30)
+check('codeLock: managed keypad with no code attributes is a code lock', cl['66'] == [deviceId: '66', name: 'Bare keypad', driver: 'Z', managed: true, codeLock: true])
+check('codeLock: unreadable managed keypad still flagged', cl['67'] == [deviceId: '67', managed: true, codeLock: true])
+check('codeLock: unreadable managed plain lock flagged false', cl['68'] == [deviceId: '68', managed: true, codeLock: false])
+check('codeLock: left out when capabilities cannot be read', cl['69'].managed == true && !cl['69'].containsKey('codeLock') && cl['69'].lock == 'locked')
+// Before the settings migration has started, only the locks in the earlier list are managed
+app.state.remove('settingsMigration')
+app.managedLocks = ['66']
+Map pre = app.reportLocks().collectEntries { [(it.deviceId): it] }
+check('codeLock: unmanaged locks are neither, readable or not', pre['70'] == [deviceId: '70', managed: false, codeLock: false] &&
+    pre['67'] == [deviceId: '67', managed: false, codeLock: false] && pre['65'].managed == false && pre['65'].codeLock == false)
+check('codeLock: managed keypad in the earlier list still a code lock', pre['66'].managed == true && pre['66'].codeLock == true)
+app.managedLocks = null
+app.state.settingsMigration = [done: true]
+app.locks = savedLocks
+app.codeLocks = savedManaged
 
 // --- Connect: the first report counts as the install, later ones as updates ---
 def connect = {
@@ -402,7 +445,7 @@ app.dailyCheckIn()
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 400, body: ''), [reason: 'daily'])
 check('400: not retried', retryJob() == null)
-check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.9.2')
+check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.9.3')
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 503, body: ''), [reason: 'daily'])
 check('503: version not recorded (retried instead)', app.state.reportedVersion == '1.5.3')
@@ -414,7 +457,7 @@ app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 408, body: ''), [reason: 'daily'])
 check('408 (timeout): retried', retryJob()?.secs == 30)
 app.reportCallback(new FakeResp(status: 202, body: '{"received":true}'), [reason: 'daily'])
-check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.9.2' && app.state.lastReportError == null)
+check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.9.3' && app.state.lastReportError == null)
 check('page: last sent shown', app.reportStatus()?.contains('last sent'))
 app.throwOnPost = true
 app.sendHubReport('daily')

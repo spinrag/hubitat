@@ -126,7 +126,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.9.2'
+@Field static final String APP_VERSION = '1.9.3'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -1634,15 +1634,26 @@ Map reportLock(lock) {
     return l
 }
 
-// Every lock selected in the app, once
+// Every lock selected in the app, once, flagged managed and code lock as
+// codeLockDevices() decides
 List reportLocks() {
+    Set managedIds = managedLockDevices().collect { it.id.toString() } as Set
     return allLocks().take(MAX_REPORT_LOCKS).collect { lock ->
+        String id = lock.id.toString()
+        Map l
         try {
-            return reportLock(lock)
+            l = reportLock(lock)
         } catch (Exception e) {
             // One unreadable device doesn't hold up the report
-            return [deviceId: lock.id.toString()]
+            l = [deviceId: id]
         }
+        l.managed = managedIds.contains(id)
+        try {
+            l.codeLock = l.managed && lock.hasCapability('LockCodes') == true
+        } catch (Exception e) {
+            // left out
+        }
+        return l
     }
 }
 
