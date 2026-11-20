@@ -85,7 +85,7 @@ List secrets = []
 String INGEST_TOKEN = 'sbit_fakeingesttokenfakeingesttoken00'
 secrets << INGEST_TOKEN
 
-check('version is 1.9.3', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.3')
+check('version is 1.9.4', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.4')
 
 def callback = { Map p ->
     String before = app.state.accessToken
@@ -142,7 +142,7 @@ headlines.each { k, h ->
     String html = pages[k]
     String status = k == 'connected' ? 'ok' : 'err'
     check("page ${k}: title and headline '${h}' with its marker", html.contains("<title>SignalBricks Telemetry: ${h}</title>") && html.contains("<main class=\"${status}\">") && html =~ /<h1><span class="mark"[^>]*>[^<]+<\/span>${h}<\/h1>/)
-    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.9.3</p>'))
+    check("page ${k}: app name and version", html.contains('<p class="app">SignalBricks Telemetry 1.9.4</p>'))
     check("page ${k}: inline CSS only, light and dark, wraps long text", html.contains('<style>') && html.contains('prefers-color-scheme:dark') && html.contains('overflow-wrap:anywhere') && !(html =~ /<script|<link|<img|@import|url\(|src=/))
     check("page ${k}: no back link (it opened in its own window); says to close it and return to the app", !html.contains('<a ') && !html.contains('installedapp') && !html.contains('Back to the app') &&
         html.contains("If this window doesn't close, close it yourself and return to the app; it's still open in your other tab."))
@@ -172,6 +172,19 @@ app.paragraphs.clear()
 app.mainPage()
 String connectedHtml = app.paragraphs.join('\n')
 check('app page connected: Last error escaped', app.state.sbToken && connectedHtml.contains('<b>Status:</b> Connected') && connectedHtml.contains('<b>Last error:</b> Token exchange returned HTTP &lt;script&gt;alert(1)&lt;/script&gt;') && !connectedHtml.contains('<script'))
+// Registration line: whether SignalBricks kept the local endpoint (#91)
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegisteredAt = '2026-11-20 10:00'
+[(true): '; local endpoint accepted', (false): '; local endpoint not used', (null): ''].each { kept, note ->
+    app.state.lockMgmtLocalEndpoint = kept
+    app.paragraphs.clear()
+    app.mainPage()
+    check("app page: registration line with local endpoint ${kept}", app.paragraphs.contains("<b>Registration:</b> registered 2026-11-20 10:00${note}".toString()))
+}
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+['lockMgmtRegisteredAt', 'lockMgmtLocalEndpoint'].each { app.state.remove(it) }
 app.state.sbToken = null
 app.logged.clear()
 callback([error: 'access_denied'])

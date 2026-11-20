@@ -57,6 +57,9 @@ abstract class HubitatStub extends Script {
     void unsubscribe() {}
     String getHubUID() { '00000000-0000-4000-8000-00000000abcd' }
     String getFullApiServerUrl() { "https://cloud.hubitat.com/api/${getHubUID()}/apps/42" }
+    // The hub's local endpoint (#91): a String, null, or an Exception to throw
+    def localUrl = null
+    String getFullLocalApiServerUrl() { if (localUrl instanceof Exception) throw localUrl; localUrl }
     def parseJson(String s) { new JsonSlurper().parseText(s) }
     String createAccessToken() { state.accessToken = 'tok-' + UUID.randomUUID(); state.accessToken }
     Boolean throwOnPost = false
@@ -1345,7 +1348,7 @@ check('fp: key never in responses, logs or posts', !keyForms.any { fpEverything.
 check('fp: no code in any fingerprint-section response or log', !fpCodes.any { fpEverything.contains(it) })
 
 // --- Re-register after an update that didn't run updated() (#539) ---
-String VERSION = '1.9.3'
+String VERSION = '1.9.4'
 def evt = [id: 1, deviceId: 7, name: 'contact', displayName: 'Door', value: 'open', isStateChange: true, type: 'physical']
 def event = { app.eventHandler(evt) }
 app.posts.clear(); app.logged.clear(); app.scheduled.clear()
@@ -1519,6 +1522,84 @@ app.eventHandler(evt)
 check('check-in: disconnected job run or event sends nothing', app.posts.isEmpty())
 check('check-in: nothing rescheduled while disconnected', checkInJobs().isEmpty())
 check('check-in: no tokens logged', !app.logged.any { it.toString().contains('ingest-fake') || it.toString().contains('tok-') })
+
+// --- Local endpoint in the registration (#91) ---
+String LOCAL = 'http://192.168.1.10/apps/api/42'
+app.state.sbToken = 'ingest-fake'
+app.state.ingestUrl = 'https://ingest.test/v1/webhooks/hubitat'
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+app.state.lockMgmtRegistered = true
+app.posts.clear(); app.logged.clear()
+app.registerWithPlatform()
+check('local: none from the hub, field left out', !regBody().containsKey('localEndpointBase') && registers()[-1].data.local == null)
+[new RuntimeException('no local url'), '', 'https://192.168.1.10/apps/api/42', 'http://' + ('x' * 300)].each { bad ->
+    app.localUrl = bad
+    app.registerWithPlatform()
+    check("local: unusable value (${bad instanceof Exception ? 'throws' : bad.toString().take(24)}) left out", !regBody().containsKey('localEndpointBase'))
+}
+app.localUrl = LOCAL
+app.registerWithPlatform()
+check('local: sent as localEndpointBase', regBody().localEndpointBase == LOCAL && registers()[-1].data.local == LOCAL)
+check('local: other fields unchanged', regBody().cloudEndpointBase == 'https://cloud.hubitat.com/api/00000000-0000-4000-8000-00000000abcd/apps/42' && regBody().lockManagement == true)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"local_endpoint":true}'), registers()[-1].data)
+check('local: success records the sent endpoint and the answer', app.state.registeredLocalEndpoint == LOCAL && app.state.lockMgmtLocalEndpoint == true)
+app.registerCallback(new FakeResp(status: 500, body: 'not json'), [enabled: true, local: 'http://10.0.0.9/apps/api/42'])
+check('local: failed registration keeps the last registered endpoint', app.state.registeredLocalEndpoint == LOCAL)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true}'), [enabled: true, local: LOCAL])
+check('local: an older platform without local_endpoint shows nothing', app.state.lockMgmtLocalEndpoint == null)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"local_endpoint":false}'), [enabled: true, local: LOCAL])
+check('local: local_endpoint false recorded', app.state.lockMgmtLocalEndpoint == false)
+
+// Daily check-in re-registers when the address changed; events don't check it
+app.state.registeredVersion = VERSION
+app.state.remove('reregisterAttemptAt')
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+check('local: same endpoint, check-in does not register', registers().isEmpty())
+app.localUrl = 'http://192.168.1.77/apps/api/42'
+app.eventHandler(evt)
+check('local: an event never checks the endpoint', registers().isEmpty())
+app.dailyCheckIn()
+check('local: changed endpoint, check-in re-registers with it', registers().size() == 1 && regBody().localEndpointBase == 'http://192.168.1.77/apps/api/42')
+check('local: re-register log says why', app.logged.any { it.toString() == 'SignalBricks Telemetry: re-registering, local endpoint changed' })
+app.dailyCheckIn()
+check('local: backoff respected', registers().size() == 1)
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"local_endpoint":true}'), registers()[-1].data)
+app.fakeNow += 24L * 3600 * 1000
+app.dailyCheckIn()
+check('local: registered, nothing on the next day', registers().size() == 1)
+app.localUrl = null
+app.fakeNow += 24L * 3600 * 1000
+app.dailyCheckIn()
+check('local: endpoint gone, re-registers without the field', registers().size() == 2 && !regBody().containsKey('localEndpointBase'))
+app.registerCallback(new FakeResp(status: 200, body: '{"lock_management":true,"connected":true,"local_endpoint":false}'), registers()[-1].data)
+check('local: none registered', app.state.registeredLocalEndpoint == null)
+
+// Every feature off: a changed endpoint doesn't re-register
+app.lockManagementEnabled = false
+app.state.lockMgmtLastEnabled = false
+app.localUrl = LOCAL
+app.fakeNow += 24L * 3600 * 1000
+app.posts.clear()
+app.dailyCheckIn()
+check('local: features off, no re-register for the endpoint', registers().isEmpty())
+app.lockManagementEnabled = true
+app.state.lockMgmtLastEnabled = true
+
+// Hub restart: a check two minutes later
+app.scheduled.clear()
+app.systemStartHandler([name: 'systemStart'])
+check('local: restart schedules a check in two minutes', app.scheduled.any { it.handler == 'localEndpointCheck' && it.secs == 120 })
+app.subscriptions.clear()
+app.subscribeToAppInfo()
+check('local: subscribes to systemStart', app.subscriptions.contains('systemStart'))
+app.localEndpointCheck()
+check('local: restart check re-registers with the new endpoint', registers().size() == 1 && regBody().localEndpointBase == LOCAL)
+
+app.appButtonHandler('btnDisconnect')
+check('local: disconnect clears it', app.state.registeredLocalEndpoint == null && app.state.lockMgmtLocalEndpoint == null)
+app.localUrl = null
 
 // --- Door codes in telemetry: "Include door codes" (signalbricks/platform#388) ---
 // Made-up PINs only.

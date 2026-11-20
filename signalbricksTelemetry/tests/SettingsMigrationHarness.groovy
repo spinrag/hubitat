@@ -182,7 +182,7 @@ check('1.7: slot rules, fingerprint key, approvals and the held change kept', ke
 check('1.7: note names the newly managed lock and full control', p17.contains('Newly managed: Lock B.') && !p17.contains('Lock A,') && p17.contains('Full control above the ceiling is now one switch'))
 check('1.7: note can be dismissed', app.inputs.btnDismissSettingsNote?.type == 'button')
 check('1.7: logged once, with a count only', app.logged.count { it.contains('settings moved to') } == 1 &&
-    app.logged.any { it == 'SignalBricks Telemetry: settings moved to SignalBricks Telemetry 1.9.3: 1 lock(s) newly managed, full control is one switch' })
+    app.logged.any { it == 'SignalBricks Telemetry: settings moved to SignalBricks Telemetry 1.9.4: 1 lock(s) newly managed, full control is one switch' })
 check('1.7: page has one Locks list and one full control switch', app.inputs.locks?.type == 'capability.lock' && app.inputs.fullControlEnabled?.type == 'bool' &&
     !['managedLocks', 'fullControlLocks', 'codeLocks'].any { app.inputs.containsKey(it) })
 int writes = settingsWritten(app)
@@ -234,7 +234,7 @@ app.params = [lockId: '101']
 check('1.8: no lock can be unlocked until Done, the newly managed one included', paused102.status == 404 && app.apiUnlock().status == 404 &&
     app.devices['102'].calls.isEmpty())
 reg = registers(app)[-1]
-check('1.8: re-registered on the version change, lock control off until Done', reg.version == '1.9.3' && reg.appAccessToken == token &&
+check('1.8: re-registered on the version change, lock control off until Done', reg.version == '1.9.4' && reg.appAccessToken == token &&
     reg.lockManagement == true && reg.codeManagement == true && reg.lockControl == false && reg.deviceControl == false)
 String p18 = page(app)
 check('1.8: note says why lock control is paused and names the lock', p18.contains('Lock control is paused because these locks are now managed: Lock B. Click Done to turn it back on.') &&
