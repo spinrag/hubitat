@@ -1,7 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbAppVersion() { '1.4.18' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.19' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -1784,24 +1784,32 @@ Map apiSyncBookingByLock() {
 
         booking.lockId = booking.lockId.unique()
         bookings[key] = booking
-        bookings = helperGetBookings(bookings)
+        // Keyed by id as text, as atomicState stores them
+        bookings = helperGetBookings(bookings).collectEntries { k, b -> [k.toString(), b] }
+
+        // If you try to save a booking that's already passed, it will be removed by helperGetBookings
+        if (bookings[key] == null) {
+            scheduleEvents(bookings)
+            atomicState.bookings = bookings
+            atomicState.lastSync = [at: now(), source: "${bookingsRequestMethod('POST/PUT')} /sync/${key}"]
+            runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
+            booking.code = null
+            return sbHttpResponseJson(booking, 202)
+        }
+
+        // Refused, not stored or scheduled: a stored booking stays as it was
+        if (helperHasOverlappingBooking(params.lockId, key, bookings) || helperHasDuplicateCode(params.lockId, bookings[key], bookings)) {
+            log.warn "apiSyncBookingByLock: ${helperLogBooking(bookings[key])} not saved for lock ${params.lockId}: duplicate code"
+            // The dispatcher may log error bodies: last 2 digits only (#36)
+            return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
+        }
+
         scheduleEvents(bookings)
 
         atomicState.bookings = bookings
         atomicState.lastSync = [at: now(), source: "${bookingsRequestMethod('POST/PUT')} /sync/${key}"]
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
-
-        // If you try to save a booking that's already passed, it will be removed by helperGetBookings
-        if (atomicState.bookings[key] == null) {
-            booking.code = null
-            return sbHttpResponseJson(booking, 202)
-        }
-
-        if (helperHasDuplicateCode(params.lockId, atomicState.bookings[key], atomicState.bookings)) {
-            // The dispatcher may log error bodies: last 2 digits only (#36)
-            return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
-        }
 
         return sbHttpResponseJson(atomicState.bookings[key])
     } catch (Exception ex) {
@@ -1942,6 +1950,27 @@ Map helperJsonMap(String text) {
         return v instanceof Map ? (Map) v : null
     } catch (Exception e) {
         return null
+    }
+}
+
+// Another booking on the lock with the same code whose stay overlaps this one's. A missing
+// check-out is open-ended (a missing check-in too). Never log the code
+boolean helperHasOverlappingBooking(def lockId, def key, Map bookings) {
+    Map booking = bookings[key]
+    String pin = helperCodeText(booking?.code)
+    if (!pin) return false
+    Date checkIn = helperToDate(booking.checkIn)
+    Date checkOut = helperToDate(booking.checkOut)
+    return bookings.any { k, other ->
+        if (!(other instanceof Map) || k.toString() == key.toString() || other.id?.toString() == key.toString()) return false
+        List otherLocks = (other.lockId instanceof List ? other.lockId : [other.lockId])*.toString()
+        if (!otherLocks.contains(lockId.toString()) || helperCodeText(other.code) != pin) return false
+        Date otherIn = helperToDate(other.checkIn)
+        Date otherOut = helperToDate(other.checkOut)
+        boolean overlap = (otherIn == null || checkOut == null || otherIn.before(checkOut)) &&
+            (otherOut == null || checkIn == null || otherOut.after(checkIn))
+        if (overlap) log.debug "helperHasOverlappingBooking: ${helperLogBooking(booking)} overlaps ${helperLogBooking(other)} on lock ${lockId}"
+        return overlap
     }
 }
 

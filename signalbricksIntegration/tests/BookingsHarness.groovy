@@ -93,7 +93,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.18', app.sbAppVersion == '1.4.18')
+check('version is 1.4.19', app.sbAppVersion == '1.4.19')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -192,7 +192,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.18'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.19'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')
@@ -238,6 +238,46 @@ check('200: a hidden or missing code on the lock', syncReply(['20': [name: 'Fron
 check('200: the booking\'s own slot, code as a number', syncReply(['20': [name: 'GT:ORB40-Jo', code: 20000040]], '20000040').status == 200)
 check('200: another code', syncReply(['20': [name: 'Front desk', code: 20000041]], '20000040').status == 200)
 check('409 sync: no code in any log line', !app.logged.any { l -> ['20000040', '1234567', '20000041'].any { l.contains(it) } })
+back.attrs.lockCodes = JsonOutput.toJson(backCodes)
+app.atomicState.bookings = [:]
+
+// --- Sync API: 409 when another booking on the lock has the same code and overlapping dates (1.4.19) ---
+back.attrs.lockCodes = JsonOutput.toJson([:])
+def sync = { String id, String lockId, String code, Long checkIn, Long checkOut ->
+    app.params = [bookingId: id, lockId: lockId]
+    app.request = [JSON: [id: id, guest: 'G' + id, code: code, checkIn: checkIn, checkOut: checkOut]]
+    app.apiSyncBookingByLock()
+}
+def stored = { String id -> app.atomicState.bookings[id] }
+long t0 = now.time - now.time % 1000 // stored dates keep whole seconds
+String pin = '40404040'
+app.logged.clear()
+check('overlap: first booking saved', sync('41', '2', pin, t0 + 24 * h, t0 + 48 * h).status == 200)
+check('overlap: back-to-back booking with the same code saved', sync('42', '2', pin, t0 + 48 * h, t0 + 72 * h).status == 200 && stored('42') && stored('41'))
+def before = [bookings: JsonOutput.toJson(app.atomicState.bookings), scheduled: app.scheduled.collect { it.toString() }, lastSync: app.atomicState.lastSync]
+app.clock += 60_000
+def ext = sync('41', '2', pin, t0 + 24 * h, t0 + 50 * h)
+check('overlap: an extension into the next booking is refused with 409, code masked',
+    ext.status == 409 && new JsonSlurper().parseText(ext.data).error == "Duplicate code: '\u2022\u2022\u2022\u202240'.")
+check('overlap: the refused extension is not saved, scheduled or recorded as the last sync',
+    JsonOutput.toJson(app.atomicState.bookings) == before.bookings && app.scheduled.collect { it.toString() } == before.scheduled && app.atomicState.lastSync == before.lastSync)
+check('overlap: a new booking inside another one is refused and not saved', sync('43', '2', pin, t0 + 60 * h, t0 + 70 * h).status == 409 && !stored('43'))
+check('overlap: a booking that starts before and ends inside another one is refused', sync('43', '2', pin, t0 + 12 * h, t0 + 30 * h).status == 409 && !stored('43'))
+check('overlap: re-sync of the same booking is saved', sync('42', '2', pin, t0 + 48 * h, t0 + 72 * h).status == 200)
+check('overlap: re-sync of the same booking with new non-overlapping dates is saved',
+    sync('42', '2', pin, t0 + 49 * h, t0 + 73 * h).status == 200 && app.helperToDate(stored('42').checkOut).time == t0 + 73 * h)
+check('overlap: a different code on the same lock is saved', sync('44', '2', '40404041', t0 + 60 * h, t0 + 70 * h).status == 200)
+check('overlap: the same code on a different lock is saved', sync('43', '4', pin, t0 + 60 * h, t0 + 70 * h).status == 200 && stored('43').lockId == ['4'])
+check('overlap: that booking then refused on the lock where it overlaps, kept on its own lock',
+    sync('43', '2', pin, t0 + 60 * h, t0 + 70 * h).status == 409 && stored('43').lockId == ['4'])
+String open = '50505050'
+check('open-ended: a booking with no check-out is saved', sync('45', '2', open, t0 + 100 * h, null).status == 200 && stored('45') && stored('45').checkOut == null)
+check('open-ended: a later booking with the same code is refused', sync('46', '2', open, t0 + 500 * h, t0 + 510 * h).status == 409 && !stored('46'))
+check('open-ended: a booking ending before its check-in is saved', sync('47', '2', open, t0 + 90 * h, t0 + 100 * h).status == 200)
+check('open-ended: a new booking with no check-out that runs into another is refused', sync('48', '2', open, t0 + 80 * h, null).status == 409 && !stored('48'))
+check('open-ended: a new booking with no check-out after the others is saved on another lock', sync('48', '4', open, t0 + 80 * h, null).status == 200)
+check('overlap: no code in any log line', !app.logged.any { l -> [pin, open, '40404041'].any { l.contains(it) } })
+check('overlap: the refusal is logged with the booking id', app.logged.any { it.contains('ORB43') && it.contains('not saved for lock 2') })
 back.attrs.lockCodes = JsonOutput.toJson(backCodes)
 app.atomicState.bookings = [:]
 
