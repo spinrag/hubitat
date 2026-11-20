@@ -1547,6 +1547,8 @@ Map apiGetInfo() {
             version: sbAppVersion,
             location: location.name,
             name: location.hub.name,
+            // Full codes, unlike the /sync replies: the dispatcher's read-merge-PUT sends
+            // these bookings back in PUT /sync, so a masked code would replace the real one
             bookings: atomicState.bookings,
             nextBooking: helperFindNextBooking(null),
         ])
@@ -1689,18 +1691,12 @@ def apiExecuteCommand() {
     }
 }
 
-// Sync all bookings (replaces state.bookings), schedule tasks, and reconcile door codes.
-// A booking whose code overlaps another's is skipped and listed in conflicts
+// Sync all bookings (replaces state.bookings), schedule tasks, and reconcile door codes
 Map apiSync() {
     try {
         log.debug "apiSync: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
-        Map stored = helperTextKeys(helperGetBookings(atomicState.bookings ?: [:]))
-        Map incoming = helperTextKeys(helperGetBookings(request.JSON ?: [:]))
-        Map merged = helperMergeBookings(stored.findAll { k, b -> incoming.containsKey(k) }, incoming)
-        helperLogConflicts('apiSync', merged.conflicts)
-
-        atomicState.bookings = merged.bookings
+        atomicState.bookings = helperGetBookings(request.JSON)
         atomicState.lastSync = [at: now(), source: 'PUT /sync']
         sbReregisterIfVersionChanged()
         sbResubscribeIfVersionChanged()
@@ -1709,7 +1705,7 @@ Map apiSync() {
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
-        return sbHttpResponseJson(helperSyncReply(atomicState.bookings) + [conflicts: merged.conflicts])
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings))
     } catch (Exception ex) {
         String error = sbApiError('apiSync', ex)
 
@@ -1721,19 +1717,16 @@ Map apiSyncPatch() {
     try {
         log.debug "apiSyncPatch: ${request.JSON?.size() ?: 0} bookings (${helperLogBookings(request.JSON)})"
 
-        Map stored = helperTextKeys(helperGetBookings(atomicState.bookings ?: [:]))
-        Map incoming = helperTextKeys(helperGetBookings(request.JSON ?: [:]))
-        Map merged = helperMergeBookings(stored, incoming)
-        helperLogConflicts('apiSyncPatch', merged.conflicts)
+        def combined = atomicState.bookings + request.JSON
 
-        atomicState.bookings = merged.bookings
+        atomicState.bookings = helperGetBookings(combined)
         atomicState.lastSync = [at: now(), source: 'PATCH /sync']
         atomicState.reconcileRetries = 0
         scheduleEvents(atomicState.bookings)
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
-        return sbHttpResponseJson(helperSyncReply(atomicState.bookings) + [conflicts: merged.conflicts])
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings))
     } catch (Exception ex) {
         String error = sbApiError('apiSyncPatch', ex)
 
@@ -1741,47 +1734,10 @@ Map apiSyncPatch() {
     }
 }
 
-// Bookings keyed by id as text, as atomicState stores them
-Map helperTextKeys(Map bookings) {
-    return bookings.collectEntries { k, b -> [k.toString(), b] }
-}
-
 // A /sync reply: bookings and next bookings with codes masked to their last 2 digits
 Map helperSyncReply(Map bookings) {
     Closure masked = { Map m -> (m ?: [:]).collectEntries { k, b -> [k, b instanceof Map ? b + [code: helperMaskCode(b.code)] : b] } }
     return [bookings: masked(bookings), nextBooking: masked(bookings ? helperFindNextBooking(bookings) : [:])]
-}
-
-void helperLogConflicts(String source, List conflicts) {
-    if (conflicts) log.warn "${source}: not saved, duplicate code: ${conflicts.collect { 'ORB' + it }.join(', ')}"
-}
-
-// The kept bookings with the incoming ones over them. An incoming booking whose code overlaps
-// another booking's on a lock they share is skipped (a skipped booking keeps its kept version,
-// if any): kept bookings first, then earlier check-in, then lower id.
-// Returns [bookings: Map, conflicts: [ids]]
-Map helperMergeBookings(Map kept, Map incoming) {
-    Map result = [:] + kept
-    List conflicts = []
-    Closure checkIn = { Map b -> helperToDate(b.checkIn)?.time ?: Long.MIN_VALUE }
-    List keys = new ArrayList(incoming.keySet()).sort { a, b ->
-        (kept.containsKey(a) ? 0 : 1) <=> (kept.containsKey(b) ? 0 : 1) ?:
-            checkIn(incoming[a]) <=> checkIn(incoming[b]) ?:
-            ((a ==~ /\d+/ && b ==~ /\d+/) ? new BigInteger(a) <=> new BigInteger(b) : a <=> b)
-    }
-    keys.each { k ->
-        Map candidate = result + [(k): incoming[k]]
-        if (helperLockIds(incoming[k]).any { l -> helperHasOverlappingBooking(l, k, candidate) }) {
-            conflicts << k
-        } else {
-            result[k] = incoming[k]
-        }
-    }
-    return [bookings: result, conflicts: conflicts]
-}
-
-List helperLockIds(Map booking) {
-    return (booking.lockId instanceof List ? booking.lockId : [booking.lockId]).findAll { it != null }*.toString()
 }
 
 // Sync a single booking, schedule tasks, and reconcile door codes
@@ -1822,26 +1778,7 @@ Map apiSyncBookingByLock() {
 
         booking.lockId = booking.lockId.unique()
         bookings[key] = booking
-        // Keyed by id as text, as atomicState stores them
-        bookings = helperGetBookings(bookings).collectEntries { k, b -> [k.toString(), b] }
-
-        // If you try to save a booking that's already passed, it will be removed by helperGetBookings
-        if (bookings[key] == null) {
-            scheduleEvents(bookings)
-            atomicState.bookings = bookings
-            atomicState.lastSync = [at: now(), source: "${bookingsRequestMethod('POST/PUT')} /sync/${key}"]
-            runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
-            booking.code = null
-            return sbHttpResponseJson(booking, 202)
-        }
-
-        // Refused, not stored or scheduled: a stored booking stays as it was
-        if (helperHasOverlappingBooking(params.lockId, key, bookings)) {
-            log.warn "apiSyncBookingByLock: ${helperLogBooking(bookings[key])} not saved for lock ${params.lockId}: duplicate code"
-            // The dispatcher may log error bodies: last 2 digits only (#36)
-            return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
-        }
-
+        bookings = helperGetBookings(bookings)
         scheduleEvents(bookings)
 
         atomicState.bookings = bookings
@@ -1849,12 +1786,19 @@ Map apiSyncBookingByLock() {
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
-        // Another code on the lock: saved anyway, the 409 is a warning
+        // If you try to save a booking that's already passed, it will be removed by helperGetBookings
+        if (atomicState.bookings[key] == null) {
+            booking.code = null
+            return sbHttpResponseJson(booking, 202)
+        }
+
         if (helperHasDuplicateCode(params.lockId, atomicState.bookings[key], atomicState.bookings)) {
+            // The dispatcher may log error bodies: last 2 digits only (#36)
             return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
         }
 
-        return sbHttpResponseJson(atomicState.bookings[key])
+        Map saved = atomicState.bookings[key]
+        return sbHttpResponseJson(saved + [code: helperMaskCode(saved.code)])
     } catch (Exception ex) {
         return sbHttpResponseJson([ error: sbApiError('apiSyncBookingByLock', ex) ], 500)
     }
@@ -1993,27 +1937,6 @@ Map helperJsonMap(String text) {
         return v instanceof Map ? (Map) v : null
     } catch (Exception e) {
         return null
-    }
-}
-
-// Another booking on the lock with the same code whose stay overlaps that of bookings[key]. A missing
-// check-out is open-ended (a missing check-in too). Never log the code
-boolean helperHasOverlappingBooking(def lockId, def key, Map bookings) {
-    Map booking = bookings[key]
-    String pin = helperCodeText(booking?.code)
-    if (!pin) return false
-    Date checkIn = helperToDate(booking.checkIn)
-    Date checkOut = helperToDate(booking.checkOut)
-    return bookings.any { k, other ->
-        if (!(other instanceof Map) || k.toString() == key.toString() || other.id?.toString() == key.toString()) return false
-        List otherLocks = (other.lockId instanceof List ? other.lockId : [other.lockId])*.toString()
-        if (!otherLocks.contains(lockId.toString()) || helperCodeText(other.code) != pin) return false
-        Date otherIn = helperToDate(other.checkIn)
-        Date otherOut = helperToDate(other.checkOut)
-        boolean overlap = (otherIn == null || checkOut == null || otherIn.before(checkOut)) &&
-            (otherOut == null || checkIn == null || otherOut.after(checkIn))
-        if (overlap) log.debug "helperHasOverlappingBooking: ${helperLogBooking(booking)} overlaps ${helperLogBooking(other)} on lock ${lockId}"
-        return overlap
     }
 }
 

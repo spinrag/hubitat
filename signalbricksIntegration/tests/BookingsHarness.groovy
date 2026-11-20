@@ -241,87 +241,41 @@ check('409 sync: no code in any log line', !app.logged.any { l -> ['20000040', '
 back.attrs.lockCodes = JsonOutput.toJson(backCodes)
 app.atomicState.bookings = [:]
 
-// --- Sync API: 409 when another booking on the lock has the same code and overlapping dates (1.4.19) ---
-back.attrs.lockCodes = JsonOutput.toJson([:])
-def sync = { String id, String lockId, String code, Long checkIn, Long checkOut ->
-    app.params = [bookingId: id, lockId: lockId]
-    app.request = [JSON: [id: id, guest: 'G' + id, code: code, checkIn: checkIn, checkOut: checkOut]]
-    app.apiSyncBookingByLock()
-}
-def stored = { String id -> app.atomicState.bookings[id] }
-long t0 = now.time - now.time % 1000 // stored dates keep whole seconds
-String pin = '40404040'
-app.logged.clear()
-check('overlap: first booking saved', sync('41', '2', pin, t0 + 24 * h, t0 + 48 * h).status == 200)
-check('overlap: back-to-back booking with the same code saved', sync('42', '2', pin, t0 + 48 * h, t0 + 72 * h).status == 200 && stored('42') && stored('41'))
-def before = [bookings: JsonOutput.toJson(app.atomicState.bookings), scheduled: app.scheduled.collect { it.toString() }, lastSync: app.atomicState.lastSync]
-app.clock += 60_000
-def ext = sync('41', '2', pin, t0 + 24 * h, t0 + 50 * h)
-check('overlap: an extension into the next booking is refused with 409, code masked',
-    ext.status == 409 && new JsonSlurper().parseText(ext.data).error == "Duplicate code: '\u2022\u2022\u2022\u202240'.")
-check('overlap: the refused extension is not saved, scheduled or recorded as the last sync',
-    JsonOutput.toJson(app.atomicState.bookings) == before.bookings && app.scheduled.collect { it.toString() } == before.scheduled && app.atomicState.lastSync == before.lastSync)
-check('overlap: a new booking inside another one is refused and not saved', sync('43', '2', pin, t0 + 60 * h, t0 + 70 * h).status == 409 && !stored('43'))
-check('overlap: a booking that starts before and ends inside another one is refused', sync('43', '2', pin, t0 + 12 * h, t0 + 30 * h).status == 409 && !stored('43'))
-check('overlap: re-sync of the same booking is saved', sync('42', '2', pin, t0 + 48 * h, t0 + 72 * h).status == 200)
-check('overlap: re-sync of the same booking with new non-overlapping dates is saved',
-    sync('42', '2', pin, t0 + 49 * h, t0 + 73 * h).status == 200 && app.helperToDate(stored('42').checkOut).time == t0 + 73 * h)
-check('overlap: a different code on the same lock is saved', sync('44', '2', '40404041', t0 + 60 * h, t0 + 70 * h).status == 200)
-check('overlap: the same code on a different lock is saved', sync('43', '4', pin, t0 + 60 * h, t0 + 70 * h).status == 200 && stored('43').lockId == ['4'])
-check('overlap: that booking then refused on the lock where it overlaps, kept on its own lock',
-    sync('43', '2', pin, t0 + 60 * h, t0 + 70 * h).status == 409 && stored('43').lockId == ['4'])
-String open = '50505050'
-check('open-ended: a booking with no check-out is saved', sync('45', '2', open, t0 + 100 * h, null).status == 200 && stored('45') && stored('45').checkOut == null)
-check('open-ended: a later booking with the same code is refused', sync('46', '2', open, t0 + 500 * h, t0 + 510 * h).status == 409 && !stored('46'))
-check('open-ended: a booking ending before its check-in is saved', sync('47', '2', open, t0 + 90 * h, t0 + 100 * h).status == 200)
-check('open-ended: a new booking with no check-out that runs into another is refused', sync('48', '2', open, t0 + 80 * h, null).status == 409 && !stored('48'))
-check('open-ended: a new booking with no check-out after the others is saved on another lock', sync('48', '4', open, t0 + 80 * h, null).status == 200)
-check('overlap: no code in any log line', !app.logged.any { l -> [pin, open, '40404041'].any { l.contains(it) } })
-check('overlap: the refusal is logged with the booking id', app.logged.any { it.contains('ORB43') && it.contains('not saved for lock 2') })
-
-// Another code on the lock (not a booking): the booking is saved, the 409 is a warning
-back.attrs.lockCodes = JsonOutput.toJson(['20': [name: 'Front desk', code: '60606060']])
-check('lock code: 409 for a code another lock code holds', sync('49', '2', '60606060', t0 + 200 * h, t0 + 210 * h).status == 409)
-check('lock code: the booking is saved anyway', stored('49')?.lockId == ['2'] && app.helperToDate(stored('49').checkOut).time == t0 + 210 * h)
-back.attrs.lockCodes = JsonOutput.toJson([:])
-
-// --- PUT and PATCH /sync: a booking whose code overlaps another's is skipped and listed (1.4.19) ---
-def body = { String id, String lockId, String code, Long checkIn, Long checkOut ->
-    [(id): [id: id, guest: 'G' + id, code: code, lockId: [lockId], checkIn: checkIn, checkOut: checkOut]]
-}
+// --- Sync replies: codes masked to their last 2 digits (1.4.19); GET /info keeps them ---
 def reply = { Map r -> new JsonSlurper().parseText(r.data) }
-List syncCodes = ['70707070', '80808080', '90909090']
+List syncCodes = ['70707070', '80808080']
+String masked70 = '\u2022\u2022\u2022\u202270'
+long t0 = now.time - now.time % 1000
+Map syncPair = [
+    '61': [id: '61', guest: 'Kim', code: syncCodes[0], lockId: ['2'], checkIn: t0 + 24 * h, checkOut: t0 + 48 * h],
+    '62': [id: '62', guest: 'Lu', code: syncCodes[0], lockId: ['2'], checkIn: t0 + 30 * h, checkOut: t0 + 40 * h],
+]
 app.atomicState.bookings = [:]
-app.logged.clear()
-app.request = [JSON: body('62', '2', syncCodes[0], t0 + 30 * h, t0 + 40 * h) + body('61', '2', syncCodes[0], t0 + 24 * h, t0 + 36 * h) +
-    body('63', '2', syncCodes[1], t0 + 24 * h, t0 + 48 * h) + body('64', '2', syncCodes[1], t0 + 24 * h, t0 + 30 * h)]
+app.request = [JSON: syncPair]
 def put = app.apiSync()
-check('PUT /sync: of an overlapping pair the earlier check-in is saved, the other listed',
-    put.status == 200 && stored('61') && !stored('62') && reply(put).conflicts.contains('62'))
-check('PUT /sync: same check-in, the lower id is saved', stored('63') && !stored('64') && reply(put).conflicts.sort() == ['62', '64'])
-check('PUT /sync: the response holds no code', !syncCodes.any { put.data.contains(it) } && reply(put).bookings['61'].code == '\u2022\u2022\u2022\u202270')
-app.request = [JSON: body('71', '2', syncCodes[2], t0 + 24 * h, t0 + 48 * h) + body('72', '2', syncCodes[2], t0 + 48 * h, t0 + 72 * h)]
-put = app.apiSync()
-check('PUT /sync: back-to-back bookings with the same code are both saved',
-    put.status == 200 && reply(put).conflicts == [] && stored('71') && stored('72') && !stored('61'))
-app.request = [JSON: body('73', '2', syncCodes[2], t0 + 47 * h, t0 + 60 * h) + body('71', '2', syncCodes[2], t0 + 24 * h, t0 + 48 * h) + body('72', '2', syncCodes[2], t0 + 48 * h, t0 + 72 * h)]
-put = app.apiSync()
-check('PUT /sync: a new booking overlapping stored ones is skipped, they keep their slot',
-    reply(put).conflicts == ['73'] && stored('71') && stored('72') && !stored('73'))
-app.clock += 60_000
-def patch
-app.request = [JSON: body('71', '2', syncCodes[2], t0 + 24 * h, t0 + 50 * h) + body('74', '2', syncCodes[1], t0 + 24 * h, t0 + 30 * h)]
-patch = app.apiSyncPatch()
-check('PATCH /sync: an extension into another booking is refused, the stored version kept',
-    patch.status == 200 && reply(patch).conflicts == ['71'] && app.helperToDate(stored('71').checkOut).time == t0 + 48 * h && stored('72'))
-check('PATCH /sync: the rest of the payload is saved', stored('74') && app.atomicState.lastSync.source == 'PATCH /sync')
-check('PATCH /sync: the response holds no code', !syncCodes.any { patch.data.contains(it) })
-app.request = [JSON: body('72', '4', syncCodes[2], t0 + 30 * h, t0 + 40 * h)]
-patch = app.apiSyncPatch()
-check('PATCH /sync: the same code on another lock is saved', reply(patch).conflicts == [] && stored('72').lockId == ['4'])
-check('/sync: conflicts logged by booking id, no code in any log line',
-    app.logged.any { it.contains('not saved, duplicate code: ORB64, ORB62') } && !app.logged.any { l -> syncCodes.any { l.contains(it) } })
+check('PUT /sync: no code in the reply, codes masked', put.status == 200 && !syncCodes.any { put.data.contains(it) } &&
+    reply(put).bookings['61'].code == masked70 && reply(put).nextBooking['2'].code == masked70)
+check('PUT /sync: overlapping bookings with the same code are both saved (as in 1.4.18)',
+    app.atomicState.bookings['61'].code == syncCodes[0] && app.atomicState.bookings['62'].code == syncCodes[0])
+app.request = [JSON: ['63': [id: '63', guest: 'Mo', code: syncCodes[1], lockId: ['2'], checkIn: t0 + 24 * h, checkOut: t0 + 50 * h]]]
+def patch = app.apiSyncPatch()
+check('PATCH /sync: no code in the reply, codes masked', patch.status == 200 && !syncCodes.any { patch.data.contains(it) } &&
+    reply(patch).bookings['63'].code == '\u2022\u2022\u2022\u202280' && app.atomicState.bookings['63'].code == syncCodes[1])
+app.params = [bookingId: '64', lockId: '2']
+app.request = [JSON: [id: '64', guest: 'Ned', code: syncCodes[0], checkIn: t0 + 26 * h, checkOut: t0 + 60 * h]]
+def one = app.apiSyncBookingByLock()
+check('PUT /sync/<id>/<lock>: no code in the reply, overlap saved (as in 1.4.18)', one.status == 200 && !syncCodes.any { one.data.contains(it) } &&
+    reply(one).code == masked70 && app.atomicState.bookings['64'].code == syncCodes[0])
+back.attrs.lockCodes = JsonOutput.toJson(['20': [name: 'Front desk', code: '90909090']])
+app.params = [bookingId: '65', lockId: '2']
+app.request = [JSON: [id: '65', guest: 'Oz', code: '90909090', checkIn: t0 + 70 * h, checkOut: t0 + 80 * h]]
+def lockDup = app.apiSyncBookingByLock()
+check('PUT /sync/<id>/<lock>: another code on the lock is a 409 warning, the booking saved (as in 1.4.18)',
+    lockDup.status == 409 && !lockDup.data.contains('90909090') && app.atomicState.bookings['65']?.lockId == ['2'])
 back.attrs.lockCodes = JsonOutput.toJson(backCodes)
+app.params = [:]
+def info = app.apiGetInfo()
+check('GET /info: full codes, for the dispatcher\'s read-merge-PUT', reply(info).bookings['61'].code == syncCodes[0])
 app.atomicState.bookings = [:]
 
 // No bookings, no locks
