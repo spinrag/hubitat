@@ -93,7 +93,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.18', app.sbAppVersion == '1.4.18')
+check('version is 1.4.19', app.sbAppVersion == '1.4.19')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -192,7 +192,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.18'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.19'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')
@@ -239,6 +239,43 @@ check('200: the booking\'s own slot, code as a number', syncReply(['20': [name: 
 check('200: another code', syncReply(['20': [name: 'Front desk', code: 20000041]], '20000040').status == 200)
 check('409 sync: no code in any log line', !app.logged.any { l -> ['20000040', '1234567', '20000041'].any { l.contains(it) } })
 back.attrs.lockCodes = JsonOutput.toJson(backCodes)
+app.atomicState.bookings = [:]
+
+// --- Sync replies: codes masked to their last 2 digits (1.4.19); GET /info keeps them ---
+def reply = { Map r -> new JsonSlurper().parseText(r.data) }
+List syncCodes = ['70707070', '80808080']
+String masked70 = '\u2022\u2022\u2022\u202270'
+long t0 = now.time - now.time % 1000
+Map syncPair = [
+    '61': [id: '61', guest: 'Kim', code: syncCodes[0], lockId: ['2'], checkIn: t0 + 24 * h, checkOut: t0 + 48 * h],
+    '62': [id: '62', guest: 'Lu', code: syncCodes[0], lockId: ['2'], checkIn: t0 + 30 * h, checkOut: t0 + 40 * h],
+]
+app.atomicState.bookings = [:]
+app.request = [JSON: syncPair]
+def put = app.apiSync()
+check('PUT /sync: no code in the reply, codes masked', put.status == 200 && !syncCodes.any { put.data.contains(it) } &&
+    reply(put).bookings['61'].code == masked70 && reply(put).nextBooking['2'].code == masked70)
+check('PUT /sync: overlapping bookings with the same code are both saved (as in 1.4.18)',
+    app.atomicState.bookings['61'].code == syncCodes[0] && app.atomicState.bookings['62'].code == syncCodes[0])
+app.request = [JSON: ['63': [id: '63', guest: 'Mo', code: syncCodes[1], lockId: ['2'], checkIn: t0 + 24 * h, checkOut: t0 + 50 * h]]]
+def patch = app.apiSyncPatch()
+check('PATCH /sync: no code in the reply, codes masked', patch.status == 200 && !syncCodes.any { patch.data.contains(it) } &&
+    reply(patch).bookings['63'].code == '\u2022\u2022\u2022\u202280' && app.atomicState.bookings['63'].code == syncCodes[1])
+app.params = [bookingId: '64', lockId: '2']
+app.request = [JSON: [id: '64', guest: 'Ned', code: syncCodes[0], checkIn: t0 + 26 * h, checkOut: t0 + 60 * h]]
+def one = app.apiSyncBookingByLock()
+check('PUT /sync/<id>/<lock>: no code in the reply, overlap saved (as in 1.4.18)', one.status == 200 && !syncCodes.any { one.data.contains(it) } &&
+    reply(one).code == masked70 && app.atomicState.bookings['64'].code == syncCodes[0])
+back.attrs.lockCodes = JsonOutput.toJson(['20': [name: 'Front desk', code: '90909090']])
+app.params = [bookingId: '65', lockId: '2']
+app.request = [JSON: [id: '65', guest: 'Oz', code: '90909090', checkIn: t0 + 70 * h, checkOut: t0 + 80 * h]]
+def lockDup = app.apiSyncBookingByLock()
+check('PUT /sync/<id>/<lock>: another code on the lock is a 409 warning, the booking saved (as in 1.4.18)',
+    lockDup.status == 409 && !lockDup.data.contains('90909090') && app.atomicState.bookings['65']?.lockId == ['2'])
+back.attrs.lockCodes = JsonOutput.toJson(backCodes)
+app.params = [:]
+def info = app.apiGetInfo()
+check('GET /info: full codes, for the dispatcher\'s read-merge-PUT', reply(info).bookings['61'].code == syncCodes[0])
 app.atomicState.bookings = [:]
 
 // No bookings, no locks

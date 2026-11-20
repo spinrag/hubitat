@@ -1,7 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbAppVersion() { '1.4.18' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.19' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -1547,6 +1547,8 @@ Map apiGetInfo() {
             version: sbAppVersion,
             location: location.name,
             name: location.hub.name,
+            // Full codes, unlike the /sync replies: the dispatcher's read-merge-PUT sends
+            // these bookings back in PUT /sync, so a masked code would replace the real one
             bookings: atomicState.bookings,
             nextBooking: helperFindNextBooking(null),
         ])
@@ -1703,18 +1705,11 @@ Map apiSync() {
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
-        return sbHttpResponseJson([
-            bookings: atomicState.bookings,
-            nextBooking: helperFindNextBooking(atomicState.bookings),
-        ])
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings))
     } catch (Exception ex) {
         String error = sbApiError('apiSync', ex)
 
-        return sbHttpResponseJson([
-            bookings: atomicState.bookings,
-            nextBooking: helperFindNextBooking(atomicState.bookings),
-            error: error
-        ], 500)
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings) + [error: error], 500)
     }
 }
 
@@ -1731,19 +1726,18 @@ Map apiSyncPatch() {
 
         runIn(10, 'reconcileDoorCodes', [ overwrite: true ])
 
-        return sbHttpResponseJson([
-            bookings: atomicState.bookings,
-            nextBooking: helperFindNextBooking(atomicState.bookings),
-        ])
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings))
     } catch (Exception ex) {
         String error = sbApiError('apiSyncPatch', ex)
 
-        return sbHttpResponseJson([
-            bookings: atomicState.bookings,
-            nextBooking: helperFindNextBooking(atomicState.bookings),
-            error: error
-        ], 500)
+        return sbHttpResponseJson(helperSyncReply(atomicState.bookings) + [error: error], 500)
     }
+}
+
+// A /sync reply: bookings and next bookings with codes masked to their last 2 digits
+Map helperSyncReply(Map bookings) {
+    Closure masked = { Map m -> (m ?: [:]).collectEntries { k, b -> [k, b instanceof Map ? b + [code: helperMaskCode(b.code)] : b] } }
+    return [bookings: masked(bookings), nextBooking: masked(bookings ? helperFindNextBooking(bookings) : [:])]
 }
 
 // Sync a single booking, schedule tasks, and reconcile door codes
@@ -1803,7 +1797,8 @@ Map apiSyncBookingByLock() {
             return sbHttpResponseJson([ error: "Duplicate code: '${helperMaskCode(booking.code)}'."], 409)
         }
 
-        return sbHttpResponseJson(atomicState.bookings[key])
+        Map saved = atomicState.bookings[key]
+        return sbHttpResponseJson(saved + [code: helperMaskCode(saved.code)])
     } catch (Exception ex) {
         return sbHttpResponseJson([ error: sbApiError('apiSyncBookingByLock', ex) ], 500)
     }
