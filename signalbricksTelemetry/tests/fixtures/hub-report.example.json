@@ -35,7 +35,9 @@
       "maxCodes": 250,
       "codeLength": 4,
       "driver": "Generic Z-Wave Plus Lock",
-      "occupiedSlots": 12
+      "occupiedSlots": 12,
+      "managed": true,
+      "codeLock": true
     }
   ]
 }

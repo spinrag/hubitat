@@ -19,6 +19,7 @@ Highlights by version:
 - **1.9.0** simpler settings: one **Locks** list (every selected lock is managed) and [one switch per feature](#what-signalbricks-may-do-optional); lock and device control no longer need door code management. Your selections [carry over](#updating-to-190).
 - **1.9.1** device control reports the hub's temperature scale and each thermostat's supported modes, and reads current device state.
 - **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well, and the daily hub report includes SignalBricks Integration's previous code name prefix.
+- **1.9.3** the daily hub report says which locks are managed and which hold door codes, so SignalBricks counts keypad locks correctly.
 
 ## Requirements
 
@@ -141,7 +142,7 @@ Since 1.6.0 the app sends SignalBricks a short report about the hub once a day, 
 
 - the versions and slot settings of SignalBricks Telemetry and of booking apps on the hub that announce themselves;
 - hub firmware, uptime and time zone;
-- for each selected lock: battery, lock state, jammed, capacity, driver and the **number** of occupied slots.
+- for each selected lock: battery, lock state, jammed, capacity, driver, the **number** of occupied slots, and (since 1.9.3) whether it's managed and holds door codes.
 
 It never contains codes, code names or guest names. SignalBricks raises alerts from it, for example when a booking app's slots overlap the ones SignalBricks manages, a lock is jammed or low on battery, or the hub stops reporting. A report that fails is retried a few times, and the **Connection** section shows the error.
 
