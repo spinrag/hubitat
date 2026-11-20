@@ -83,6 +83,11 @@
  * Updates (#13): a daily check-in at a random per-hub time re-registers when
  * the version changed, since an HPM update doesn't run updated().
  *
+ * Local endpoint (#91): registration also sends the app's local endpoint
+ * (`getFullLocalApiServerUrl()`), which SignalBricks may call through a site
+ * connection, with Hubitat cloud as the fallback. The daily check-in, and a
+ * check shortly after the hub restarts, re-register when it changed.
+ *
  * Hub report (signalbricks/platform#692): booking apps on the hub announce
  * their version and slot settings with a hub-local `signalbricksAppInfo`
  * location event; the app keeps the latest per app. At the daily check-in,
@@ -126,7 +131,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.9.3'
+@Field static final String APP_VERSION = '1.9.4'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -208,6 +213,9 @@ import javax.crypto.spec.SecretKeySpec
 // An HPM update replaces the code without calling updated(), so the app
 // re-registers itself once the version changes, at most this often (#539).
 @Field static final long REREGISTER_INTERVAL_MS = 30L * 60 * 1000
+// After a restart with no local address yet (#91): check again this often, this many times.
+@Field static final int LOCAL_CHECK_RETRY_SECONDS = 600
+@Field static final int LOCAL_CHECK_RETRIES = 3
 // Reconnect link (#46): a click on Reconnect opens a sign-in link for this long.
 @Field static final int CONNECT_LINK_SECONDS = 600
 // Automatic retries of a registration that failed for a reason that may pass
@@ -461,7 +469,8 @@ Map mainPage() {
                     } else if (featuresAwaitingDone()) {
                         paragraph '<b>Click Done to turn it on.</b> The app replaces its access token first.'
                     } else {
-                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}" : 'not registered yet (click Done)'}"
+                        String localNote = state.lockMgmtRegisteredAt && state.lockMgmtLocalEndpoint != null ? "; local endpoint ${state.lockMgmtLocalEndpoint ? 'accepted' : 'not used'}" : ''
+                        paragraph "<b>Registration:</b> ${state.lockMgmtRegisteredAt ? "registered ${state.lockMgmtRegisteredAt}${localNote}" : 'not registered yet (click Done)'}"
                     }
                     if (state.lockMgmtRegisterError) paragraph "<b>Last registration error:</b> ${state.lockMgmtRegisterError}"
                     if (endpointOn()) input(name: 'btnRotateLockToken', type: 'button', title: 'Rotate access token and re-register')
@@ -872,6 +881,10 @@ void appButtonHandler(String btn) {
         state.remove('lockMgmtRegistered')
         state.remove('lockMgmtReconnectRequired')
         state.remove('registeredVersion')
+        state.remove('registeredLocalEndpoint')
+        state.remove('lockMgmtLocalEndpoint')
+        state.remove('localCheckRetries')
+        unschedule('localEndpointCheck')
         state.remove('reregisterAttemptAt')
         state.remove('reportedVersion')
         state.remove('reportAttemptAt')
@@ -1331,6 +1344,9 @@ Boolean registerWithPlatform(Boolean enabledOverride = null, Boolean retry = fal
         deviceControl: enabled && state.deviceControlOn == true,
         capabilities: CAPABILITIES,
     ]
+    // Left out when unknown; the platform then clears what it stored
+    String local = localEndpointBase()
+    if (local) body.localEndpointBase = local
     Map params = [
         uri: "${state.ingestUrl}/register",
         requestContentType: 'application/json',
@@ -1339,8 +1355,19 @@ Boolean registerWithPlatform(Boolean enabledOverride = null, Boolean retry = fal
         body: JsonOutput.toJson(body),
         timeout: 15,
     ]
-    asynchttpPost('registerCallback', params, [enabled: enabled])
+    asynchttpPost('registerCallback', params, [enabled: enabled, local: local])
     return true
+}
+
+// This app's local endpoint, `http://<hub IP>/apps/api/<appId>`, or null when
+// the hub doesn't give a usable one.
+String localEndpointBase() {
+    try {
+        String u = getFullLocalApiServerUrl()?.toString()
+        return u && u.startsWith('http://') && u.length() <= 300 ? u : null
+    } catch (Exception e) {
+        return null
+    }
 }
 
 // --- Registration retries (#46) ---
@@ -1418,19 +1445,27 @@ String hubFirmwareVersion() {
 // After an update that didn't run updated() (HPM), re-register so SignalBricks
 // sees the new version: on the next event or scheduled check, only when
 // registering is otherwise allowed, and at most every REREGISTER_INTERVAL_MS.
-void reregisterIfVersionChanged() {
-    if (state.registeredVersion == APP_VERSION) return
-    if (!state.sbToken || !isHttps(state.ingestUrl)) return
-    if (!endpointOn() && !lockMgmtPreviouslyRegistered()) return
-    if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) return
+// With checkLocal (daily check-in, after a hub restart), also when the local
+// endpoint differs from the one last registered while a feature is on (#91).
+// Returns the backoff left in ms when only the backoff held it back, else 0.
+long reregisterIfVersionChanged(Boolean checkLocal = false) {
+    Boolean versionChanged = state.registeredVersion != APP_VERSION
+    Boolean localChanged = checkLocal && endpointOn() && state.registeredLocalEndpoint != localEndpointBase()
+    if (!versionChanged && !localChanged) return 0L
+    if (!state.sbToken || !isHttps(state.ingestUrl)) return 0L
+    if (!endpointOn() && !lockMgmtPreviouslyRegistered()) return 0L
+    if (state.reregisterAttemptAt && now() - (state.reregisterAttemptAt as long) < REREGISTER_INTERVAL_MS) {
+        return (state.reregisterAttemptAt as long) + REREGISTER_INTERVAL_MS - now()
+    }
     state.reregisterAttemptAt = now()
-    log.info "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}"
+    log.info(versionChanged ? "SignalBricks Telemetry: re-registering after update to ${appNameAndVersion()}" : 'SignalBricks Telemetry: re-registering, local endpoint changed')
     try {
         registerWithPlatform()
     } catch (Exception e) {
         // Only the class name: the request body carries the access token.
         log.warn "SignalBricks Telemetry: re-registration failed (${e.class.simpleName})"
     }
+    return 0L
 }
 
 // Schedules dailyCheckIn at this hub's time of day, picked at random once and
@@ -1455,13 +1490,13 @@ String checkInTime() {
     return String.format('%02d:%02d', t.intdiv(3600), (t.intdiv(60)) % 60)
 }
 
-// Scheduled daily: re-registers if the version changed since the last
-// registration (same guards and backoff as after an event), and sends the
+// Scheduled daily: re-registers if the version or local endpoint changed since
+// the last registration (same guards and backoff as after an event), and sends the
 // daily hub report (#692) whether or not anything changed.
 void dailyCheckIn() {
     logDebug 'daily check-in'
     migrateSettings(true)
-    reregisterIfVersionChanged()
+    reregisterIfVersionChanged(true)
     ensureAppInfoSubscription()
     sendHubReport('daily')
 }
@@ -1477,6 +1512,8 @@ void dailyCheckIn() {
 void subscribeToAppInfo() {
     try {
         subscribe(location, APP_INFO_EVENT, 'appInfoHandler')
+        // A restart may bring a new IP address (#91)
+        subscribe(location, 'systemStart', 'systemStartHandler')
         state.appInfoSubscribed = APP_VERSION
     } catch (Exception e) {
         log.warn "SignalBricks Telemetry: subscribing to app announcements failed (${e.class.simpleName})"
@@ -1497,6 +1534,33 @@ void ensureAppInfoSubscription() {
         return
     }
     subscribeToAppInfo()
+}
+
+// Two minutes, so the hub's network is up before reading its address.
+// Several restarts in a row collapse into one check.
+void systemStartHandler(evt) {
+    state.remove('localCheckRetries')
+    runIn(120, 'localEndpointCheck', [overwrite: true])
+}
+
+// No address yet after a restart while one is registered: the hub may still be
+// starting, so try again later rather than clear it on the platform. After the
+// retries, the daily check-in takes over.
+void localEndpointCheck() {
+    if (!localEndpointBase() && state.registeredLocalEndpoint) {
+        int n = (state.localCheckRetries ?: 0) as int
+        if (n < LOCAL_CHECK_RETRIES) {
+            state.localCheckRetries = n + 1
+            runIn(LOCAL_CHECK_RETRY_SECONDS, 'localEndpointCheck', [overwrite: true])
+        } else {
+            state.remove('localCheckRetries')
+        }
+        return
+    }
+    state.remove('localCheckRetries')
+    long wait = reregisterIfVersionChanged(true)
+    // Held back by the re-register backoff: check again when it ends
+    if (wait > 0) runIn(Math.max((long) (wait / 1000) + 1, 5L), 'localEndpointCheck', [overwrite: true])
 }
 
 void appInfoHandler(evt) {
@@ -1840,6 +1904,7 @@ void registerCallback(resp, Map data) {
         state.lockMgmtReconnectRequired = true
         state.remove('lockMgmtRegisterError')
         state.registeredVersion = APP_VERSION
+        state.registeredLocalEndpoint = data?.local
         return
     }
     if (failed) {
@@ -1854,6 +1919,9 @@ void registerCallback(resp, Map data) {
     state.remove('lockMgmtRegisterError')
     state.remove('lockMgmtReconnectRequired')
     state.registeredVersion = APP_VERSION
+    state.registeredLocalEndpoint = data?.local
+    // Whether SignalBricks kept the local endpoint; null from older platforms
+    state.lockMgmtLocalEndpoint = reply.local_endpoint instanceof Boolean ? reply.local_endpoint : null
     state.lockMgmtRegistered = data?.enabled == true
     state.lockMgmtRegisteredAt = new Date().format('yyyy-MM-dd HH:mm')
     log.info "SignalBricks Telemetry: registered ${appNameAndVersion()} with SignalBricks (${data?.enabled ? 'on' : 'off'})"

@@ -20,6 +20,7 @@ Highlights by version:
 - **1.9.1** device control reports the hub's temperature scale and each thermostat's supported modes, and reads current device state.
 - **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well, and the daily hub report includes SignalBricks Integration's previous code name prefix.
 - **1.9.3** the daily hub report says which locks are managed and which hold door codes, so SignalBricks counts keypad locks correctly.
+- **1.9.4** registration includes the hub's local address, so SignalBricks can reach the hub without Hubitat cloud where your setup allows it.
 
 ## Requirements
 
@@ -71,7 +72,7 @@ Use Hubitat Package Manager (HPM) to keep the app up to date. Set this up once o
 
 **You don't need to open the app and click Done after an update.** The app notices the new version and re-registers with SignalBricks by itself. Open the app and click **Done** only when a release adds a new setting or permission you want to use (the release notes say so).
 
-**Daily check-in.** Once a day, at a random time per hub outside 2–4am, the app re-registers if it was updated and sends the [daily hub report](#daily-hub-report). The app page shows the time under **Status**.
+**Daily check-in.** Once a day, at a random time per hub outside 2–4am, the app re-registers if it was updated (or its local address changed) and sends the [daily hub report](#daily-hub-report). The app page shows the time under **Status**.
 
 ### Beta channel
 
@@ -156,6 +157,8 @@ Under **Devices**, pick each device once: **Locks**, sensors, and the devices Si
 - **Control the devices above**
 
 Turning a feature on takes effect when you click **Done**: the app replaces its access token and registers it first. Turning one off takes effect at once, even before **Done**. The features are independent: lock and device control don't need door code management. After a Reconnect, lock and device control need a **Done** again.
+
+The registration also includes the app's local address on your network (`http://<hub IP>/apps/api/<app id>`). SignalBricks uses it only through a site connection your organization set up, and otherwise calls the hub through Hubitat cloud as before. The app re-registers when the address changes: at the daily check-in, and a couple of minutes after the hub restarts. The **Registration** line says whether SignalBricks accepted it.
 
 ### Manage door codes
 
