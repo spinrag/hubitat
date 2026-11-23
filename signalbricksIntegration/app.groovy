@@ -1126,19 +1126,18 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
             currentLockBookings.each { bookingId, booking ->
                 String codeName = helperGetCodeName(booking)
 
-                // Covered by the slot of another booking with the same code (#95): no write. A
-                // write of its own the lock hasn't confirmed (the lock refuses a code it already
-                // holds) is dropped, so it isn't re-sent
+                // Covered by the slot of another booking with the same code (#95): no write. A write
+                // of its own the lock hasn't confirmed (it may refuse a code it already holds) gets a
+                // delete, so the code never stays behind untracked if that write lands after all;
+                // not while writes are held back (the lock's code list may be partial)
                 String sharedWith = shared["${bookingId}".toString()]
                 if (!sbCodes[bookingId] && sharedWith) {
-                    Map all = atomicState.codeAssignments ?: [:]
-                    Map mine = all[lockKey] ?: [:]
-                    List refused = mine.findAll { pos, a -> a instanceof Map && helperPendingSet(a) && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && !lockCodes[pos] && !lockCodes["${pos}"] }.collect { it.key }
-                    if (refused) {
-                        refused.each { mine.remove(it) }
-                        all[lockKey] = mine
-                        atomicState.codeAssignments = all
-                        log.info "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares ORB${sharedWith}'s slot; its own unconfirmed write is no longer sent"
+                    if (!holdWrites) {
+                        lockAssignments.each { pos, a ->
+                            if (!(a instanceof Map) || !helperPendingSet(a) || "${a.bookingId ?: ''}".find(/\d+/) != "${bookingId}".toString() || lockCodes[pos] || lockCodes["${pos}"] || !"${pos}".isInteger()) return
+                            log.info "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares ORB${sharedWith}'s slot; its own unconfirmed write at pos ${pos} is deleted"
+                            runIn(++i * 60, 'tryDeleteCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: "${pos}".toInteger() ]])
+                        }
                     }
                     log.debug "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares the slot of ORB${sharedWith} (same code)"
                     return
@@ -2028,7 +2027,9 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
             Date otherOut = helperToDate(other?.checkOut)
             Date checkIn = helperToDate(booking.checkIn)
             Date checkOut = helperToDate(booking.checkOut)
-            boolean otherCurrent = otherIn && otherOut && !otherIn.after(now) && !otherOut.before(now)
+            // Current on this lock, as reconcile counts it
+            boolean otherCurrent = otherIn && otherOut && !otherIn.after(now) && !otherOut.before(now) &&
+                (other.lockId instanceof List ? other.lockId : [other.lockId]).any { "${it}" == "${lockId}" }
             if (other && helperSameBookingCode(other.code, pin) && otherIn && otherOut && checkIn && checkOut && !otherOut.before(checkIn) && !otherIn.after(checkOut)) return false
             if (!otherCurrent && checkIn && checkOut && !checkIn.after(now) && !checkOut.before(now)) return false
         }
@@ -2092,12 +2093,13 @@ Map helperFindCurrentBookings(Map bookings) {
     }
 }
 
-// Two codes that are the same, compared as text: digits only, and a dropped leading zero
-// counts either way round (#95). Never log them
-boolean helperSameBookingCode(def a, def b) {
+// Two codes that are the same (#95), digits only. Two booking codes compare as exact text: 123
+// and 0123 are different codes. reported: a is what a lock reports, which may have dropped
+// the leading zeros of b (helperSameCode). Never log them
+boolean helperSameBookingCode(def a, def b, boolean reported = false) {
     String x = helperCodeText(a)
     String y = helperCodeText(b)
-    return helperCodeKnown(x) && helperCodeKnown(y) && (helperSameCode(x, y) || helperSameCode(y, x))
+    return helperCodeKnown(x) && helperCodeKnown(y) && (reported ? helperSameCode(x, y) : x == y)
 }
 
 // Bookings with the same code share one slot on a lock (#95). For each current booking on the
@@ -2105,39 +2107,45 @@ boolean helperSameBookingCode(def a, def b) {
 // Current bookings all overlap now, so a slot of this app that holds the code covers a current
 // booking with that code, also when the slot's booking checked out, was cancelled or moved:
 // the slot stays until the last of them checks out, and is never deleted and written again.
-// A current booking's slot holds its booking's code; another slot the code helperOnlySbCodes
-// gives it (tracked, or reported), else the code tracked there. A slot being deleted never
-// covers, nor one whose code is hidden and untracked. No slot holds the code yet: one write,
-// for the booking with a write pending, else the earliest check-in, then the lowest id.
-// Recomputed from the current bookings on every run; nothing is stored.
+// What a slot holds: for a current booking on this lock, its booking's code (reconcile keeps it
+// so), also in a tracked slot the lock confirmed that a partial lockCodes report leaves out;
+// for any other booking, what the lock reports, else a code the lock confirmed there. A slot
+// being deleted never covers, nor one whose code is hidden and unconfirmed. No slot holds the
+// code yet: one write, for the booking with a write pending, else the earliest check-in, then
+// the lowest id. Recomputed from the current bookings on every run; nothing is stored.
 Map helperSharedSlots(def lockId, Map sbCodes, Map currentLockBookings, Map lockCodes) {
     Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
     Map current = currentLockBookings.collectEntries { k, b -> [("${b.id ?: k}".toString()): b] }
     Closure bid = { a -> "${a?.bookingId ?: ''}".find(/\d+/) }
+    Closure slotNumber = { pos -> "${pos}".isInteger() ? "${pos}".toInteger() : Integer.MAX_VALUE }
 
-    // The code each of this app's slots holds
-    Map slotCode = [:]
+    // Each slot that can cover: [code, reported (the code is what the lock reports), pos, current]
+    Map holders = [:]
     sbCodes.each { id, c ->
         String sid = "${id}".toString()
         Map a = lockAssignments["${c.key}"]
         if (a?.deleting) return
         if (current[sid]) {
-            slotCode[sid] = current[sid].code
+            holders[sid] = [code: current[sid].code, reported: false, pos: c.key, current: true]
             return
         }
-        slotCode[sid] = helperCodeKnown(c.code) ? c.code : (a && bid(a) == sid ? a.code : null)
+        def lockCode = c.containsKey('lockReported') ? c.lockReported : c.code
+        if (helperCodeKnown(lockCode)) holders[sid] = [code: lockCode, reported: true, pos: c.key, current: false]
+        else if (a && a.confirmed == true && bid(a) == sid) holders[sid] = [code: a.code, reported: false, pos: c.key, current: false]
     }
-    Closure slotNumber = { s -> "${sbCodes[s].key}".isInteger() ? "${sbCodes[s].key}".toInteger() : Integer.MAX_VALUE }
-    List slots = slotCode.keySet().toList().sort { x, y -> ((current[x] ? 0 : 1) <=> (current[y] ? 0 : 1)) ?: (slotNumber(x) <=> slotNumber(y)) }
+    // A current booking's tracked slot the lock confirmed but leaves out of a partial report
+    current.each { id, b ->
+        if (sbCodes[id]) return
+        def hit = lockAssignments.find { pos, a -> a instanceof Map && !a.deleting && a.confirmed != false && bid(a) == id && !lockCodes[pos] && !lockCodes["${pos}"] }
+        if (hit) holders[id] = [code: b.code, reported: false, pos: hit.key, current: true]
+    }
+    List slots = holders.keySet().toList().sort { x, y -> ((holders[x].current ? 0 : 1) <=> (holders[y].current ? 0 : 1)) ?: (slotNumber(holders[x].pos) <=> slotNumber(holders[y].pos)) }
 
-    // Without a slot: no code of this app on the lock, and no tracked slot the lock confirmed
-    // (a partial lockCodes report hides it)
-    List open = current.keySet().toList().findAll { id ->
-        !sbCodes[id] && !lockAssignments.any { pos, a -> a instanceof Map && !a.deleting && a.confirmed != false && bid(a) == id && !lockCodes[pos] && !lockCodes["${pos}"] }
-    }
+    // Without a slot: neither a code of this app on the lock nor such a tracked slot
+    List open = current.keySet().toList().findAll { id -> !sbCodes[id] && !holders[id] }
     Map shared = [:]
     open.each { id ->
-        String holder = slots.find { helperSameBookingCode(slotCode[it], current[id].code) }
+        String holder = slots.find { helperSameBookingCode(holders[it].code, current[id].code, holders[it].reported) }
         if (holder) shared[id] = holder
     }
 
@@ -2210,6 +2218,7 @@ Map helperOnlySbCodes(Map codes, def lockId = null, boolean quiet = false) {
         if (helperTrackedVerdict(assignment, lockCode, pos) == 'claim') {
             lockCode.key = pos
             lockCode.bookingId = bId
+            lockCode.lockReported = lockCode.code // What the lock reports, for #95's shared slots
             lockCode.code = assignment.code // Use our tracked code, not the lock's (may be redacted)
             result[bId] = lockCode
             if (!quiet) log.debug("helperOnlySbCodes: found by tracking: ${bId} at pos ${pos}")

@@ -1467,22 +1467,63 @@ check('#95 duplicate check: an outside code with the same PIN is still a duplica
 lock.attrs.lockCodes = JsonOutput.toJson(desk + ['30': [name: 'GO:ORB77-Cy', code: '20000077']])
 check('#95 duplicate check: another app\'s ORB code with the same PIN is still a duplicate', app.helperHasDuplicateCode('7', both['78'], both))
 
-// Leading zero: the same code
+// Leading zero: two booking codes compare as exact text; a lock reporting a code without its zero matches
 Map zero = stay('77', 'Cy', '01234567', -2, 1) + stay('78', 'Di', 1234567, -1, 3)
 r = prefixRun(desk, [:], zero)
-check('#95 leading zero dropped on one booking: the same code, one write', r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB77-Cy')
+check('#95 booking codes 01234567 and 1234567 are different codes: one write each', r.sets.collect { it.codeName } == ['G:ORB77-Cy', 'G:ORB78-Di'])
+Map zero3 = stay('77', 'Cy', '123', -2, 1) + stay('78', 'Di', '0123', -1, 3)
+r = prefixRun(desk, [:], zero3)
+check('#95 booking codes 123 and 0123 are different codes: one write each', r.sets.size() == 2)
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['50': [name: 'G:ORB77-Cy', code: '123']])
+check('#95 duplicate check: 0123 beside booking 77\'s 123 is still a duplicate warning', app.helperHasDuplicateCode('7', zero3['78'], zero3))
 r = prefixRun(desk + ['50': [name: 'G:ORB77-Cy', code: 1234567]], [:], stay('78', 'Di', '01234567', -1, 3))
-check('#95 leading zero: an owner slot reported without its zero covers the other booking', r.sets.isEmpty() && r.deletes.isEmpty())
+check('#95 leading zero: an owner slot the lock reports without its zero covers the other booking', r.sets.isEmpty() && r.deletes.isEmpty())
+Map zeroLock = stay('77', 'Cy', '01234567', -2, 1) + stay('78', 'Di', '01234567', -1, 3)
 lock.attrs.lockCodes = JsonOutput.toJson(desk + ['50': [name: 'G:ORB77-Cy', code: 1234567]])
-check('#95 duplicate check: leading zero, shared not a duplicate', !app.helperHasDuplicateCode('7', zero['78'], zero))
+check('#95 duplicate check: the slot reported without its zero, same booking codes: shared, not a duplicate', !app.helperHasDuplicateCode('7', zeroLock['78'], zeroLock))
 
-// A write of the covered booking the lock refused (before 1.4.20) is dropped, not re-sent
+// A no-longer-current booking's slot counts by what the lock reports, not an unconfirmed tracked code
+Map unconfirmed77 = ['7': ['50': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 3, confirmed: false]]]
+r = prefixRun(desk + ['50': [code: '20000066']], unconfirmed77, past77 + only78)
+check('#95 nameless driver: the old slot reports another code than tracked: not shared, removed, the other booking written', r.deletes == [50] && r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB78-Di')
+r = prefixRun(desk + ['50': [code: '********']], unconfirmed77, past77 + only78)
+check('#95 nameless driver: hidden code, tracked write unconfirmed: not shared', r.deletes == [50] && r.sets.size() == 1)
+r = prefixRun(desk + ['50': [code: '********']], track77, past77 + only78)
+check('#95 nameless driver: hidden code, tracked write confirmed: shared', r.deletes.isEmpty() && r.sets.isEmpty())
+
+// A current booking's confirmed slot that a partial report leaves out still holds the code
+r = prefixRun(desk, track77, both)
+check('#95 the owner\'s confirmed slot missing from the report: rewritten there, no write for the other booking', r.sets.size() == 1 && r.sets[0].codePosition == 50 && r.sets[0].codeName == 'G:ORB77-Cy')
+
+// The other booking still current but moved to another lock: the 409 check agrees with reconcile
+Map moved = stay('77', 'Cy', '20000077', -2, 1) + only78
+moved['77'].lockId = ['8']
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+check('#95 duplicate check: slot of a booking now current on another lock covers this one, not a duplicate', !app.helperHasDuplicateCode('7', moved['78'], moved))
+r = prefixRun(desk + slot77, track77, moved)
+check('#95 reconcile: that slot is kept for the booking on this lock', r.sets.isEmpty() && r.deletes.isEmpty())
+
+// A covered booking's own unconfirmed write (the lock may have refused it): deleted, never forgotten
+app.atomicState.bookings = both
 Map refused = ['7': track77['7'] + ['51': [bookingId: 'ORB78', code: '20000077', codeName: 'G:ORB78-Di', attempt: 9, confirmed: false]]]
 r = prefixRun(desk + slot77, refused, both)
-check('#95 the covered booking\'s refused write: no new write, its tracking dropped', r.sets.isEmpty() && r.deletes.isEmpty() && assigned('51') == null && assigned('50') != null)
+check('#95 the covered booking\'s unconfirmed write: no new write, a delete of its slot, tracking kept', r.sets.isEmpty() && r.deletes == [51] && assigned('51') != null && assigned('50') != null)
+def refusedDelete = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.deleted.clear()
+if (refusedDelete) app.tryDeleteCode(refusedDelete.data)
+check('#95 the delete runs and marks the slot deleting', lock.deleted == [51] && assigned('51')?.deleting == true)
 lock.setCalls.clear()
 app.verifySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', attempt: 9])
-check('#95 the dropped write\'s verify stops', lock.setCalls.isEmpty())
+check('#95 that write is no longer re-sent (the booking is still current)', lock.setCalls.isEmpty())
+Map afterDelete = new JsonSlurper().parseText(JsonOutput.toJson(app.atomicState.codeAssignments))
+r = prefixRun(desk + ['50': [code: '20000077'], '51': [code: '20000077']], afterDelete, [:])
+check('#95 if that write landed anyway (nameless driver), its slot is still removed after checkout', r.deletes.sort() == [50, 51])
+// Never while the lock is being read (partial list)
+app.atomicState.codeRefresh = [index: 0, lockIds: ['7'], stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0, runId: 1]
+r = prefixRun(desk + slot77, refused, both)
+check('#95 during a door code refresh read: no delete, no write, tracking untouched', r.sets.isEmpty() && r.deletes.isEmpty() && assigned('51')?.confirmed == false && !assigned('51')?.deleting)
+app.atomicState.codeRefresh = null
+app.atomicState.bookings = [:]
 // No slot on the lock yet but a write pending for the later booking: that write is the one
 Map pending78 = ['7': ['51': [bookingId: 'ORB78', code: '20000077', codeName: 'G:ORB78-Di', attempt: 1, confirmed: false]]]
 r = prefixRun(desk, pending78, both)
@@ -1503,7 +1544,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567', '20000080'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567', '20000080', '20000066', '0123'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)
