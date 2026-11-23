@@ -1364,11 +1364,252 @@ check('duplicate check: own code with an old guest name is not a duplicate', !ap
 lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'G:ORB88-Di', code: '20000077']])
 check('duplicate check: the same PIN on another current booking still is', app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88))
 
+// --- #95: bookings on one lock with the same code share one slot ---
+// In a closure: the script's run() would otherwise exceed the JVM's method size limit
+({ ->
+// 77 checks in first; 78 is the same guest in the other unit sharing the lock, with the same code
+app.locks = [lock]
+app.minCodePosition = 50
+app.codeNamePrefix = 'G:'
+app.settings = [:]
+app.atomicState.codeRefresh = null
+app.atomicState.codeDisplaced = [:]
+app.atomicState.lockCodesReadEmpty = []
+long hr = 3600_000L
+def stay = { String id, String guest, def code, long inH, long outH -> [(id): [id: id, guest: guest, code: code, lockId: ['7'], checkIn: new Date(now.time + inH * hr), checkOut: new Date(now.time + outH * hr)]] }
+Map desk = ['10': [name: 'Front desk', code: '10000040']]
+Map slot77 = ['50': [name: 'G:ORB77-Cy', code: '20000077']]
+Map track77 = ['7': ['50': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true]]]
+Map both = stay('77', 'Cy', '20000077', -2, 1) + stay('78', 'Di', '20000077', -1, 3)
+Map only78 = stay('78', 'Di', '20000077', -1, 3)
+Map past77 = stay('77', 'Cy', '20000077', -5, -1)
+
+r = prefixRun(desk, [:], both)
+check('#95 two same-code current bookings: one write, for the earliest check-in', r.sets.size() == 1 && r.sets[0].codePosition == 50 && r.sets[0].codeName == 'G:ORB77-Cy' && r.deletes.isEmpty())
+r = prefixRun(desk + slot77, track77, both)
+check('#95 the slot on the lock covers the other booking: no second write, no delete', r.sets.isEmpty() && r.deletes.isEmpty())
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+check('#95 duplicate check: the same code on an overlapping booking\'s slot is shared, not a duplicate', !app.helperHasDuplicateCode('7', both['78'], both))
+check('#95 duplicate check: the same for the slot\'s own booking', !app.helperHasDuplicateCode('7', both['77'], both))
+
+// The owner checks out while the other is still current: the slot stays as it is
+r = prefixRun(desk + slot77, track77, past77 + only78)
+check('#95 owner checks out, other current: slot kept, no delete, no new write', r.sets.isEmpty() && r.deletes.isEmpty())
+check('#95 owner checks out: the slot is still tracked for the owner (not renamed)', assigned('50')?.bookingId == 'ORB77' && assigned('50')?.codeName == 'G:ORB77-Cy')
+r = prefixRun(desk + slot77, track77, only78)
+check('#95 owner removed from the bookings (cancelled): the slot follows the remaining booking', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(desk + slot77, track77, stay('77', 'Cy', '20000077', 48, 72) + only78)
+check('#95 owner moved to later dates: the slot stays for the current booking', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(desk + slot77, track77, stay('77', 'Cy', '20000077', -2, 1))
+check('#95 the other booking removed: the owner keeps its slot as before', r.sets.isEmpty() && r.deletes.isEmpty())
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+check('#95 duplicate check: the remaining booking re-synced after the owner checked out is not a duplicate', !app.helperHasDuplicateCode('7', only78['78'], only78))
+// Untracked slot (state reset): the name and the code the lock reports still decide
+r = prefixRun(desk + slot77, [:], only78)
+check('#95 untracked owner slot with the code reported: kept for the other booking', r.sets.isEmpty() && r.deletes.isEmpty())
+r = prefixRun(desk + ['50': [name: 'G:ORB77-Cy', code: '********']], [:], only78)
+check('#95 untracked owner slot with the code hidden: can\'t tell, removed and written as before', r.deletes == [50] && r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB78-Di')
+// A slot being deleted never covers
+Map deleting77 = ['7': ['50': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 1, confirmed: true, deleting: true]]]
+r = prefixRun(desk + slot77, deleting77, only78)
+check('#95 the owner slot already being deleted: not shared, the other booking gets its own write', r.deletes == [50] && r.sets.size() == 1 && r.sets[0].codePosition == 51)
+
+// Bookings page: the covered booking shows the shared slot, the kept slot is no orphan
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+app.atomicState.codeAssignments = new JsonSlurper().parseText(JsonOutput.toJson(track77))
+app.atomicState.bookings = both
+def view = app.bookingsView()
+check('#95 Bookings page: the other booking is covered by the shared slot, not missing',
+    view.bookings.any { it.contains('ORB78') && it.contains('slot 50 (shared with ORB77: same code)') } && view.summary.contains('0 current not on lock') &&
+    view.bookings.any { it.contains('ORB77') && it.contains('slot 50 (shared with ORB78: same code)') } && view.orphans.isEmpty())
+app.atomicState.bookings = past77 + only78
+view = app.bookingsView()
+check('#95 Bookings page: after the owner checks out its slot shows as kept for the other booking, no orphan',
+    view.bookings.any { it.contains('ORB77') && it.contains('kept: shared with ORB78, same code') } && view.bookings.any { it.contains('ORB78') && it.contains('slot 50 (shared with ORB77') } && view.orphans.isEmpty())
+app.atomicState.bookings = only78
+view = app.bookingsView()
+check('#95 Bookings page: owner gone from the bookings, its slot still no orphan', view.orphans.isEmpty() && view.summary.contains('0 current not on lock'))
+app.atomicState.bookings = [:]
+
+// The other later checks out too: the slot goes
+r = prefixRun(desk + slot77, track77, past77 + stay('78', 'Di', '20000077', -4, -1))
+check('#95 the last booking checks out: the slot is deleted', r.deletes == [50] && r.sets.isEmpty())
+r = prefixRun(desk + slot77, track77, [:])
+check('#95 no bookings left: the slot is deleted', r.deletes == [50])
+
+// Touching stays (checkout == check-in) share
+Map touch = stay('77', 'Cy', '20000077', -5, 0) + stay('78', 'Di', '20000077', 0, 4)
+touch['77'].checkOut = new Date(now.time - 60_000); touch['78'].checkIn = touch['77'].checkOut
+r = prefixRun(desk + slot77, track77, touch)
+check('#95 touching stays: the slot carries over at the changeover, no delete, no write', r.sets.isEmpty() && r.deletes.isEmpty())
+Map touchAhead = stay('77', 'Cy', '20000077', -2, 2) + stay('78', 'Di', '20000077', 2, 6)
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+check('#95 duplicate check: an upcoming booking touching the owner\'s stay is not a duplicate', !app.helperHasDuplicateCode('7', touchAhead['78'], touchAhead))
+
+// Same code, stays apart: as before (the slot goes at checkout, the next booking is written at check-in)
+r = prefixRun(desk + slot77, track77, past77 + stay('78', 'Di', '20000077', 2, 6))
+check('#95 same code, stays apart: the slot is deleted at checkout, nothing written early', r.deletes == [50] && r.sets.isEmpty())
+r = prefixRun(desk, [:], stay('78', 'Di', '20000077', -1, 3))
+check('#95 same code, stays apart: the later booking gets its own write at check-in', r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB78-Di')
+
+// Different codes: unchanged
+Map diff = stay('77', 'Cy', '20000077', -2, 1) + stay('78', 'Di', '20000078', -1, 3)
+r = prefixRun(desk, [:], diff)
+check('#95 different codes: one slot each', r.sets.collect { it.codePosition } == [50, 51] && r.sets.collect { it.codeName } == ['G:ORB77-Cy', 'G:ORB78-Di'])
+r = prefixRun(desk + slot77 + ['51': [name: 'G:ORB78-Di', code: '20000078']], track77, stay('77', 'Cy', '20000077', -5, -1) + stay('78', 'Di', '20000078', -1, 3))
+check('#95 different codes: the first checks out, its slot is deleted as before', r.deletes == [50] && r.sets.isEmpty())
+r = prefixRun(desk + slot77, track77, stay('77', 'Cy', '20000077', -5, -1) + stay('78', 'Di', '20000078', -1, 3))
+check('#95 different codes: no sharing, the other booking gets its own slot', r.deletes == [50] && r.sets.size() == 1 && r.sets[0].codePosition == 51)
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['50': [name: 'G:ORB77-Cy', code: '20000078']])
+check('#95 duplicate check: a booking\'s slot holding the PIN while that booking\'s code differs is still a duplicate', app.helperHasDuplicateCode('7', diff['78'], diff))
+
+// Codes from outside this app with the same PIN: still duplicates
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['20': [name: 'Front desk 2', code: '20000077']])
+check('#95 duplicate check: an outside code with the same PIN is still a duplicate', app.helperHasDuplicateCode('7', both['78'], both))
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['30': [name: 'GO:ORB77-Cy', code: '20000077']])
+check('#95 duplicate check: another app\'s ORB code with the same PIN is still a duplicate', app.helperHasDuplicateCode('7', both['78'], both))
+
+// Leading zero: two booking codes compare as exact text; a lock reporting a code without its zero matches
+Map zero = stay('77', 'Cy', '01234567', -2, 1) + stay('78', 'Di', 1234567, -1, 3)
+r = prefixRun(desk, [:], zero)
+check('#95 booking codes 01234567 and 1234567 are different codes: one write each', r.sets.collect { it.codeName } == ['G:ORB77-Cy', 'G:ORB78-Di'])
+Map zero3 = stay('77', 'Cy', '123', -2, 1) + stay('78', 'Di', '0123', -1, 3)
+r = prefixRun(desk, [:], zero3)
+check('#95 booking codes 123 and 0123 are different codes: one write each', r.sets.size() == 2)
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['50': [name: 'G:ORB77-Cy', code: '123']])
+check('#95 duplicate check: 0123 beside booking 77\'s 123 is still a duplicate warning', app.helperHasDuplicateCode('7', zero3['78'], zero3))
+r = prefixRun(desk + ['50': [name: 'G:ORB77-Cy', code: 1234567]], [:], stay('78', 'Di', '01234567', -1, 3))
+check('#95 leading zero: an owner slot the lock reports without its zero covers the other booking', r.sets.isEmpty() && r.deletes.isEmpty())
+Map zeroLock = stay('77', 'Cy', '01234567', -2, 1) + stay('78', 'Di', '01234567', -1, 3)
+lock.attrs.lockCodes = JsonOutput.toJson(desk + ['50': [name: 'G:ORB77-Cy', code: 1234567]])
+check('#95 duplicate check: the slot reported without its zero, same booking codes: shared, not a duplicate', !app.helperHasDuplicateCode('7', zeroLock['78'], zeroLock))
+
+// A no-longer-current booking's slot counts by what the lock reports, not an unconfirmed tracked code
+Map unconfirmed77 = ['7': ['50': [bookingId: 'ORB77', code: '20000077', codeName: 'G:ORB77-Cy', attempt: 3, confirmed: false]]]
+r = prefixRun(desk + ['50': [code: '20000066']], unconfirmed77, past77 + only78)
+check('#95 nameless driver: the old slot reports another code than tracked: not shared, removed, the other booking written', r.deletes == [50] && r.sets.size() == 1 && r.sets[0].codeName == 'G:ORB78-Di')
+r = prefixRun(desk + ['50': [code: '********']], unconfirmed77, past77 + only78)
+check('#95 nameless driver: hidden code, tracked write unconfirmed: not shared', r.deletes == [50] && r.sets.size() == 1)
+r = prefixRun(desk + ['50': [code: '********']], track77, past77 + only78)
+check('#95 nameless driver: hidden code, tracked write confirmed: shared', r.deletes.isEmpty() && r.sets.isEmpty())
+
+// A current booking's confirmed slot that a partial report leaves out still holds the code
+r = prefixRun(desk, track77, both)
+check('#95 the owner\'s confirmed slot missing from the report: rewritten there, no write for the other booking', r.sets.size() == 1 && r.sets[0].codePosition == 50 && r.sets[0].codeName == 'G:ORB77-Cy')
+
+// The other booking still current but moved to another lock: the 409 check agrees with reconcile
+Map moved = stay('77', 'Cy', '20000099', -2, 1) + only78
+moved['77'].lockId = ['8']
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+check('#95 duplicate check: slot of a booking now current on another lock (its code since changed) covers this one, not a duplicate', !app.helperHasDuplicateCode('7', moved['78'], moved))
+r = prefixRun(desk + slot77, track77, moved)
+check('#95 reconcile: that slot is kept for the booking on this lock', r.sets.isEmpty() && r.deletes.isEmpty())
+
+// A covered booking's own unconfirmed write (the lock may have refused it): deleted, never forgotten
+app.atomicState.bookings = both
+Map refused = ['7': track77['7'] + ['51': [bookingId: 'ORB78', code: '20000077', codeName: 'G:ORB78-Di', attempt: 9, confirmed: false]]]
+r = prefixRun(desk + slot77, refused, both)
+check('#95 the covered booking\'s unconfirmed write: no new write, a delete of its slot, tracking kept', r.sets.isEmpty() && r.deletes == [51] && assigned('51') != null && assigned('50') != null)
+def refusedDelete = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.deleted.clear()
+if (refusedDelete) app.tryDeleteCode(refusedDelete.data)
+check('#95 the delete runs and marks the slot deleting', lock.deleted == [51] && assigned('51')?.deleting == true)
+lock.setCalls.clear()
+app.verifySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', attempt: 9])
+check('#95 that write is no longer re-sent (the booking is still current)', lock.setCalls.isEmpty())
+Map afterDelete = new JsonSlurper().parseText(JsonOutput.toJson(app.atomicState.codeAssignments))
+r = prefixRun(desk + ['50': [code: '20000077'], '51': [code: '20000077']], afterDelete, [:])
+check('#95 if that write landed anyway (nameless driver), its slot is still removed after checkout', r.deletes.sort() == [50, 51])
+// The delete never removes a code written to that slot since it was queued
+r = prefixRun(desk + slot77, refused, both)
+def guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'Cleaner', code: '30000051']])
+app.codeChangedHandler([device: [id: '7'], value: 'added', data: JsonOutput.toJson(['51': [name: 'Cleaner', code: '30000051']])])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 a foreign code written to that slot before the delete runs is not deleted', assigned('51') == null && lock.deleted.isEmpty())
+r = prefixRun(desk + slot77, refused, both)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', free: true])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 a fresh write of the booking into that slot before the delete runs is not deleted', lock.deleted.isEmpty() && assigned('51')?.attempt == 1 && !assigned('51')?.deleting)
+r = prefixRun(desk + slot77 + ['51': [name: 'Plumber', code: '30000051']], refused, both)
+check('#95 no delete queued while the lock shows another code there', r.deletes.isEmpty())
+r = prefixRun(desk + slot77, refused, both)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB12-Zed', code: '30000051']])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 the delete is skipped when the lock shows another booking in that slot', lock.deleted.isEmpty())
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+lock.deleted.clear()
+app.tryDeleteCode([lockId: '7', codePosition: 50])
+check('#95 checkout deletes are unguarded as before', lock.deleted == [50])
+
+// The write lands and the lock confirms it before the delete runs: it is the booking's slot now, never deleted
+Map pastBoth = past77 + only78
+app.atomicState.bookings = pastBoth
+r = prefixRun(desk + slot77, refused, pastBoth)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB78-Di', code: '20000077']])
+app.codeChangedHandler([device: [id: '7'], value: 'added', data: JsonOutput.toJson(['51': [name: 'G:ORB78-Di', code: '20000077']])])
+check('#95 a confirmed write is no longer marked as dropped', assigned('51')?.confirmed == true && !assigned('51')?.sharedDrop)
+app.scheduled.clear()
+app.reconcileDoorCodes(pastBoth)
+check('#95 the booking now has its own slot: the old covering slot goes', app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition } == [50])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 the queued delete of the confirmed write is skipped', lock.deleted.isEmpty())
+// Confirmed by a retry's read of the lock instead of an event
+r = prefixRun(desk + slot77, refused, pastBoth)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB78-Di', code: '20000077']])
+app.helperRetryWanted([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', attempt: 9], app.atomicState.codeAssignments['7']['51'])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 confirmed from the lock\'s codes: not marked dropped, the delete is skipped', assigned('51')?.confirmed == true && !assigned('51')?.sharedDrop && lock.deleted.isEmpty())
+app.atomicState.bookings = both
+
+// The owner's code changes while it covers another booking: its rewrite goes first, whatever the order
+[both, only78 + stay('77', 'Cy', '20000077', -2, 1)].each { Map order ->
+    Map changed = order.collectEntries { k, b -> [k, k == '77' ? b + [code: '20000099'] : b] }
+    r = prefixRun(desk + slot77, track77, changed)
+    def ownerJob = r.jobs.find { it.handler == 'trySetCode' && it.data.codePosition == 50 }
+    def newJob = r.jobs.find { it.handler == 'trySetCode' && it.data.codeName == 'G:ORB78-Di' }
+    check("#95 owner code changes (${order.keySet().join(',')}): the owner's rewrite is queued before the other booking's write".toString(),
+        ownerJob && newJob && ownerJob.secs < newJob.secs && newJob.data.codePosition == 51)
+}
+
+// Never while the lock is being read (partial list)
+app.atomicState.codeRefresh = [index: 0, lockIds: ['7'], stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0, runId: 1]
+r = prefixRun(desk + slot77, refused, both)
+check('#95 during a door code refresh read: no delete, no write, tracking untouched', r.sets.isEmpty() && r.deletes.isEmpty() && assigned('51')?.confirmed == false && !assigned('51')?.deleting)
+app.atomicState.codeRefresh = null
+app.atomicState.bookings = [:]
+// No slot on the lock yet but a write pending for the later booking: that write is the one
+Map pending78 = ['7': ['51': [bookingId: 'ORB78', code: '20000077', codeName: 'G:ORB78-Di', attempt: 1, confirmed: false]]]
+r = prefixRun(desk, pending78, both)
+check('#95 no slot yet, a write pending for one booking: it is the one written, no second slot', r.sets.size() == 1 && r.sets[0].codePosition == 51 && r.sets[0].codeName == 'G:ORB78-Di')
+
+// Scheduling: every current booking's check-out and each lock's next check-in
+app.scheduleEvents(both + stay('79', 'Ed', '20000079', 5, 9) + stay('80', 'Fi', '20000080', 6, 9))
+List onceAt = app.scheduled.findAll { it.handler == 'reconcileDoorCodes' && it.at }.collect { it.at }
+check('#95 scheduling: reconcile at each current booking\'s check-out and the next check-in only',
+    onceAt as Set == [both['77'].checkOut, both['78'].checkOut, new Date(now.time + 5 * hr)] as Set && onceAt.size() == 3)
+app.scheduleEvents(stay('79', 'Ed', '20000079', 5, 9))
+onceAt = app.scheduled.findAll { it.handler == 'reconcileDoorCodes' && it.at }.collect { it.at }
+check('#95 scheduling: one upcoming booking, its check-in as before', onceAt == [new Date(now.time + 5 * hr)])
+lock.attrs.lockCodes = '{}'
+app.atomicState.codeAssignments = [:]
+})()
+
 app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567', '20000080', '20000066', '0123', '20000099', '30000051'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

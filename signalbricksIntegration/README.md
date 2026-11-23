@@ -10,6 +10,7 @@ Originally based on the [HubitatCommunity OwnerRez](https://github.com/HubitatCo
 
 - **Code names.** Each booking code is named with the app's code name prefix, the booking id and the guest name (or with the booking id at the end, with **Booking ID at End?** on).
 - **Timing.** A code is on the lock from before check-in to after checkout.
+- **Same code, one slot.** Since 1.4.20, bookings on one lock with the same code and overlapping or touching stays share one slot, named for the booking that got it first. It stays until the last of them checks out.
 - **Which codes it manages.** Only codes named with its own prefix (or its optional previous prefix, see [Changing the code name prefix](#changing-the-code-name-prefix)), and slots it assigned itself. It writes new codes only into empty slots from its **Minimum Code Position** up, and leaves every other code on the lock alone.
 - **Retries.** Each code write is re-sent until the lock confirms it, and a regular reconcile catches anything missed.
 - **Door code refresh.** Off by default. Reads the codes back from the locks one lock at a time, on a schedule you choose or from the app page (see [Door code refresh](#door-code-refresh)).
@@ -82,7 +83,7 @@ Since 1.4.6 the app announces its version and slot settings (minimum code positi
 Added in 1.3.7. Open the app and click **Bookings** under **Diagnostics**. It shows what the app knows and what is on the locks, from the hub's own state (reload the page to update it, or run a [door code refresh](#door-code-refresh) first if a lock's codes may be out of date):
 
 - **Summary:** the number of bookings known, codes on locks, current bookings not on a lock, and orphans, and when the last booking sync arrived.
-- **Known bookings:** each booking with its guest, dates and masked code, and for each lock the slot that holds its code or *not on lock*. A current booking that is not on a lock is shown in red: try **Debug** → **Reconcile Door Codes**.
+- **Known bookings:** each booking with its guest, dates and masked code, and for each lock the slot that holds its code (or the slot it *shares* with another booking with the same code) or *not on lock*. A current booking that is not on a lock is shown in red: try **Debug** → **Reconcile Door Codes**.
 - **Notes about other copies:** codes that look like a copy of a booking's code but that the app doesn't manage, and slots whose name *names two bookings*. The app leaves these alone: delete them by hand on the lock's device page if they aren't needed.
 - **Orphans:** codes with the app's prefix that match no known booking for that lock. The next reconcile removes them.
 
