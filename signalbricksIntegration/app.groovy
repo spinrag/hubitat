@@ -1,7 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbAppVersion() { '1.4.20' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.21' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -803,7 +803,7 @@ void codeRefreshOnLockCodes(e) {
 void codeRefreshSettled(Map data) {
     if (!codeRefreshIsCurrent(atomicState.codeRefresh, data, data?.index as int)) return
     log.info "Door code refresh: lock ${(data.index as int) + 1} read"
-    codeRefreshAdvance(data)
+    codeRefreshAdvance(data, true)
 }
 
 void codeRefreshTimeout(Map data) {
@@ -812,10 +812,10 @@ void codeRefreshTimeout(Map data) {
     codeRefreshAdvance(data)
 }
 
-void codeRefreshAdvance(Map data) {
+void codeRefreshAdvance(Map data, boolean settled = false) {
     Map r = atomicState.codeRefresh
     if (!codeRefreshIsCurrent(r, data, data?.index as int)) return
-    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true, r.stepAt as long)
+    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true, r.stepAt as long, settled)
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
 }
 
@@ -828,15 +828,16 @@ void codeRefreshAnswered() {
     atomicState.codeRefresh = r
 }
 
-// A read of this lock ended (settled or out of time). Remember whether it answered and
-// reported no codes: reconcile writes to a lock with an empty lockCodes only after such a
-// read (#55). A lock that never answered stays unmarked. Reconcile is run again for locks
-// whose writes it deferred.
-void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
+// A read of this lock ended (settled or out of time). Remember whether it settled with no
+// codes: reconcile writes to a lock with an empty lockCodes only after such a read (#55).
+// A read that ran out of time leaves the lock unmarked, even if it answered: the list may
+// not be complete. Reconcile is run again for locks whose writes it deferred.
+void codeRefreshLockDone(String lockId, boolean answered, long stepAt, boolean settled = false) {
     def lock = locks?.find { lock -> lock.id.toString() == lockId }
     if (!lock) return
     // An empty lock re-reporting {} sends no event (the value is unchanged), but the lock
-    // still talked to the hub during the step; an offline lock shows no such activity
+    // still talked to the hub during the step; an offline lock shows no such activity.
+    // Only a settled read marks the lock; this decides whether a timeout is logged.
     if (!answered) {
         try {
             def last = lock.getLastActivity()
@@ -850,7 +851,13 @@ void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
     List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
     // Unreadable lockCodes (null) is not empty: the lock stays unmarked (#57)
     Map lockCodes = helperParseLockCodes(raw)
-    if (answered && raw && lockCodes != null && lockCodes.isEmpty()) readEmpty << lockId
+    if (answered && raw && lockCodes != null && lockCodes.isEmpty()) {
+        if (settled) {
+            readEmpty << lockId
+        } else {
+            log.warn "Door code refresh: ${lock.label ?: lock.name} reports no codes but its read did not finish; its new codes stay on hold until a read finishes"
+        }
+    }
     atomicState.lockCodesReadEmpty = readEmpty
     // Readable again after reconcile skipped it: reconcile soon, not at the next sync (#57)
     List unreadable = atomicState.lockCodesUnreadable ?: []

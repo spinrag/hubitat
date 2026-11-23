@@ -70,7 +70,7 @@ The **Door code refresh** section of the app page has:
 
 Locks are always read one at a time; a refresh of many large locks can take a few hours. Booking syncs and reconciles carry on during a refresh.
 
-Since 1.4.10 the app waits until it has read a lock's codes before adding new codes to a lock that reports none (for example after a driver change or a re-pair). It reads such a lock itself; while it waits, the **Door code refresh** section shows *Waiting* for that lock. See [Troubleshooting](#troubleshooting) if it keeps waiting.
+Since 1.4.10 the app waits until it has read a lock's codes before adding new codes to a lock that reports none (for example after a driver change or a re-pair). It reads such a lock itself; while it waits, the **Door code refresh** section shows *Waiting* for that lock. Since 1.4.21 only a read that finishes counts: a lock whose read runs out of time keeps waiting until a later read finishes. See [Troubleshooting](#troubleshooting) if it keeps waiting.
 
 Since 1.4.11 the app also reads locks whose driver encrypts its code list. A lock whose codes can't be read at all is shown as *Waiting* with the reason, and the app neither adds nor removes codes on it until it can be read (see [Troubleshooting](#troubleshooting)).
 
