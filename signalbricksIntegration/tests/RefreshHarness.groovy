@@ -451,5 +451,56 @@ check('S5: the write is deferred and logged', app.atomicState.codeWritesDeferred
 List leakedS = app.logged.findAll { it.contains('11112222') || it.contains('20000077') }
 check('S5: no door code values logged', leakedS.isEmpty())
 
+// A: a read-empty mark is kept on a timeout only when the read started from a readable {}
+app.minCodePosition = 0
+['unreadable': 'not json', 'only this app\'s codes': JsonOutput.toJson(['50': [name: 'GT:ORB88-Ann', code: '24681357']])].each { label, start ->
+    e.attrs.lockCodes = start
+    app.atomicState.lockCodesReadEmpty = ['4']
+    app.atomicState.lockCodesReadIncomplete = []
+    runOne()
+    e.attrs.lockCodes = '{}' // the driver clears its list during the read, which never finishes
+    app.clock += 120_000
+    fire('codeRefreshTimeout')
+    check("A: read from ${label}, timed out with {}: mark dropped, held as unfinished", app.atomicState.lockCodesReadEmpty == [] && app.atomicState.lockCodesReadIncomplete == ['4'])
+    fire('codeRefreshNext')
+}
+app.atomicState.lockCodesReadIncomplete = []
+
+// C: a settled {} from a lock not heard from during the step doesn't mark it
+e.attrs.lockCodes = '{}'
+app.atomicState.lockCodesReadEmpty = []
+runOne()
+e.lastActivity = new Date(app.clock - 3600_000)
+app.lockCodesHandler([deviceId: 4L, name: 'lockCodes', value: '{}'])
+app.clock += 78_000; fire('codeRefreshFloor'); app.clock += 30_000; fire('codeRefreshSettled')
+check('C: settled {} with no activity during the step: not marked, held as unfinished', app.atomicState.lockCodesReadEmpty == [] && app.atomicState.lockCodesReadIncomplete == ['4'])
+fire('codeRefreshTimeout'); fire('codeRefreshNext')
+// ...the same lock settling with codes and no activity: as before (no longer held)
+runOne()
+e.attrs.lockCodes = JsonOutput.toJson(['1': [name: 'Owner', code: '11112222']])
+app.lockCodesHandler([deviceId: 4L, name: 'lockCodes'])
+app.clock += 78_000; fire('codeRefreshFloor'); app.clock += 30_000; fire('codeRefreshSettled')
+check('C: settled with codes, no activity: not marked, no longer held', app.atomicState.lockCodesReadEmpty == [] && app.atomicState.lockCodesReadIncomplete == [])
+fire('codeRefreshTimeout'); fire('codeRefreshNext')
+
+// B: on the first run of 1.4.21, marks on locks that report {} are dropped once
+def f = new FakeLock(id: '5', name: 'F', label: 'Gate', calls: calls, attrs: [maxCodes: 30, lockCodes: JsonOutput.toJson(['1': [name: 'Owner', code: '11112222']])])
+app.locks = [e, f]
+e.attrs.lockCodes = '{}'
+app.state.remove('readEmptyRechecked')
+app.state.lastVersion = '1.4.20'
+app.atomicState.lockCodesReadEmpty = ['4', '5', '9']
+app.logged.clear()
+app.sbResubscribeIfVersionChanged()
+check('B: first run after the update: the mark on a lock reporting {} is dropped, others kept', app.atomicState.lockCodesReadEmpty == ['5', '9'] && app.logged.contains('Door code refresh: 1 lock(s) with no codes will be read again before new codes are added'))
+app.atomicState.lockCodesReadEmpty = ['4', '5', '9']
+app.state.lastVersion = '1.4.20'
+app.sbResubscribeIfVersionChanged()
+app.updated()
+check('B: only once: a later mark (from a settled read) stays', app.atomicState.lockCodesReadEmpty == ['4', '5', '9'])
+app.state.remove('readEmptyRechecked')
+app.updated()
+check('B: Done after the update (no sync first) drops it too', app.atomicState.lockCodesReadEmpty == ['5', '9'])
+
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

@@ -330,6 +330,7 @@ def fireJob = { String handler ->
 }
 // Lock 7 (being read, floor passed) sends lockCodes; its settle timer fires with the other jobs cleared
 def settleStep = { ->
+    lock.lastActivity = new Date(app.now())
     app.codeRefreshOnLockCodes([deviceId: '7'])
     def job = app.scheduled.find { it.handler == 'codeRefreshSettled' }
     app.scheduled.clear()
@@ -471,7 +472,7 @@ reset55()
 lock.attrs.lockCodes = '{}'
 app.atomicState.lockCodesReadEmpty = ['7']
 reading('7')
-app.atomicState.codeRefresh = app.atomicState.codeRefresh + [startEmpty: true]
+app.atomicState.codeRefresh = app.atomicState.codeRefresh + [startEmpty: true, startReadEmpty: true]
 app.codeRefreshTimeout([runId: 5L, index: 0])
 check('read-empty lock, timed-out read, still {}: keeps its mark, not held', app.atomicState.lockCodesReadEmpty == ['7'] && app.atomicState.lockCodesReadIncomplete == [])
 app.atomicState.codeRefresh = null

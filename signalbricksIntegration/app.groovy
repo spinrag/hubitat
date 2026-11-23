@@ -525,6 +525,7 @@ void updated() {
         state.lastVersion = sbAppVersion
     }
     state.remove('sbId') // left by the registration removed in 1.4.17
+    codeReadEmptyRecheck()
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
@@ -570,7 +571,27 @@ void sbResubscribeIfVersionChanged() {
     if (state.lastVersion == sbAppVersion) return
     state.lastVersion = sbAppVersion
     state.remove('sbId') // left by the registration removed in 1.4.17
+    codeReadEmptyRecheck()
     subscribeToEvents()
+}
+
+// Once, on the first run of 1.4.21: up to 1.4.20 a read that ran out of time could mark a
+// lock as having no codes. Drop that mark on locks that report no codes now; a read that
+// finishes marks them again.
+void codeReadEmptyRecheck() {
+    if (state.readEmptyRechecked) return
+    state.readEmptyRechecked = true
+    List readEmpty = atomicState.lockCodesReadEmpty ?: []
+    List keep = readEmpty.findAll { lockId ->
+        def lock = locks?.find { lock -> lock.id.toString() == lockId }
+        def raw = lock?.currentValue('lockCodes', true)
+        Map codes = raw ? helperParseLockCodes(raw) : null
+        !(lock && codes != null && codes.isEmpty())
+    }
+    if (keep.size() != readEmpty.size()) {
+        atomicState.lockCodesReadEmpty = keep
+        log.info "Door code refresh: ${readEmpty.size() - keep.size()} lock(s) with no codes will be read again before new codes are added"
+    }
 }
 
 // Setup scheduled tasks for all bookings
@@ -774,12 +795,14 @@ void codeRefreshNext(Map data) {
     int slots = lock ? ((lock.currentValue('maxCodes') ?: 30) as int) : 0
     // A read that starts from an empty or unreadable list and doesn't finish leaves a list
     // that may be partial
-    Map startCodes = lock ? helperParseLockCodes(lock.currentValue('lockCodes', true)) : null
+    def startRaw = lock ? lock.currentValue('lockCodes', true) : null
+    Map startCodes = lock ? helperParseLockCodes(startRaw) : null
     r.index = index
     r.stepAt = now()
     r.budgetSec = codeRefreshBudgetSec(slots)
     r.floorSec = codeRefreshFloorSec(slots)
     r.startEmpty = startCodes == null || startCodes.isEmpty()
+    r.startReadEmpty = startRaw && startCodes != null && startCodes.isEmpty()
     r.lockCodesAt = null
     r.settleAt = null
     atomicState.codeRefresh = r
@@ -864,30 +887,40 @@ void codeRefreshAdvance(Map data, boolean settled = false) {
     r.endedIndex = index
     atomicState.codeRefresh = r
     unschedule('codeRefreshFloor')
-    codeRefreshLockDone(r.lockIds[index], settled, r.startEmpty == true)
+    // A settled {} counts only if the lock itself talked to the hub during the step
+    // (a driver can publish {} when the read starts, also for a lock that is offline)
+    boolean heard = false
+    if (settled) {
+        def lock = locks?.find { lock -> lock.id.toString() == r.lockIds[index] }
+        Long last = lock ? codeRefreshLastActivity(lock) : null
+        heard = last != null && last >= (r.stepAt as long)
+    }
+    codeRefreshLockDone(r.lockIds[index], settled, r.startEmpty == true, r.startReadEmpty == true, heard)
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
 }
 
 // A read of this lock ended (settled or out of time). Remember whether it settled with no
 // codes: reconcile writes to a lock with an empty lockCodes only after such a read (#55).
-// A read that ran out of time proves nothing: a lock read empty before that still reports
-// no codes keeps its mark; one whose read started from an empty or unreadable list, or
+// A read that ran out of time proves nothing: a lock read empty before that reported no
+// codes at the start and still does keeps its mark; one whose read started from an empty or unreadable list, or
 // that ends with no codes, holds its writes until a read settles. Reconcile is run again
 // for locks whose writes it deferred.
-void codeRefreshLockDone(String lockId, boolean settled = false, boolean startEmpty = false) {
+void codeRefreshLockDone(String lockId, boolean settled = false, boolean startEmpty = false, boolean startReadEmpty = false, boolean heard = false) {
     def lock = locks?.find { lock -> lock.id.toString() == lockId }
     if (!lock) return
     def raw = lock.currentValue('lockCodes', true)
     // Unreadable lockCodes (null) is not empty: the lock stays unmarked (#57)
     Map lockCodes = helperParseLockCodes(raw)
     boolean endEmpty = raw && lockCodes != null && lockCodes.isEmpty()
+    // An empty list from a lock not heard from during the step proves nothing either
+    if (settled && endEmpty && !heard) settled = false
     List readEmptyBefore = atomicState.lockCodesReadEmpty ?: []
     List incompleteBefore = atomicState.lockCodesReadIncomplete ?: []
     List readEmpty = readEmptyBefore.findAll { it != lockId }
     List incomplete = incompleteBefore.findAll { it != lockId }
     if (settled) {
         if (endEmpty) readEmpty << lockId
-    } else if (endEmpty && readEmptyBefore.contains(lockId) && !incompleteBefore.contains(lockId)) {
+    } else if (endEmpty && startReadEmpty && readEmptyBefore.contains(lockId) && !incompleteBefore.contains(lockId)) {
         readEmpty << lockId
     } else if (startEmpty || incompleteBefore.contains(lockId) || lockCodes == null || lockCodes.isEmpty()) {
         incomplete << lockId
