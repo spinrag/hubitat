@@ -1414,6 +1414,7 @@ boolean helperRetryWanted(Map data, Map a) {
     if (confirm) {
         log.info "helperRetryWanted: lock ${lockKey} pos ${pos} reports the code written for ${a.bookingId}: confirmed"
         a.confirmed = true
+        a.remove('sharedDrop') // the lock holds it now: never removed as a dropped write (#95)
         a.remove('mismatches')
         lockAssignments[pos] = a
     } else {
@@ -1452,15 +1453,15 @@ void tryDeleteCode(Map data) {
         return
     }
 
-    // A covered booking's unconfirmed write (#95): only while the slot still tracks that write
-    // and the lock shows nothing else there, so a code written there since (another app, a person,
+    // A covered booking's unconfirmed write (#95): only while the slot still tracks that write,
+    // the lock hasn't confirmed it, and the lock shows nothing else there, so a code written there since (another app, a person,
     // or a fresh write of this booking) is never removed. Checkout deletes are unguarded: they
     // also remove codes claimed by name with no tracking
     if (data.sharedDrop) {
         Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
         Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
         def lockCode = codes == null ? null : (codes["${data.codePosition}"] ?: codes[data.codePosition])
-        if (!tracked || !tracked.sharedDrop || "${tracked.codeName}" != "${data.codeName}" || codes == null ||
+        if (!tracked || !tracked.sharedDrop || tracked.confirmed == true || "${tracked.codeName}" != "${data.codeName}" || codes == null ||
             helperTrackedVerdict(tracked, lockCode, data.codePosition) in ['otherName', 'otherBooking']) {
             log.info "tryDeleteCode: lock ${data.lockId} pos ${data.codePosition} no longer holds that write, skipped"
             return
@@ -1529,6 +1530,7 @@ void codeChangedHandler(e) {
                 } else if (e.value == 'added' || e.value == 'changed') {
                     log.info "codeChangedHandler: confirmed code at pos ${pos} on lock ${lockId} for ${assignment.bookingId}"
                     assignment.confirmed = true
+                    assignment.remove('sharedDrop') // the lock holds it now: never removed as a dropped write (#95)
                     assignment.remove('mismatches')
                     // Confirmed only by the leading-zero tolerance: the lock may hold the shorter code (#61)
                     String reported = helperEventCode(data, pos)

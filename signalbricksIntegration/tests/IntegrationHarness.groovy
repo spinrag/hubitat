@@ -1365,6 +1365,8 @@ lock.attrs.lockCodes = JsonOutput.toJson(['53': [name: 'G:ORB88-Di', code: '2000
 check('duplicate check: the same PIN on another current booking still is', app.helperHasDuplicateCode('7', booking77()['77'], booking77() + booking88))
 
 // --- #95: bookings on one lock with the same code share one slot ---
+// In a closure: the script's run() would otherwise exceed the JVM's method size limit
+({ ->
 // 77 checks in first; 78 is the same guest in the other unit sharing the lock, with the same code
 app.locks = [lock]
 app.minCodePosition = 50
@@ -1546,6 +1548,30 @@ lock.deleted.clear()
 app.tryDeleteCode([lockId: '7', codePosition: 50])
 check('#95 checkout deletes are unguarded as before', lock.deleted == [50])
 
+// The write lands and the lock confirms it before the delete runs: it is the booking's slot now, never deleted
+Map pastBoth = past77 + only78
+app.atomicState.bookings = pastBoth
+r = prefixRun(desk + slot77, refused, pastBoth)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB78-Di', code: '20000077']])
+app.codeChangedHandler([device: [id: '7'], value: 'added', data: JsonOutput.toJson(['51': [name: 'G:ORB78-Di', code: '20000077']])])
+check('#95 a confirmed write is no longer marked as dropped', assigned('51')?.confirmed == true && !assigned('51')?.sharedDrop)
+app.scheduled.clear()
+app.reconcileDoorCodes(pastBoth)
+check('#95 the booking now has its own slot: the old covering slot goes', app.scheduled.findAll { it.handler == 'tryDeleteCode' }.collect { it.data.codePosition } == [50])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 the queued delete of the confirmed write is skipped', lock.deleted.isEmpty())
+// Confirmed by a retry's read of the lock instead of an event
+r = prefixRun(desk + slot77, refused, pastBoth)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB78-Di', code: '20000077']])
+app.helperRetryWanted([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', attempt: 9], app.atomicState.codeAssignments['7']['51'])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 confirmed from the lock\'s codes: not marked dropped, the delete is skipped', assigned('51')?.confirmed == true && !assigned('51')?.sharedDrop && lock.deleted.isEmpty())
+app.atomicState.bookings = both
+
 // The owner's code changes while it covers another booking: its rewrite goes first, whatever the order
 [both, only78 + stay('77', 'Cy', '20000077', -2, 1)].each { Map order ->
     Map changed = order.collectEntries { k, b -> [k, k == '77' ? b + [code: '20000099'] : b] }
@@ -1577,6 +1603,7 @@ onceAt = app.scheduled.findAll { it.handler == 'reconcileDoorCodes' && it.at }.c
 check('#95 scheduling: one upcoming booking, its check-in as before', onceAt == [new Date(now.time + 5 * hr)])
 lock.attrs.lockCodes = '{}'
 app.atomicState.codeAssignments = [:]
+})()
 
 app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
