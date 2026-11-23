@@ -77,6 +77,8 @@ class FakeLock {
     List calls
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
     void getCodes() { calls << id }
+    def lastActivity
+    def getLastActivity() { lastActivity }
 }
 
 def cfg = new CompilerConfiguration()
@@ -355,6 +357,99 @@ check('reconcile done: timer kept, no cadence', pending('codeRefreshTimeout')?.d
 app.appButtonHandler('btnReset')
 check('Reset State: run cleared, Off stays off', app.atomicState.codeRefresh == null && refreshJobs().isEmpty())
 reset(calls)
+
+// --- A read is trusted only when it settles (fake values only) ---
+def e = new FakeLock(id: '4', name: 'E', label: 'Side', calls: calls, attrs: [maxCodes: 30, lockCodes: '{}'])
+app.locks = [e]
+app.settings = [locks: ['4'] as String[]]
+app.codeNamePrefix = 'GT:'
+def runOne = { -> app.scheduled.clear(); app.atomicState.codeRefresh = null; app.startCodeRefresh(null, ['4']); fire('codeRefreshNext') }
+def quietEvent = { -> e.lastActivity = new Date(app.clock); app.lockCodesHandler([deviceId: 4L, name: 'lockCodes', value: '{}']) }
+
+// S1: an empty 30-slot lock whose driver sends {} once, when its read ends at 30 s
+app.atomicState.lockCodesReadEmpty = []
+runOne()
+check('S1: floor timer at 78 s next to the 120 s budget', pending('codeRefreshFloor')?.secs == 78 && pending('codeRefreshTimeout')?.secs == 120)
+app.clock += 30_000
+quietEvent()
+check('S1: lockCodes at 30 s does not settle before the floor', !pending('codeRefreshSettled'))
+app.clock += 48_000
+fire('codeRefreshFloor')
+check('S1: at the floor the settle starts', pending('codeRefreshSettled')?.secs == 30)
+app.clock += 30_000
+fire('codeRefreshSettled')
+check('S1: settled with {}: read empty', app.atomicState.lockCodesReadEmpty == ['4'] && (app.atomicState.lockCodesReadIncomplete ?: []) == [])
+fire('codeRefreshTimeout')
+fire('codeRefreshNext')
+check('S1: run finished', app.atomicState.codeRefresh == null)
+
+// S2: a lock read empty earlier; a later read times out with no lockCodes and the lock still {}
+runOne()
+app.clock += 120_000
+fire('codeRefreshTimeout')
+check('S2: timed-out read of a read-empty lock still reporting {}: keeps its mark', app.atomicState.lockCodesReadEmpty == ['4'] && (app.atomicState.lockCodesReadIncomplete ?: []) == [])
+fire('codeRefreshNext')
+// ...and with its end-of-read {} before the floor it settles and stays marked
+runOne()
+app.clock += 30_000
+quietEvent()
+app.clock += 48_000
+fire('codeRefreshFloor')
+app.clock += 30_000
+fire('codeRefreshSettled')
+check('S2: the same lock settling again stays marked', app.atomicState.lockCodesReadEmpty == ['4'])
+fire('codeRefreshTimeout'); fire('codeRefreshNext')
+
+// S3: settled, then the budget timer fires in the 5 s gap
+app.atomicState.lockCodesReadEmpty = []
+runOne()
+app.clock += 80_000
+quietEvent()
+app.clock += 30_000
+fire('codeRefreshSettled')
+check('S3: settled: read empty', app.atomicState.lockCodesReadEmpty == ['4'])
+app.codeRefreshTimeout([runId: app.atomicState.codeRefresh.runId, index: 0])
+check('S3: budget timer in the gap: mark kept, one next step', app.atomicState.lockCodesReadEmpty == ['4'] && app.scheduled.count { it.handler == 'codeRefreshNext' } == 1)
+fire('codeRefreshNext')
+
+// S4: a booking sync clears the hub's timers (scheduleEvents) while a step waits
+app.atomicState.lockCodesReadEmpty = []
+runOne()
+app.clock += 20_000
+app.scheduleEvents([:])
+check('S4: before the floor: floor and budget timers re-armed', pending('codeRefreshFloor')?.secs == 58 && pending('codeRefreshTimeout')?.secs == 100)
+app.clock += 60_000
+quietEvent()
+app.clock += 10_000
+app.scheduleEvents([:])
+check('S4: settle pending: re-armed for the time left', pending('codeRefreshSettled')?.secs == 20 && pending('codeRefreshTimeout')?.secs == 30)
+app.clock += 20_000
+fire('codeRefreshSettled')
+check('S4: the re-armed settle marks the lock', app.atomicState.lockCodesReadEmpty == ['4'])
+app.scheduleEvents([:])
+check('S4: in the gap after the step: the next step re-armed', pending('codeRefreshNext')?.data?.index == 1 && !pending('codeRefreshTimeout'))
+fire('codeRefreshNext')
+
+// S5: a read from {} times out with a partial list (slot 1 read, the rest not)
+app.atomicState.lockCodesReadEmpty = []
+app.minCodePosition = 1
+runOne()
+e.attrs.lockCodes = JsonOutput.toJson(['1': [name: 'Owner', code: '11112222']])
+app.clock += 60_000
+e.lastActivity = new Date(app.clock + 30_000)
+app.lockCodesHandler([deviceId: 4L, name: 'lockCodes'])
+app.clock += 60_000
+fire('codeRefreshTimeout')
+check('S5: timed-out read from {}: held as unfinished', app.atomicState.lockCodesReadIncomplete == ['4'])
+fire('codeRefreshNext')
+app.scheduled.clear()
+app.logged.clear()
+app.atomicState.bookings = ['77': [id: '77', guest: 'Cy', code: '20000077', lockId: ['4'], checkIn: new Date(System.currentTimeMillis() - 3600_000), checkOut: new Date(System.currentTimeMillis() + 3600_000)]]
+app.reconcileDoorCodes()
+check('S5: no first-free write into the partial list', !app.scheduled.any { it.handler == 'trySetCode' })
+check('S5: the write is deferred and logged', app.atomicState.codeWritesDeferred == ['4': 1] && app.logged.contains('reconcileDoorCodes: lock 4 (Side) has not finished a read of its codes, deferring 1 code writes'))
+List leakedS = app.logged.findAll { it.contains('11112222') || it.contains('20000077') }
+check('S5: no door code values logged', leakedS.isEmpty())
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

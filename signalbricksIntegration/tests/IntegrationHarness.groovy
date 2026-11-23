@@ -53,7 +53,9 @@ abstract class HubitatStub extends Script {
         return ciphers[s]
     }
     String createAccessToken() { 'tok-fake' }
-    long now() { System.currentTimeMillis() }
+    // Moves the app's clock (timers in these tests are fired by hand)
+    long clockOffset = 0
+    long now() { System.currentTimeMillis() + clockOffset }
 }
 
 class FakeLock {
@@ -302,6 +304,9 @@ def reset55 = {
     app.atomicState.codeAutoReadAt = [:]
     app.atomicState.codeRefresh = null
     app.atomicState.reconcileRetries = 0
+    app.atomicState.lockCodesReadIncomplete = []
+    app.clockOffset = 0
+    lock.lastActivity = null
     lock.getCodesCalls = 0
 }
 reset55()
@@ -315,6 +320,23 @@ def newLogs = { app.logged.drop(logMark).collect { it.toString() } }
 def deferLog = { String lockId -> newLogs().find { it.startsWith("reconcileDoorCodes: lock ${lockId} ") && it.contains('deferring') } }
 def reading = { String lockId -> app.atomicState.codeRefresh = [runId: 5L, lockIds: [lockId], index: 0, stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0] }
 def reconciles = { app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs } }
+// Run the pending job for a handler, as the hub scheduler would
+def fireJob = { String handler ->
+    def job = app.scheduled.find { it.handler == handler }
+    if (!job) return false
+    app.scheduled.remove(job)
+    app."$handler"(job.data)
+    return true
+}
+// Lock 7 (being read, floor passed) sends lockCodes; its settle timer fires with the other jobs cleared
+def settleStep = { ->
+    app.codeRefreshOnLockCodes([deviceId: '7'])
+    def job = app.scheduled.find { it.handler == 'codeRefreshSettled' }
+    app.scheduled.clear()
+    if (job) app.codeRefreshSettled(job.data)
+    return job != null
+}
+String heldIncomplete = 'reconcileDoorCodes: lock 7 (Front) has not finished a read of its codes, deferring 1 code writes'
 
 // Being read by a refresh: a partial list must not decide which slot is free
 reading('7')
@@ -335,9 +357,7 @@ app.settings = [:]
 
 // The refresh reads the lock: it is reconciled again shortly after
 lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
-app.scheduled.clear()
-app.codeRefreshOnLockCodes([deviceId: '7'])
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#55 read finished: the deferred lock is reconciled again', app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 } && app.atomicState.codeWritesDeferred == [:])
 check('#55 read finished with other codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
 app.atomicState.codeRefresh = null
@@ -352,7 +372,7 @@ app.codeRefreshOnLockCodes([deviceId: '7'])
 app.scheduled.clear()
 mark()
 app.codeRefreshTimeout([runId: 5L, index: 0])
-check('timeout with codes: not marked, deferred lock reconciled again, no extra log', app.atomicState.lockCodesReadEmpty == [] && app.atomicState.codeWritesDeferred == [:] && reconciles() && !newLogs().any { it.contains('reports no codes') })
+check('timeout with codes: not marked, deferred lock reconciled again, no extra log', app.atomicState.lockCodesReadEmpty == [] && app.atomicState.codeWritesDeferred == [:] && reconciles() && !newLogs().any { it.contains('did not finish reading') })
 app.atomicState.codeRefresh = null
 r = prefixRun(frontDesk, [:], booking77on(['7']))
 check('timeout with codes: the write proceeds as before', setsOn('7') == [50])
@@ -378,28 +398,24 @@ def run55 = app.atomicState.codeRefresh
 check('#55 empty, not read: a read of that lock only is started', run55?.lockIds == ['7'] && app.atomicState.codeAutoReadAt?.containsKey('7') && newLogs().contains('reconcileDoorCodes: reading the codes of 1 lock(s) whose code writes are waiting'))
 app.codeRefreshNext([runId: run55.runId, index: 0])
 check('#55 auto read: getCodes sent to the lock', lock.getCodesCalls == 1)
+check('auto read: budget 180 s and floor 156 s timers for the 60-slot lock', app.scheduled.find { it.handler == 'codeRefreshTimeout' }?.secs == 180 && app.scheduled.find { it.handler == 'codeRefreshFloor' }?.secs == 156)
+// The driver reads fast and sends its one {} at 30 s, before the floor; the lock is quiet after
+app.clockOffset = 30_000
+lock.lastActivity = new Date(app.now())
 app.codeRefreshOnLockCodes([deviceId: '7'])
+check('fast driver: lockCodes before the floor does not settle yet', !app.scheduled.any { it.handler == 'codeRefreshSettled' })
+app.clockOffset = 156_000
+fireJob('codeRefreshFloor')
+check('fast driver: at the floor, the earlier lockCodes starts the 30 s settle', app.scheduled.find { it.handler == 'codeRefreshSettled' }?.secs == 30)
+app.clockOffset = 186_000
+def settleJob = app.scheduled.find { it.handler == 'codeRefreshSettled' }
 app.scheduled.clear()
-mark()
+app.codeRefreshSettled(settleJob.data)
+check('fast driver: settled with {}: marked read-empty, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && reconciles() && app.atomicState.lockCodesReadIncomplete == [])
 app.codeRefreshTimeout([runId: run55.runId, index: 0])
-check('timeout: answered with {} but out of time: not marked read-empty', app.atomicState.lockCodesReadEmpty == [] && reconciles())
-check('timeout: answered with {} but out of time: logged, no codes in the line', newLogs().contains('Door code refresh: Front reports no codes but its read did not finish; its new codes stay on hold until a read finishes'))
-check('timeout: the refresh moves on as before', app.scheduled.any { it.handler == 'codeRefreshNext' && it.data.index == 1 })
+check('settle then the budget timer in the gap: the mark stays, no second advance', app.atomicState.lockCodesReadEmpty == ['7'] && app.scheduled.count { it.handler == 'codeRefreshNext' } == 1)
 app.atomicState.codeRefresh = null
-mark()
-r = prefixRun([:], [:], booking77on(['7']))
-check('timeout: writes still held, as for a lock that has not reported its codes', setsOn('7').isEmpty() && r.sets.findAll { "${it.lockId}" == '7' && it.free }.isEmpty() && deferLog('7') == 'reconcileDoorCodes: lock 7 (Front) has not reported its codes, deferring 1 code writes')
-// The next read settles with {}: the lock is read empty as before
-app.atomicState.codeAutoReadAt = [:]
-app.atomicState.codeRefresh = null
-app.codeAutoRead(['7'])
-run55 = app.atomicState.codeRefresh
-app.codeRefreshNext([runId: run55.runId, index: 0])
-app.codeRefreshOnLockCodes([deviceId: '7'])
-app.scheduled.clear()
-app.codeRefreshSettled([runId: run55.runId, index: 0])
-check('#55 read settled with no codes: marked read-empty, reconciled again', app.atomicState.lockCodesReadEmpty == ['7'] && reconciles())
-app.atomicState.codeRefresh = null
+app.clockOffset = 0
 mark()
 r = prefixRun([:], [:], booking77on(['7']))
 check('#55 read and empty: the write lands', setsOn('7') == [50] && deferLog('7') == null)
@@ -409,6 +425,39 @@ app.atomicState.codeRefresh = [runId: 9L, lockIds: ['8'], index: 0, stepAt: Syst
 r = prefixRun([:], [:], booking77on(['7']))
 check('#55 empty again (driver change): deferred, no read while another lock is read', setsOn('7').isEmpty() && app.atomicState.codeRefresh.runId == 9L)
 
+// Still reading after its last lockCodes (activity later): not settled, the budget ends the step
+reset55()
+r = prefixRun([:], [:], booking77on(['7']))
+run55 = app.atomicState.codeRefresh
+app.codeRefreshNext([runId: run55.runId, index: 0])
+app.clockOffset = 160_000
+app.codeRefreshOnLockCodes([deviceId: '7'])
+lock.lastActivity = new Date(app.now() + 20_000)
+app.clockOffset = 190_000
+settleJob = app.scheduled.find { it.handler == 'codeRefreshSettled' }
+app.codeRefreshSettled(settleJob.data)
+check('activity after the last lockCodes: not settled, still reading', app.atomicState.codeRefresh?.index == 0 && app.atomicState.codeRefresh.endedIndex == null && app.atomicState.lockCodesReadEmpty == [])
+app.scheduled.clear()
+mark()
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('timeout with {}: not marked read-empty, held as an unfinished read', app.atomicState.lockCodesReadEmpty == [] && app.atomicState.lockCodesReadIncomplete == ['7'] && reconciles())
+check('timeout with {}: logged, no codes in the line', newLogs().contains('Door code refresh: Front did not finish reading its codes; its new codes stay on hold until a read finishes'))
+check('timeout: the refresh moves on as before', app.scheduled.any { it.handler == 'codeRefreshNext' && it.data.index == 1 })
+app.atomicState.codeRefresh = null
+app.clockOffset = 0
+mark()
+r = prefixRun([:], [:], booking77on(['7']))
+check('timeout with {}: writes still held, no free-slot write', setsOn('7').isEmpty() && r.sets.findAll { "${it.lockId}" == '7' && it.free }.isEmpty() && deferLog('7') == heldIncomplete)
+check('timeout with {}: an auto read is started again later', app.atomicState.codeWritesDeferred == ['7': 1] && app.scheduled.any { it.handler == 'codeAutoReadRetry' })
+// The next read settles with {}: read empty as before
+lock.lastActivity = null
+reading('7')
+settleStep()
+check('settled read after a timeout: marked read-empty, no longer held', app.atomicState.lockCodesReadEmpty == ['7'] && app.atomicState.lockCodesReadIncomplete == [])
+app.atomicState.codeRefresh = null
+r = prefixRun([:], [:], booking77on(['7']))
+check('settled read after a timeout: the write lands', setsOn('7') == [50])
+
 // A read step that times out without any answer leaves the lock unmarked
 reset55()
 r = prefixRun([:], [:], booking77on(['7']))
@@ -416,55 +465,49 @@ run55 = app.atomicState.codeRefresh
 app.codeRefreshNext([runId: run55.runId, index: 0])
 app.codeRefreshTimeout([runId: run55.runId, index: 0])
 check('#55 read timed out with no answer: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
-app.codeRefreshNext([runId: run55.runId, index: 0])
-app.codeChangedHandler(codeEvent('changed', 60))
-check('#55 a codeChanged from the lock being read counts as an answer', app.atomicState.codeRefresh.answered == true)
-// A truly empty lock re-reports {} without an event, but it talked to the hub during the step
-app.atomicState.codeRefresh = null
-lock.lastActivity = new Date(System.currentTimeMillis() - 3600_000L)
-r = prefixRun([:], [:], booking77on(['7']))
-app.atomicState.codeAutoReadAt = [:]
-app.atomicState.codeRefresh = null
-app.codeAutoRead(['7'])
-run55 = app.atomicState.codeRefresh
-app.codeRefreshNext([runId: run55.runId, index: 0])
-app.codeRefreshTimeout([runId: run55.runId, index: 0])
-check('#55 timeout, no events, last activity before the step (offline): not marked', app.atomicState.lockCodesReadEmpty == [])
-app.codeRefreshNext([runId: run55.runId, index: 0])
-lock.lastActivity = new Date(System.currentTimeMillis() + 1000)
-app.atomicState.codeWritesDeferred = ['7': 1]
-app.scheduled.clear()
-mark()
-app.codeRefreshTimeout([runId: run55.runId, index: 0])
-check('timeout: no events, activity after the step started: not marked, logged, reconciled again', app.atomicState.lockCodesReadEmpty == [] && newLogs().any { it.contains('reports no codes but its read did not finish') } && reconciles())
-app.atomicState.codeRefresh = null
-r = prefixRun([:], [:], booking77on(['7']))
-check('timeout: empty lock that only showed activity: no free-slot write', setsOn('7').isEmpty())
-lock.lastActivity = System.currentTimeMillis() + 1000
-app.atomicState.lockCodesReadEmpty = []
-reading('7')
-mark()
-app.codeRefreshTimeout([runId: 5L, index: 0])
-check('timeout: last activity as a number also counts as an answer (logged, not marked)', app.atomicState.lockCodesReadEmpty == [] && newLogs().any { it.contains('reports no codes but its read did not finish') })
-reading('7')
-mark()
-app.codeRefreshSettled([runId: 5L, index: 0])
-check('#55 settled with {}: marked read-empty', app.atomicState.lockCodesReadEmpty == ['7'] && !newLogs().any { it.contains('did not finish') })
-// A lock previously read empty loses the mark when a later read times out
-reading('7')
-app.codeRefreshTimeout([runId: 5L, index: 0])
-check('timeout: a read-empty lock whose next read times out is unmarked', app.atomicState.lockCodesReadEmpty == [])
-lock.lastActivity = null
-app.atomicState.lockCodesReadEmpty = []
+
+// A lock read empty before keeps its mark when a later read times out and it still reports {}
 reset55()
+lock.attrs.lockCodes = '{}'
+app.atomicState.lockCodesReadEmpty = ['7']
+reading('7')
+app.atomicState.codeRefresh = app.atomicState.codeRefresh + [startEmpty: true]
+app.codeRefreshTimeout([runId: 5L, index: 0])
+check('read-empty lock, timed-out read, still {}: keeps its mark, not held', app.atomicState.lockCodesReadEmpty == ['7'] && app.atomicState.lockCodesReadIncomplete == [])
+app.atomicState.codeRefresh = null
+r = prefixRun([:], [:], booking77on(['7']))
+check('read-empty lock, timed-out read, still {}: the write lands', setsOn('7') == [50])
+
+// A read from an empty list that times out with a partial list: held until a read settles
+reset55()
+lock.attrs.lockCodes = '{}'
 r = prefixRun([:], [:], booking77on(['7']))
 run55 = app.atomicState.codeRefresh
 app.codeRefreshNext([runId: run55.runId, index: 0])
-// codeRefreshAnswered sets only the flag on the current step
-app.atomicState.codeRefresh = app.atomicState.codeRefresh + [index: 0, stepAt: 42L]
-app.codeRefreshAnswered()
-check('#55 answered flag set without rewriting the step', app.atomicState.codeRefresh.answered == true && app.atomicState.codeRefresh.stepAt == 42L)
+check('read from {}: noted as starting empty', app.atomicState.codeRefresh.startEmpty == true)
+lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
+app.codeRefreshOnLockCodes([deviceId: '7'])
+app.codeRefreshTimeout([runId: run55.runId, index: 0])
+check('partial list after a timed-out read from {}: held as unfinished', app.atomicState.lockCodesReadIncomplete == ['7'])
 app.atomicState.codeRefresh = null
+mark()
+r = prefixRun(frontDesk, [:], booking77on(['7']))
+check('partial list: no first-free write', setsOn('7').isEmpty() && deferLog('7') == heldIncomplete)
+r = prefixRun(ourCode, tracked51, booking77())
+check('partial list of only this app\'s codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
+// A later read that starts from the partial list and times out: still held
+reading('7')
+app.codeRefreshTimeout([runId: 5L, index: 0])
+check('partial list, next read times out too: still held', app.atomicState.lockCodesReadIncomplete == ['7'])
+reading('7')
+lock.attrs.lockCodes = JsonOutput.toJson(frontDesk)
+settleStep()
+check('partial list, then a settled read: no longer held', app.atomicState.lockCodesReadIncomplete == [])
+app.atomicState.codeRefresh = null
+r = prefixRun(frontDesk, [:], booking77on(['7']))
+check('after the settled read: the write proceeds', setsOn('7') == [50])
+app.scheduled.clear()
+reset55()
 
 // A driver that never fills in lockCodes: auto reads at most once per 6 h
 reset55()
@@ -505,8 +548,14 @@ app.codeAutoReadRetry()
 run55 = app.atomicState.codeRefresh
 app.codeRefreshNext([runId: run55.runId, index: 0])
 check('#55 auto read timer fires: the second auto read starts', run55?.lockIds == ['7'] && lock.getCodesCalls == 2)
+app.clockOffset = 30_000
+lock.lastActivity = new Date(app.now())
 app.codeRefreshOnLockCodes([deviceId: '7'])
-app.codeRefreshSettled([runId: run55.runId, index: 0])
+app.clockOffset = 156_000
+fireJob('codeRefreshFloor')
+app.clockOffset = 186_000
+fireJob('codeRefreshSettled')
+app.clockOffset = 0
 app.atomicState.codeRefresh = null
 r = prefixRun([:], [:], booking77on(['7']))
 check('#55 auto read timer: the lock settled empty and the write lands', app.atomicState.lockCodesReadEmpty == ['7'] && setsOn('7') == [50])
@@ -525,16 +574,13 @@ reading('7')
 app.atomicState.reconcileRetries = 20
 r = prefixRun(frontDesk, [:], booking77on(['7']))
 check('#55 deferred past the retry cap: retry loop stops', !reconciles() && app.atomicState.codeWritesDeferred == ['7': 1])
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#55 past the cap: the next read of the lock reconciles it', reconciles())
 
 // Unreadable lockCodes at the end of a read
 lock.attrs.lockCodes = 'not json'
 reading('7')
-app.atomicState.codeRefresh.answered = true
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#55 unreadable lockCodes at the end of a read: the refresh still moves on, not marked', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
 
 // Optional hardening: a first-free pick never lands on another current booking's tracked empty slot
@@ -617,19 +663,15 @@ check('#57 readable again: reconciled, off the unreadable list', setsOn('7') == 
 reset55()
 lock.attrs.lockCodes = 'undecryptable:RW1wdHk'
 reading('7')
-app.atomicState.codeRefresh.answered = true
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#57 read ends with undecryptable lockCodes: refresh moves on, not marked read-empty', app.scheduled.any { it.handler == 'codeRefreshNext' } && app.atomicState.lockCodesReadEmpty == [])
 lock.attrs.lockCodes = encrypt('enc:e30', [:])
 reading('7')
-app.atomicState.codeRefresh.answered = true
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#57 read ends with an encrypted empty list: marked read-empty', app.atomicState.lockCodesReadEmpty == ['7'])
 lock.attrs.lockCodes = encrypt(enc, frontDesk)
 reading('7')
-app.atomicState.codeRefresh.answered = true
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#57 read ends with encrypted codes: not marked read-empty', app.atomicState.lockCodesReadEmpty == [])
 reset55()
 
@@ -1328,13 +1370,11 @@ reset55()
 app.atomicState.lockCodesUnreadable = ['7']
 lock.attrs.lockCodes = 'undecryptable:UmVh'
 reading('7')
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#57 read ends still unreadable: stays listed, no extra reconcile', app.atomicState.lockCodesUnreadable == ['7'] && !reconciles())
 lock.attrs.lockCodes = encrypt(enc, frontDesk)
 reading('7')
-app.scheduled.clear()
-app.codeRefreshSettled([runId: 5L, index: 0])
+settleStep()
 check('#57 read ends readable again: off the list, reconciled 10 s later', app.atomicState.lockCodesUnreadable == [] && app.scheduled.any { it.handler == 'reconcileDoorCodes' && it.secs == 10 })
 reset55()
 
