@@ -1496,10 +1496,10 @@ r = prefixRun(desk, track77, both)
 check('#95 the owner\'s confirmed slot missing from the report: rewritten there, no write for the other booking', r.sets.size() == 1 && r.sets[0].codePosition == 50 && r.sets[0].codeName == 'G:ORB77-Cy')
 
 // The other booking still current but moved to another lock: the 409 check agrees with reconcile
-Map moved = stay('77', 'Cy', '20000077', -2, 1) + only78
+Map moved = stay('77', 'Cy', '20000099', -2, 1) + only78
 moved['77'].lockId = ['8']
 lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
-check('#95 duplicate check: slot of a booking now current on another lock covers this one, not a duplicate', !app.helperHasDuplicateCode('7', moved['78'], moved))
+check('#95 duplicate check: slot of a booking now current on another lock (its code since changed) covers this one, not a duplicate', !app.helperHasDuplicateCode('7', moved['78'], moved))
 r = prefixRun(desk + slot77, track77, moved)
 check('#95 reconcile: that slot is kept for the booking on this lock', r.sets.isEmpty() && r.deletes.isEmpty())
 
@@ -1518,6 +1518,44 @@ check('#95 that write is no longer re-sent (the booking is still current)', lock
 Map afterDelete = new JsonSlurper().parseText(JsonOutput.toJson(app.atomicState.codeAssignments))
 r = prefixRun(desk + ['50': [code: '20000077'], '51': [code: '20000077']], afterDelete, [:])
 check('#95 if that write landed anyway (nameless driver), its slot is still removed after checkout', r.deletes.sort() == [50, 51])
+// The delete never removes a code written to that slot since it was queued
+r = prefixRun(desk + slot77, refused, both)
+def guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'Cleaner', code: '30000051']])
+app.codeChangedHandler([device: [id: '7'], value: 'added', data: JsonOutput.toJson(['51': [name: 'Cleaner', code: '30000051']])])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 a foreign code written to that slot before the delete runs is not deleted', assigned('51') == null && lock.deleted.isEmpty())
+r = prefixRun(desk + slot77, refused, both)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+app.trySetCode([lockId: '7', codePosition: 51, code: '20000077', codeName: 'G:ORB78-Di', free: true])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 a fresh write of the booking into that slot before the delete runs is not deleted', lock.deleted.isEmpty() && assigned('51')?.attempt == 1 && !assigned('51')?.deleting)
+r = prefixRun(desk + slot77 + ['51': [name: 'Plumber', code: '30000051']], refused, both)
+check('#95 no delete queued while the lock shows another code there', r.deletes.isEmpty())
+r = prefixRun(desk + slot77, refused, both)
+guardJob = app.scheduled.find { it.handler == 'tryDeleteCode' }
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77 + ['51': [name: 'G:ORB12-Zed', code: '30000051']])
+lock.deleted.clear()
+app.tryDeleteCode(guardJob.data)
+check('#95 the delete is skipped when the lock shows another booking in that slot', lock.deleted.isEmpty())
+lock.attrs.lockCodes = JsonOutput.toJson(desk + slot77)
+lock.deleted.clear()
+app.tryDeleteCode([lockId: '7', codePosition: 50])
+check('#95 checkout deletes are unguarded as before', lock.deleted == [50])
+
+// The owner's code changes while it covers another booking: its rewrite goes first, whatever the order
+[both, only78 + stay('77', 'Cy', '20000077', -2, 1)].each { Map order ->
+    Map changed = order.collectEntries { k, b -> [k, k == '77' ? b + [code: '20000099'] : b] }
+    r = prefixRun(desk + slot77, track77, changed)
+    def ownerJob = r.jobs.find { it.handler == 'trySetCode' && it.data.codePosition == 50 }
+    def newJob = r.jobs.find { it.handler == 'trySetCode' && it.data.codeName == 'G:ORB78-Di' }
+    check("#95 owner code changes (${order.keySet().join(',')}): the owner's rewrite is queued before the other booking's write".toString(),
+        ownerJob && newJob && ownerJob.secs < newJob.secs && newJob.data.codePosition == 51)
+}
+
 // Never while the lock is being read (partial list)
 app.atomicState.codeRefresh = [index: 0, lockIds: ['7'], stepAt: System.currentTimeMillis(), budgetSec: 600, floorSec: 0, runId: 1]
 r = prefixRun(desk + slot77, refused, both)
@@ -1544,7 +1582,7 @@ app.paragraphs.clear()
 app.settings = [locks: ['x'] as String[], codeNamePrefix: 'G:']
 app.pages()
 check('page: explains the previous prefix setting', app.paragraphs.any { it.contains('enter the old one here') })
-check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567', '20000080', '20000066', '0123'].any { l.toString().contains(it) } })
+check('harness: no code in any log line', !app.logged.any { l -> ['20000077', '20000078', '20000070', '20000088', '30000051', '10000031', '10000099', '30000032', '30000033', '20000012', '30000001', '20000066', '10000040', '1234567', '1234568', '20000079', '20000005', '101234567', '20000080', '20000066', '0123', '20000099', '30000051'].any { l.toString().contains(it) } })
 
 println(fails == 0 ? 'ALL PASS' : "${fails} FAILED")
 System.exit(fails == 0 ? 0 : 1)

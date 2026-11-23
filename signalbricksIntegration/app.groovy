@@ -1123,21 +1123,29 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
             availableCodePositions.removeAll(trackedFree)
             int index = 0
 
-            currentLockBookings.each { bookingId, booking ->
+            // Rewrites of slots on the lock first, then new writes: when a slot owner's code changes,
+            // a booking it covered (#95) gets its own write after the old code is gone
+            currentLockBookings.sort { x, y -> (sbCodes[x.key] ? 0 : 1) <=> (sbCodes[y.key] ? 0 : 1) }.each { bookingId, booking ->
                 String codeName = helperGetCodeName(booking)
 
                 // Covered by the slot of another booking with the same code (#95): no write. A write
-                // of its own the lock hasn't confirmed (it may refuse a code it already holds) gets a
-                // delete, so the code never stays behind untracked if that write lands after all;
-                // not while writes are held back (the lock's code list may be partial)
+                // of its own the lock hasn't confirmed (it may refuse a code it already holds) stops
+                // being re-sent and gets a delete, so the code never stays behind untracked if that
+                // write lands after all; not while writes are held back (the code list may be partial).
+                // The delete runs only if the slot still tracks that write (see tryDeleteCode)
                 String sharedWith = shared["${bookingId}".toString()]
                 if (!sbCodes[bookingId] && sharedWith) {
                     if (!holdWrites) {
-                        lockAssignments.each { pos, a ->
+                        Map all = atomicState.codeAssignments ?: [:]
+                        Map mine = all[lockKey] ?: [:]
+                        mine.each { pos, a ->
                             if (!(a instanceof Map) || !helperPendingSet(a) || "${a.bookingId ?: ''}".find(/\d+/) != "${bookingId}".toString() || lockCodes[pos] || lockCodes["${pos}"] || !"${pos}".isInteger()) return
                             log.info "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares ORB${sharedWith}'s slot; its own unconfirmed write at pos ${pos} is deleted"
-                            runIn(++i * 60, 'tryDeleteCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: "${pos}".toInteger() ]])
+                            a.sharedDrop = true
+                            runIn(++i * 60, 'tryDeleteCode', [ overwrite: false, data: [ lockId: lock.id, codePosition: "${pos}".toInteger(), sharedDrop: true, codeName: a.codeName ]])
                         }
+                        all[lockKey] = mine
+                        atomicState.codeAssignments = all
                     }
                     log.debug "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares the slot of ORB${sharedWith} (same code)"
                     return
@@ -1277,7 +1285,7 @@ void trySetCode(Map data) {
     Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
     boolean stale
     if (data.attempt != null) {
-        stale = !tracked || tracked.deleting || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}" || !helperRetryWanted(data, tracked)
+        stale = !tracked || tracked.deleting || tracked.sharedDrop || "${tracked.codeName}" != "${data.codeName}" || "${tracked.code}" != "${data.code}" || !helperRetryWanted(data, tracked)
     } else {
         Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
         def lockCode = codes == null ? null : (codes[data.codePosition] ?: codes["${data.codePosition}"])
@@ -1355,7 +1363,7 @@ void verifySetCode(Map data) {
         return
     }
 
-    if (a.deleting) {
+    if (a.deleting || a.sharedDrop) {
         log.debug "verifySetCode: slot is being deleted, stopping retry"
         return
     }
@@ -1442,6 +1450,21 @@ void tryDeleteCode(Map data) {
     if (!lock) {
         log.debug "tryDeleteCode: Lock not found"
         return
+    }
+
+    // A covered booking's unconfirmed write (#95): only while the slot still tracks that write
+    // and the lock shows nothing else there, so a code written there since (another app, a person,
+    // or a fresh write of this booking) is never removed. Checkout deletes are unguarded: they
+    // also remove codes claimed by name with no tracking
+    if (data.sharedDrop) {
+        Map tracked = ((atomicState.codeAssignments ?: [:])["${data.lockId}"] ?: [:])["${data.codePosition}"]
+        Map codes = helperParseLockCodes(lock.currentValue('lockCodes', true))
+        def lockCode = codes == null ? null : (codes["${data.codePosition}"] ?: codes[data.codePosition])
+        if (!tracked || !tracked.sharedDrop || "${tracked.codeName}" != "${data.codeName}" || codes == null ||
+            helperTrackedVerdict(tracked, lockCode, data.codePosition) in ['otherName', 'otherBooking']) {
+            log.info "tryDeleteCode: lock ${data.lockId} pos ${data.codePosition} no longer holds that write, skipped"
+            return
+        }
     }
 
     lock.deleteCode(data.codePosition)
