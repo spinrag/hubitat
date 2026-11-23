@@ -93,7 +93,7 @@ def mainPage = { app.paragraphs.clear(); app.hrefs.clear(); app.pages(); app.par
 def bookingsPage = { app.paragraphs.clear(); app.bookingsPage(); app.paragraphs.join('\n') }
 String bullets = '&bull;&bull;&bull;&bull;'
 
-check('version is 1.4.19', app.sbAppVersion == '1.4.19')
+check('version is 1.4.20', app.sbAppVersion == '1.4.20')
 
 // --- Saving the app code renders pages with no state, settings or locks ---
 app.state = null; app.atomicState = null; app.settings = null; app.locks = null
@@ -192,7 +192,7 @@ check('mask: short or missing code shows no digits', app.bookingsMask('12') == b
 check('mask: redacted lock code stays redacted', app.bookingsMask('********') == bullets + '**')
 List shown = allCodes.findAll { page.contains(it) }
 check("render: no full code on the page (${shown.size()} found)", shown.isEmpty())
-check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.19'))
+check('render: main page still renders with state', mainPage().contains('SignalBricks Integration 1.4.20'))
 // Reconcile still logs its matches (quiet only for the page)
 app.logged.clear()
 app.helperOnlySbCodes(new JsonSlurper().parseText(JsonOutput.toJson(frontCodes)), '1')
@@ -237,6 +237,20 @@ check('200: a hidden or missing code on the lock', syncReply(['20': [name: 'Fron
     syncReply(['20': [name: 'Front desk']], '20000040').status == 200)
 check('200: the booking\'s own slot, code as a number', syncReply(['20': [name: 'GT:ORB40-Jo', code: 20000040]], '20000040').status == 200)
 check('200: another code', syncReply(['20': [name: 'Front desk', code: 20000041]], '20000040').status == 200)
+// Another current booking with the same code holds a slot of this app on the lock: shared (#95), no 409
+def sharedReply = { Map lockCodes, Map other ->
+    back.attrs.lockCodes = JsonOutput.toJson(lockCodes)
+    app.atomicState.bookings = new JsonSlurper().parseText(JsonOutput.toJson(other))
+    app.params = [bookingId: '40', lockId: '2']
+    app.request = [JSON: [id: '40', guest: 'Jo', code: '20000040', checkIn: now.time - h, checkOut: now.time + h]]
+    app.apiSyncBookingByLock()
+}
+Map other41 = ['41': [id: '41', guest: 'Jo', code: '20000040', lockId: ['2'], checkIn: now.time - 2 * h, checkOut: now.time + 3 * h]]
+def shared = sharedReply(['20': [name: 'GT:ORB41-Jo', code: '20000040']], other41)
+check('200: another current booking with the same code shares its slot (#95)', shared.status == 200 && !shared.data.contains('20000040') && app.atomicState.bookings['40'] != null)
+check('200: shared, the same code reported as a number (#95)', sharedReply(['20': [name: 'GT:ORB41-Jo', code: 20000040]], other41).status == 200)
+check('409: that booking\'s slot when its own code differs (#95)', sharedReply(['20': [name: 'GT:ORB41-Jo', code: '20000040']], ['41': other41['41'] + [code: '20000041']]).status == 409)
+check('409: an outside code with the same PIN beside the shared slot (#95)', sharedReply(['20': [name: 'GT:ORB41-Jo', code: '20000040'], '21': [name: 'Front desk', code: '20000040']], other41).status == 409)
 check('409 sync: no code in any log line', !app.logged.any { l -> ['20000040', '1234567', '20000041'].any { l.contains(it) } })
 back.attrs.lockCodes = JsonOutput.toJson(backCodes)
 app.atomicState.bookings = [:]

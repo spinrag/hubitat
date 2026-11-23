@@ -1,7 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbAppVersion() { '1.4.19' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.20' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -134,6 +134,7 @@ def bookingsPage() {
             v.notes.each { paragraph it }
             paragraph '<small>From this hub\'s state and the locks\' last reported codes; reload the page to update. ' +
                 'A lock\'s codes are matched the way reconcile matches them: this app\'s prefix (or its previous prefix) + <code>ORB&lt;booking id&gt;</code>, or a slot the app assigned earlier. ' +
+                'Bookings on one lock with the same code share one slot, named for one of them. ' +
                 'Codes show only their last 2 digits.</small>'
         }
         section(title: '<h2>Known bookings</h2>') {
@@ -168,7 +169,7 @@ Map bookingsView() {
     // the lock reported none (reconcile skips such a lock too) or they can't be read.
     Map onLock = [:]
     (locks ?: []).each { lock ->
-        Map l = [name: bookingsEsc(lock.label ?: lock.name), codes: null, problem: 'no codes reported', strays: []]
+        Map l = [name: bookingsEsc(lock.label ?: lock.name), codes: null, problem: 'no codes reported', strays: [], shared: [:]]
         def raw = lock.currentValue('lockCodes', true)
         if (raw) {
             Map lockCodes = helperParseLockCodes(raw)
@@ -176,6 +177,14 @@ Map bookingsView() {
             else {
                 l.codes = helperOnlySbCodes(lockCodes, lock.id, true)
                 l.strays = helperStrayCodes(lockCodes, lock.id, l.codes)
+                // Current bookings covered by another booking's slot with the same code (#95)
+                String lockKey = lock.id.toString()
+                Map lockCurrent = known.findAll { key, b ->
+                    Date i = helperToDate(b.checkIn)
+                    Date o = helperToDate(b.checkOut)
+                    i && o && !now.before(i) && !now.after(o) && (b.lockId instanceof List ? b.lockId : [b.lockId]).any { "${it}" == lockKey }
+                }.collectEntries { key, b -> [("${b.id ?: key}".toString()): b] }
+                l.shared = helperSharedSlots(lock.id, l.codes, lockCurrent, lockCodes)
             }
         }
         onLock[lock.id.toString()] = l
@@ -200,11 +209,16 @@ Map bookingsView() {
             Map c = l.codes[id]
             if (c) {
                 String slot = "${l.name}: slot ${bookingsEsc(c.key)}"
+                // Also holds the code of current bookings with the same code (#95)
+                List covered = l.shared.findAll { k, holder -> "${holder}" == id }.collect { k, holder -> 'ORB' + bookingsEsc(k) }
+                if (status == 'current') return slot + (covered ? " (shared with ${covered.join(', ')}: same code)" : '')
+                if (covered) return slot + " (kept: shared with ${covered.join(', ')}, same code)"
                 // reconcile removes every code of a booking that isn't current
                 if (status == 'upcoming') return slot + ' (early: reconcile removes it until check-in)'
-                if (status == 'current') return slot
                 return slot + " &mdash; reconcile will remove it (${status == 'past' ? 'past checkout' : 'not current'})"
             }
+            Map shared = status == 'current' && l.shared[id] ? l.codes[l.shared[id]] : null
+            if (shared) return "${l.name}: slot ${bookingsEsc(shared.key)} (shared with ORB${bookingsEsc(l.shared[id])}: same code)"
             if (status == 'current') {
                 notOnLock++
                 return "${l.name}: ${bookingsMissing}"
@@ -226,7 +240,10 @@ Map bookingsView() {
             return
         }
         codesOnLocks += l.codes.size()
+        List sharing = l.shared.values().collect { it.toString() }
         l.codes.each { bookingId, c ->
+            // Kept for a current booking with the same code (#95)
+            if (sharing.contains(bookingId.toString())) return
             Map b = known[bookingId] ?: known.values().find { it.id?.toString() == bookingId }
             List lockIds = b ? (b.lockId instanceof List ? b.lockId : [b.lockId]).collect { it?.toString() } : []
             if (lockIds.contains(lockId)) return
@@ -575,38 +592,35 @@ void scheduleEvents(Map bookings) {
     // Keep track of scheduled times as we add them to avoid simultaneous executions of reconcileDoorCodes
     List schedules = []
 
-    // Schedule tasks
+    // Schedule tasks: reconcile adds new codes and removes old ones. Per lock: the check-out of
+    // every current booking and the earliest check-in still to come. Several bookings may be
+    // current on one lock, e.g. bookings with the same code sharing a slot (#95): the slot must
+    // go at the last check-out, and a booking that checks in during another's stay gets its code
     if (bookings) {
-        // Iterate through all bookings for each lock
-        // There's an assumption there can only be one active booking per lock
-        Map nextBooking = helperFindNextBooking(bookings)
+        Date now = new Date()
+        Map firstCheckIn = [:]
+        bookings.each { key, booking ->
+            // Ensure dates are Date objects (atomicState serialization loses types)
+            Date checkIn = helperToDate(booking.checkIn)
+            Date checkOut = helperToDate(booking.checkOut)
+            if (!checkIn || !checkOut) return
 
-        if (nextBooking) {
-            Date now = new Date()
-
-            // Schedule reconcileDoorCodes for next booking
-            // This will add new codes and remove old codes
-            nextBooking.each { lockId, booking ->
-
-                // Ensure dates are Date objects (atomicState serialization loses types)
-                Date checkIn = helperToDate(booking.checkIn)
-                Date checkOut = helperToDate(booking.checkOut)
-
-                if (!checkIn || !checkOut) return
-
-                // Only schedule check-in if its in the future
+            (booking.lockId instanceof List ? booking.lockId : [booking.lockId]).each { lockId ->
                 if (checkIn.after(now)) {
-                    if (!schedules.contains(checkIn)) {
-                        log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
-                        runOnce(checkIn, 'reconcileDoorCodes', [overwrite: false])
-                        schedules.add(checkIn)
-                    }
-                } else if (!schedules.contains(checkOut)) {
+                    String lockKey = "${lockId}"
+                    if (firstCheckIn[lockKey] == null || checkIn.before(firstCheckIn[lockKey].at)) firstCheckIn[lockKey] = [at: checkIn, booking: booking]
+                } else if (checkOut.after(now) && !schedules.contains(checkOut)) {
                     log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(booking)}"
                     runOnce(checkOut, 'reconcileDoorCodes', [overwrite: false])
                     schedules.add(checkOut)
                 }
             }
+        }
+        firstCheckIn.each { lockKey, next ->
+            if (schedules.contains(next.at)) return
+            log.debug "scheduleEvents: schedule reconcileDoorCodes for ${helperLogBooking(next.booking)}"
+            runOnce(next.at, 'reconcileDoorCodes', [overwrite: false])
+            schedules.add(next.at)
         }
     }
 
@@ -1064,9 +1078,16 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
         String holdWrites = reading ? 'is being read by a door code refresh'
             : (!lockCodes && !readEmpty.contains(lockKey) ? 'has not reported its codes' : null)
 
+        // Current bookings with the same code share one slot (#95): covered bookings get no write,
+        // and a slot that covers one stays, also after its own booking is no longer current
+        Map shared = helperSharedSlots(lock.id, sbCodes, currentLockBookings, lockCodes)
+        List sharedHolders = shared.values().collect { "${it}".toString() }
+
         // Remove all codes that are not in the current bookings
         sbCodes.each { bookingId, lockCode ->
-            if (!currentLockBookings[bookingId]) {
+            if (!currentLockBookings[bookingId] && sharedHolders.contains("${bookingId}".toString())) {
+                log.debug "reconcileDoorCodes: lock ${lock.id} pos ${lockCode.key} kept: a current booking with the same code shares it"
+            } else if (!currentLockBookings[bookingId]) {
                 int codePosition
 
                 // deleteCode has to be called with an integer
@@ -1104,6 +1125,24 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
 
             currentLockBookings.each { bookingId, booking ->
                 String codeName = helperGetCodeName(booking)
+
+                // Covered by the slot of another booking with the same code (#95): no write. A
+                // write of its own the lock hasn't confirmed (the lock refuses a code it already
+                // holds) is dropped, so it isn't re-sent
+                String sharedWith = shared["${bookingId}".toString()]
+                if (!sbCodes[bookingId] && sharedWith) {
+                    Map all = atomicState.codeAssignments ?: [:]
+                    Map mine = all[lockKey] ?: [:]
+                    List refused = mine.findAll { pos, a -> a instanceof Map && helperPendingSet(a) && "${a.bookingId ?: ''}".find(/\d+/) == "${bookingId}".toString() && !lockCodes[pos] && !lockCodes["${pos}"] }.collect { it.key }
+                    if (refused) {
+                        refused.each { mine.remove(it) }
+                        all[lockKey] = mine
+                        atomicState.codeAssignments = all
+                        log.info "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares ORB${sharedWith}'s slot; its own unconfirmed write is no longer sent"
+                    }
+                    log.debug "reconcileDoorCodes: lock ${lock.id}: ORB${bookingId} shares the slot of ORB${sharedWith} (same code)"
+                    return
+                }
 
                 // Is the booking missing from the list of codes
                 if (!sbCodes[bookingId]) {
@@ -1963,6 +2002,9 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
 
     String codeName = helperGetCodeName(booking)
     String pin = helperCodeText(booking.code)
+    // This app's slots on the lock, by slot: a slot shared with another booking with the same code is no duplicate (#95)
+    Map ownSlots = helperOnlySbCodes(lockCodes.collectEntries { k, v -> [k, v instanceof Map ? v + [:] : v] }, lockId, true).collectEntries { id, c -> [("${c.key}".toString()): id] }
+    Date now = new Date()
 
     // Compared as text, a reported code without its leading zeros counts; a hidden or
     // missing code is "can't tell", like an unreadable lock
@@ -1975,6 +2017,21 @@ boolean helperHasDuplicateCode(String lockId, Map booking, Map bookings = null) 
         // The booking's own code under an older name (prefix or guest name changed, or
         // lower-cased by the driver): its own ORB<id>, wherever it is in the name (#61)
         if (helperNameHasId(existing.name, booking.id)) return false
+
+        // This app's slot of another booking with the same code (#95): shared, not a duplicate,
+        // while both stays overlap or touch, or while this booking is current and that one is
+        // not (checked out, cancelled or moved: the slot stays for this booking)
+        String ownId = ownSlots["${k}".toString()]
+        if (ownId) {
+            Map other = bookings ? (bookings[ownId] ?: bookings.values().find { "${it.id}" == ownId }) : null
+            Date otherIn = helperToDate(other?.checkIn)
+            Date otherOut = helperToDate(other?.checkOut)
+            Date checkIn = helperToDate(booking.checkIn)
+            Date checkOut = helperToDate(booking.checkOut)
+            boolean otherCurrent = otherIn && otherOut && !otherIn.after(now) && !otherOut.before(now)
+            if (other && helperSameBookingCode(other.code, pin) && otherIn && otherOut && checkIn && checkOut && !otherOut.before(checkIn) && !otherIn.after(checkOut)) return false
+            if (!otherCurrent && checkIn && checkOut && !checkIn.after(now) && !checkOut.before(now)) return false
+        }
 
         if (existing.name?.toUpperCase()?.contains('ORB')) {
             // The other booking's id (bare digits, as SignalBricks keys bookings), ignoring
@@ -2033,6 +2090,68 @@ Map helperFindCurrentBookings(Map bookings) {
 
         return false
     }
+}
+
+// Two codes that are the same, compared as text: digits only, and a dropped leading zero
+// counts either way round (#95). Never log them
+boolean helperSameBookingCode(def a, def b) {
+    String x = helperCodeText(a)
+    String y = helperCodeText(b)
+    return helperCodeKnown(x) && helperCodeKnown(y) && (helperSameCode(x, y) || helperSameCode(y, x))
+}
+
+// Bookings with the same code share one slot on a lock (#95). For each current booking on the
+// lock with no slot of its own: the booking id whose slot (or write) covers it, [covered: holder].
+// Current bookings all overlap now, so a slot of this app that holds the code covers a current
+// booking with that code, also when the slot's booking checked out, was cancelled or moved:
+// the slot stays until the last of them checks out, and is never deleted and written again.
+// A current booking's slot holds its booking's code; another slot the code helperOnlySbCodes
+// gives it (tracked, or reported), else the code tracked there. A slot being deleted never
+// covers, nor one whose code is hidden and untracked. No slot holds the code yet: one write,
+// for the booking with a write pending, else the earliest check-in, then the lowest id.
+// Recomputed from the current bookings on every run; nothing is stored.
+Map helperSharedSlots(def lockId, Map sbCodes, Map currentLockBookings, Map lockCodes) {
+    Map lockAssignments = (atomicState.codeAssignments ?: [:])["${lockId}"] ?: [:]
+    Map current = currentLockBookings.collectEntries { k, b -> [("${b.id ?: k}".toString()): b] }
+    Closure bid = { a -> "${a?.bookingId ?: ''}".find(/\d+/) }
+
+    // The code each of this app's slots holds
+    Map slotCode = [:]
+    sbCodes.each { id, c ->
+        String sid = "${id}".toString()
+        Map a = lockAssignments["${c.key}"]
+        if (a?.deleting) return
+        if (current[sid]) {
+            slotCode[sid] = current[sid].code
+            return
+        }
+        slotCode[sid] = helperCodeKnown(c.code) ? c.code : (a && bid(a) == sid ? a.code : null)
+    }
+    Closure slotNumber = { s -> "${sbCodes[s].key}".isInteger() ? "${sbCodes[s].key}".toInteger() : Integer.MAX_VALUE }
+    List slots = slotCode.keySet().toList().sort { x, y -> ((current[x] ? 0 : 1) <=> (current[y] ? 0 : 1)) ?: (slotNumber(x) <=> slotNumber(y)) }
+
+    // Without a slot: no code of this app on the lock, and no tracked slot the lock confirmed
+    // (a partial lockCodes report hides it)
+    List open = current.keySet().toList().findAll { id ->
+        !sbCodes[id] && !lockAssignments.any { pos, a -> a instanceof Map && !a.deleting && a.confirmed != false && bid(a) == id && !lockCodes[pos] && !lockCodes["${pos}"] }
+    }
+    Map shared = [:]
+    open.each { id ->
+        String holder = slots.find { helperSameBookingCode(slotCode[it], current[id].code) }
+        if (holder) shared[id] = holder
+    }
+
+    // The rest: one write per code
+    Closure pending = { id -> helperTrackedEmptySlot(lockId, id, lockCodes) != null ? 0 : 1 }
+    Closure checkIn = { id -> helperToDate(current[id].checkIn)?.time ?: 0L }
+    Closure byId = { x, y -> x.isLong() && y.isLong() ? x.toLong() <=> y.toLong() : x <=> y }
+    List leaders = []
+    open.findAll { !shared[it] }.sort { x, y -> (pending(x) <=> pending(y)) ?: (checkIn(x) <=> checkIn(y)) ?: byId(x, y) }.each { id ->
+        String lead = leaders.find { helperSameBookingCode(current[it].code, current[id].code) }
+        if (lead) shared[id] = lead
+        else leaders << id
+    }
+    return shared
 }
 
 // Get only the SignalBricks codes based on code name beginning with the booking Id
