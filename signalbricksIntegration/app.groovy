@@ -1,7 +1,7 @@
 // Groovy scripts do not have constants, so we use functions instead
 // Functions that start with get can be referenced as variables,
 // i.e. "getFunctionName" can be referenced as "functionName"
-String getSbAppVersion() { '1.4.20' } // major.minor.patch[-prerelease]
+String getSbAppVersion() { '1.4.21' } // major.minor.patch[-prerelease]
 String getSbAppName() { 'SignalBricks Integration' }
 // Shown on the app page and in logs, e.g. "SignalBricks Integration 1.3.4" (#20).
 // API responses and headers keep the bare version.
@@ -387,6 +387,7 @@ void appButtonHandler(String btnName) {
             atomicState.bookings = [:]
             atomicState.codeAssignments = [:]
             atomicState.lockCodesReadEmpty = []
+            atomicState.lockCodesReadIncomplete = []
             atomicState.codeWritesDeferred = [:]
             atomicState.lockCodesUnreadable = []
             atomicState.codeDisplaced = [:]
@@ -524,6 +525,7 @@ void updated() {
         state.lastVersion = sbAppVersion
     }
     state.remove('sbId') // left by the registration removed in 1.4.17
+    codeReadEmptyRecheck()
 
     // Keep SignalBricks' copy of the URLs, version and token current
     if (state.sbCredential) sbRegister()
@@ -569,7 +571,27 @@ void sbResubscribeIfVersionChanged() {
     if (state.lastVersion == sbAppVersion) return
     state.lastVersion = sbAppVersion
     state.remove('sbId') // left by the registration removed in 1.4.17
+    codeReadEmptyRecheck()
     subscribeToEvents()
+}
+
+// Once, on the first run of 1.4.21: up to 1.4.20 a read that ran out of time could mark a
+// lock as having no codes. Drop that mark on locks that report no codes now; a read that
+// finishes marks them again.
+void codeReadEmptyRecheck() {
+    if (state.readEmptyRechecked) return
+    state.readEmptyRechecked = true
+    List readEmpty = atomicState.lockCodesReadEmpty ?: []
+    List keep = readEmpty.findAll { lockId ->
+        def lock = locks?.find { lock -> lock.id.toString() == lockId }
+        def raw = lock?.currentValue('lockCodes', true)
+        Map codes = raw ? helperParseLockCodes(raw) : null
+        !(lock && codes != null && codes.isEmpty())
+    }
+    if (keep.size() != readEmpty.size()) {
+        atomicState.lockCodesReadEmpty = keep
+        log.info "Door code refresh: ${readEmpty.size() - keep.size()} lock(s) with no codes will be read again before new codes are added"
+    }
 }
 
 // Setup scheduled tasks for all bookings
@@ -699,15 +721,18 @@ void sbScheduleAppInfo() {
 // midnight, so reads overlapped and Z-Wave timed out on every lock for hours.
 // Now locks are read one at a time (the same approach as our OwnerRez
 // coexistence work): the next lock starts once the current one has reported
-// lockCodes (counted only after 2.6 s per slot, at least 60 s, because large
-// locks send lockCodes mid-read; then 30 s with no further lockCodes to settle) or once its time budget (3 s per slot, 120 s to
-// 20 min) runs out. The run lives in atomicState.codeRefresh; every timer
-// carries the run id and lock index, so a timer from an earlier step or run
-// does nothing. Off by default: it runs only on the chosen cadence or when
+// lockCodes (counted only from 2.6 s per slot, at least 60 s, because large
+// locks send lockCodes mid-read; then 30 s with no further lockCodes and no other
+// activity to settle) or once its time budget (3 s per slot, 120 s to
+// 20 min) runs out. Only a settled read can show that a lock has no codes.
+// The run lives in atomicState.codeRefresh; every timer carries the run id and
+// lock index, so a timer from an earlier step or run does nothing. Off by default: it runs only on the chosen cadence or when
 // started from the app page.
 int getCodeRefreshStartDelaySec() { 60 }
 int getCodeRefreshSettleSec() { 30 }
 int getCodeRefreshGapSec() { 5 }
+// A settled read needs the lock quiet after its last lockCodes (a lock still reading shows activity per slot)
+int getCodeRefreshQuietSec() { 5 }
 // A run whose step is this long past its budget lost its timers (e.g. a reboot)
 int getCodeRefreshStaleSec() { 300 }
 
@@ -768,11 +793,18 @@ void codeRefreshNext(Map data) {
 
     def lock = locks?.find { lock -> lock.id.toString() == r.lockIds[index] }
     int slots = lock ? ((lock.currentValue('maxCodes') ?: 30) as int) : 0
+    // A read that starts from an empty or unreadable list and doesn't finish leaves a list
+    // that may be partial
+    def startRaw = lock ? lock.currentValue('lockCodes', true) : null
+    Map startCodes = lock ? helperParseLockCodes(startRaw) : null
     r.index = index
     r.stepAt = now()
     r.budgetSec = codeRefreshBudgetSec(slots)
     r.floorSec = codeRefreshFloorSec(slots)
-    r.answered = false
+    r.startEmpty = startCodes == null || startCodes.isEmpty()
+    r.startReadEmpty = startRaw && startCodes != null && startCodes.isEmpty()
+    r.lockCodesAt = null
+    r.settleAt = null
     atomicState.codeRefresh = r
 
     if (!lock) {
@@ -783,27 +815,61 @@ void codeRefreshNext(Map data) {
 
     log.info "Door code refresh: reading lock ${index + 1} of ${total} (${lock.label ?: lock.name}), up to ${r.budgetSec} s"
     runIn(r.budgetSec, 'codeRefreshTimeout', [overwrite: true, data: [runId: r.runId, index: index]])
+    runIn(r.floorSec, 'codeRefreshFloor', [overwrite: true, data: [runId: r.runId, index: index]])
     // Varies by lock driver, but this can iterate through all code positions over z-wave/zigbee and can take a while
     lock.getCodes()
 }
 
-// lockCodes from the lock being read: done once past its floor, after a settle period
+// lockCodes from the lock being read: done once past its floor, after a settle period.
+// Some drivers send lockCodes while still walking the slots, so an earlier one only
+// counts at the floor; fast drivers send their last one before the floor.
 void codeRefreshOnLockCodes(e) {
     Map r = atomicState.codeRefresh
     if (!r || (r.index as int) < 0) return
     int index = r.index as int
     if (index >= r.lockIds.size() || r.lockIds[index] != e.deviceId?.toString()) return
-    codeRefreshAnswered()
-    // Some drivers send lockCodes while still walking the slots; ignore early ones
-    if (now() - (r.stepAt as long) < (r.floorSec as long) * 1000L) return
+    r.lockCodesAt = now()
+    boolean pastFloor = now() - (r.stepAt as long) >= (r.floorSec as long) * 1000L
+    if (pastFloor) r.settleAt = now() + codeRefreshSettleSec * 1000L
+    atomicState.codeRefresh = r
+    if (pastFloor) runIn(codeRefreshSettleSec, 'codeRefreshSettled', [overwrite: true, data: [runId: r.runId, index: index]])
+}
 
-    runIn(codeRefreshSettleSec, 'codeRefreshSettled', [overwrite: true, data: [runId: r.runId, index: index]])
+// The floor passed: a lockCodes that came earlier starts the settle period now
+void codeRefreshFloor(Map data) {
+    Map r = atomicState.codeRefresh
+    if (!codeRefreshIsCurrent(r, data, data?.index as int) || r.lockCodesAt == null || r.settleAt != null) return
+    r.settleAt = now() + codeRefreshSettleSec * 1000L
+    atomicState.codeRefresh = r
+    runIn(codeRefreshSettleSec, 'codeRefreshSettled', [overwrite: true, data: [runId: r.runId, index: data.index]])
 }
 
 void codeRefreshSettled(Map data) {
-    if (!codeRefreshIsCurrent(atomicState.codeRefresh, data, data?.index as int)) return
+    Map r = atomicState.codeRefresh
+    if (!codeRefreshIsCurrent(r, data, data?.index as int) || r.lockCodesAt == null) return
+    // Activity well after the last lockCodes: the lock is still reading (or stopped mid-read),
+    // so this list may be partial. Wait for the next lockCodes or the time budget.
+    def lock = locks?.find { lock -> lock.id.toString() == r.lockIds[data.index as int] }
+    Long last = lock ? codeRefreshLastActivity(lock) : null
+    if (last != null && last > (r.lockCodesAt as long) + codeRefreshQuietSec * 1000L) {
+        log.info "Door code refresh: lock ${(data.index as int) + 1} still active after its last code list, waiting"
+        r.settleAt = null
+        atomicState.codeRefresh = r
+        return
+    }
     log.info "Door code refresh: lock ${(data.index as int) + 1} read"
-    codeRefreshAdvance(data)
+    codeRefreshAdvance(data, true)
+}
+
+// The lock's last activity in ms, or null when the hub doesn't give it
+Long codeRefreshLastActivity(lock) {
+    try {
+        def last = lock.getLastActivity()
+        return last instanceof Date ? last.time : (last instanceof Number ? last.longValue() : null)
+    } catch (e) {
+        log.debug "codeRefreshLastActivity: lock ${lock.id} last activity not available (${e.class.simpleName})"
+        return null
+    }
 }
 
 void codeRefreshTimeout(Map data) {
@@ -812,46 +878,56 @@ void codeRefreshTimeout(Map data) {
     codeRefreshAdvance(data)
 }
 
-void codeRefreshAdvance(Map data) {
+void codeRefreshAdvance(Map data, boolean settled = false) {
     Map r = atomicState.codeRefresh
-    if (!codeRefreshIsCurrent(r, data, data?.index as int)) return
-    codeRefreshLockDone(r.lockIds[data.index as int], r.answered == true, r.stepAt as long)
+    int index = data?.index as int
+    if (!codeRefreshIsCurrent(r, data, index)) return
+    // A step ends once: a budget timer firing in the gap after a settled read does nothing
+    if (r.endedIndex != null && (r.endedIndex as int) == index) return
+    r.endedIndex = index
+    atomicState.codeRefresh = r
+    unschedule('codeRefreshFloor')
+    // A settled {} counts only if the lock itself talked to the hub during the step
+    // (a driver can publish {} when the read starts, also for a lock that is offline)
+    boolean heard = false
+    if (settled) {
+        def lock = locks?.find { lock -> lock.id.toString() == r.lockIds[index] }
+        Long last = lock ? codeRefreshLastActivity(lock) : null
+        heard = last != null && last >= (r.stepAt as long)
+    }
+    codeRefreshLockDone(r.lockIds[index], settled, r.startEmpty == true, r.startReadEmpty == true, heard)
     runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: (r.index as int) + 1]])
 }
 
-// The lock being read sent lockCodes or codeChanged during this step
-void codeRefreshAnswered() {
-    // Re-read so only the flag is set on the current step, never an older copy written back
-    Map r = atomicState.codeRefresh
-    if (!r || r.answered) return
-    r.answered = true
-    atomicState.codeRefresh = r
-}
-
-// A read of this lock ended (settled or out of time). Remember whether it answered and
-// reported no codes: reconcile writes to a lock with an empty lockCodes only after such a
-// read (#55). A lock that never answered stays unmarked. Reconcile is run again for locks
-// whose writes it deferred.
-void codeRefreshLockDone(String lockId, boolean answered, long stepAt) {
+// A read of this lock ended (settled or out of time). Remember whether it settled with no
+// codes: reconcile writes to a lock with an empty lockCodes only after such a read (#55).
+// A read that ran out of time proves nothing: a lock read empty before that reported no
+// codes at the start and still does keeps its mark; one whose read started from an empty or unreadable list, or
+// that ends with no codes, holds its writes until a read settles. Reconcile is run again
+// for locks whose writes it deferred.
+void codeRefreshLockDone(String lockId, boolean settled = false, boolean startEmpty = false, boolean startReadEmpty = false, boolean heard = false) {
     def lock = locks?.find { lock -> lock.id.toString() == lockId }
     if (!lock) return
-    // An empty lock re-reporting {} sends no event (the value is unchanged), but the lock
-    // still talked to the hub during the step; an offline lock shows no such activity
-    if (!answered) {
-        try {
-            def last = lock.getLastActivity()
-            long at = last instanceof Date ? last.time : (last instanceof Number ? last.longValue() : 0L)
-            answered = at >= stepAt
-        } catch (e) {
-            log.debug "codeRefreshLockDone: lock ${lockId} last activity not available (${e.class.simpleName})"
-        }
-    }
     def raw = lock.currentValue('lockCodes', true)
-    List readEmpty = (atomicState.lockCodesReadEmpty ?: []).findAll { it != lockId }
     // Unreadable lockCodes (null) is not empty: the lock stays unmarked (#57)
     Map lockCodes = helperParseLockCodes(raw)
-    if (answered && raw && lockCodes != null && lockCodes.isEmpty()) readEmpty << lockId
+    boolean endEmpty = raw && lockCodes != null && lockCodes.isEmpty()
+    // An empty list from a lock not heard from during the step proves nothing either
+    if (settled && endEmpty && !heard) settled = false
+    List readEmptyBefore = atomicState.lockCodesReadEmpty ?: []
+    List incompleteBefore = atomicState.lockCodesReadIncomplete ?: []
+    List readEmpty = readEmptyBefore.findAll { it != lockId }
+    List incomplete = incompleteBefore.findAll { it != lockId }
+    if (settled) {
+        if (endEmpty) readEmpty << lockId
+    } else if (endEmpty && startReadEmpty && readEmptyBefore.contains(lockId) && !incompleteBefore.contains(lockId)) {
+        readEmpty << lockId
+    } else if (startEmpty || incompleteBefore.contains(lockId) || lockCodes == null || lockCodes.isEmpty()) {
+        incomplete << lockId
+        log.warn "Door code refresh: ${lock.label ?: lock.name} did not finish reading its codes; its new codes stay on hold until a read finishes"
+    }
     atomicState.lockCodesReadEmpty = readEmpty
+    atomicState.lockCodesReadIncomplete = incomplete
     // Readable again after reconcile skipped it: reconcile soon, not at the next sync (#57)
     List unreadable = atomicState.lockCodesUnreadable ?: []
     if (lockCodes != null && unreadable.contains(lockId)) {
@@ -900,10 +976,24 @@ void codeRefreshRearm() {
 
     long left = (r.budgetSec as long) - (long) ((now() - (r.stepAt as long)) / 1000)
     int index = r.index as int
+    Map data = [runId: r.runId, index: index]
     if (index < 0) {
         runIn(Math.max(left, 5L), 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: 0]])
-    } else {
-        runIn(Math.max(left, 5L), 'codeRefreshTimeout', [overwrite: true, data: [runId: r.runId, index: index]])
+        return
+    }
+    if (r.endedIndex != null && (r.endedIndex as int) == index) {
+        // In the gap after the step ended
+        runIn(codeRefreshGapSec, 'codeRefreshNext', [overwrite: true, data: [runId: r.runId, index: index + 1]])
+        return
+    }
+    runIn(Math.max(left, 5L), 'codeRefreshTimeout', [overwrite: true, data: data])
+    long floorLeft = (r.floorSec as long) - (long) ((now() - (r.stepAt as long)) / 1000)
+    if (floorLeft > 0) {
+        runIn(floorLeft, 'codeRefreshFloor', [overwrite: true, data: data])
+    } else if (r.settleAt != null) {
+        runIn(Math.max((long) (((r.settleAt as long) - now()) / 1000), 1L), 'codeRefreshSettled', [overwrite: true, data: data])
+    } else if (r.lockCodesAt != null) {
+        runIn(1, 'codeRefreshFloor', [overwrite: true, data: data])
     }
 }
 
@@ -1067,15 +1157,18 @@ void reconcileDoorCodes(Map bookings, boolean rewriteUnknown = false) {
         // this app's codes keeps getting codes after its last one is deleted at checkout.
         String lockKey = "${lock.id}"
         boolean reading = codeRefreshReading(lock.id)
+        // A read that started from an empty or unreadable list didn't finish: the list may be partial
+        boolean readIncomplete = (atomicState.lockCodesReadIncomplete ?: []).contains(lockKey)
         List readEmpty = atomicState.lockCodesReadEmpty ?: []
         if (lockCodes.size() > sbCodes.size() && readEmpty.contains(lockKey)) {
             readEmpty = readEmpty.findAll { it != lockKey }
             atomicState.lockCodesReadEmpty = readEmpty
-        } else if (!reading && lockCodes && lockCodes.size() == sbCodes.size() && !readEmpty.contains(lockKey)) {
+        } else if (!reading && !readIncomplete && lockCodes && lockCodes.size() == sbCodes.size() && !readEmpty.contains(lockKey)) {
             readEmpty = readEmpty + [lockKey]
             atomicState.lockCodesReadEmpty = readEmpty
         }
         String holdWrites = reading ? 'is being read by a door code refresh'
+            : readIncomplete ? 'has not finished a read of its codes'
             : (!lockCodes && !readEmpty.contains(lockKey) ? 'has not reported its codes' : null)
 
         // Current bookings with the same code share one slot (#95): covered bookings get no write,
@@ -1488,7 +1581,6 @@ void lockCodesHandler(e) {
 }
 
 void codeChangedHandler(e) {
-    if (codeRefreshReading(e.device?.id)) codeRefreshAnswered()
     // Verify our tracked assignments against what the lock confirmed
     try {
         // Encrypted like lockCodes on drivers with lock code encryption on (#57). The slot is
