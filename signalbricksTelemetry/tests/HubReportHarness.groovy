@@ -7,7 +7,9 @@
 // from docs/hub-reporting.md (tests/fixtures). Locks report counts only: no code,
 // code name, guest name or token in the body or any log line; encrypted and plain
 // lockCodes are counted, labels truncated, string attributes coerced; failed
-// posts are retried like registrations; the 64 KB limit is respected.
+// posts are retried like registrations; the 64 KB limit is respected. Device
+// states (signalbricks/platform#1533): subscribed, allow-listed attributes only,
+// no names, at most 200 by device id, added last within the byte cap.
 // Fake values only; nothing is sent to a hub or to SignalBricks.
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -116,6 +118,15 @@ class FakeLock {
     Boolean hasCapability(String c) { caps.contains(c) }
     Map attrs = [:]
     def currentValue(String a, Boolean skipCache = false) { attrs[a] }
+    Boolean hasAttribute(String a) { attrs.containsKey(a) }
+    Date lastActivity = null
+    Date getLastActivity() { lastActivity }
+}
+
+// A selection that can't be read: iterating it throws
+class UnreadableList extends ArrayList {
+    UnreadableList() { super([new FakeLock(id: '1')]) }
+    Iterator iterator() { throw new IllegalStateException('unreadable 24681357') }
 }
 
 // A device the app can't read: reportLock throws
@@ -158,6 +169,15 @@ Map LOCK_RULES = [deviceId: str(32), name: str(64), battery: { v -> isNum(v) && 
     lock: { v -> v instanceof String && v.trim().toLowerCase() in ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed'] },
     jammed: bool, maxCodes: intIn(0, 1000), codeLength: intIn(0, 32), driver: str(64), occupiedSlots: intIn(0, 1000),
     managed: bool, codeLock: bool]
+// devices[]: the platform's HUB_REPORT_DEVICE_ATTRIBUTES and forbidden-name rule
+def numIn = { BigDecimal min, BigDecimal max -> { v -> isNum(v) && (v as BigDecimal) >= min && (v as BigDecimal) <= max } }
+def word = { List words -> { v -> v instanceof String && v.trim().toLowerCase() in words } }
+Map DEVICE_ATTR_RULES = [battery: numIn(0, 100), temperature: numIn(-100, 300), humidity: numIn(0, 100), illuminance: numIn(0, 1000000),
+    contact: word(['open', 'closed']), motion: word(['active', 'inactive']), acceleration: word(['active', 'inactive']), water: word(['wet', 'dry']),
+    smoke: word(['clear', 'detected', 'tested']), carbonMonoxide: word(['clear', 'detected', 'tested']), tamper: word(['clear', 'detected']),
+    presence: word(['present', 'not present']), switch: word(['on', 'off']),
+    lock: word(['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed'])]
+def FORBIDDEN_ATTR = ~/(?i)code|pin|passw|token|secret|name|user|guest/
 Map TELEMETRY_RULES = [version: str(32), maxManagedSlot: intIn(0, 1000)]
 Map HUB_RULES = [firmwareVersion: str(32), uptimeSec: { v -> isInt(v) && (v as long) >= 0 }, timeZone: str(64)]
 def validateObject = { String where, def obj, Map rules, List errors ->
@@ -170,7 +190,7 @@ def validateObject = { String where, def obj, Map rules, List errors ->
 def validateReport = { def r ->
     List errors = []
     if (!(r instanceof Map)) return ['not an object']
-    Set top = ['schemaVersion', 'sentAt', 'reason', 'telemetry', 'apps', 'hub', 'locks'] as Set
+    Set top = ['schemaVersion', 'sentAt', 'reason', 'telemetry', 'apps', 'hub', 'locks', 'devices'] as Set
     r.keySet().findAll { !(it in top) }.each { errors << "${it}: not in the schema" }
     if (r.containsKey('schemaVersion') && !intIn(1, 1000)(r.schemaVersion)) errors << 'schemaVersion'
     if (r.containsKey('sentAt') && !epochMs(r.sentAt)) errors << 'sentAt'
@@ -184,6 +204,21 @@ def validateReport = { def r ->
     if (r.containsKey('locks')) {
         if (!(r.locks instanceof List) || r.locks.size() > 200) errors << 'locks: not a list of at most 200'
         else r.locks.eachWithIndex { l, i -> validateObject("locks[${i}]", l, LOCK_RULES, errors) }
+    }
+    if (r.containsKey('devices')) {
+        if (!(r.devices instanceof List) || r.devices.size() > 200) errors << 'devices: not a list of at most 200'
+        else {
+            if (r.devices*.deviceId.unique(false).size() != r.devices.size()) errors << 'devices: a device id twice'
+            r.devices.eachWithIndex { d, i ->
+                validateObject("devices[${i}]", d, [deviceId: { v -> v instanceof String && v ==~ /[0-9]{1,20}/ }, lastActivity: epochMs,
+                    attributes: { v -> v instanceof Map && !v.isEmpty() }], errors)
+                if (!(d instanceof Map) || !d.containsKey('deviceId') || !d.containsKey('lastActivity') || !d.containsKey('attributes')) errors << "devices[${i}]: missing a field"
+                if (d instanceof Map && d.attributes instanceof Map) {
+                    d.attributes.keySet().findAll { (it =~ FORBIDDEN_ATTR).find() }.each { errors << "devices[${i}].attributes.${it}: forbidden" }
+                    validateObject("devices[${i}].attributes", d.attributes, DEVICE_ATTR_RULES, errors)
+                }
+            }
+        }
     }
     return errors
 }
@@ -199,7 +234,7 @@ check('doc example app info validates', appInfoErrors.isEmpty())
 List bad = validateReport(docReport + [extra: 1, locks: [[deviceId: '1', battery: '85', lockCodes: '{}']]])
 check('validator rejects extra keys and string numbers', bad.size() == 3)
 
-check('version is 1.9.4', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.4')
+check('version is 1.9.5', app.appNameAndVersion() == 'SignalBricks Telemetry 1.9.5')
 
 // --- Fake hub: connected, two booking apps, locks with codes ---
 String INGEST = 'sbit_fakeingesttokenfakeingesttoken00'
@@ -210,15 +245,25 @@ def codeMap = { int n -> (1..n).collectEntries { i -> [(String.valueOf(25 + i)):
 String plain12 = JsonOutput.toJson(codeMap(12))
 String enc3 = 'ENC:' + JsonOutput.toJson(codeMap(3)).bytes.encodeBase64().toString()
 String longLabel = 'Back door ' + ('x' * 70)
-def front = new FakeLock(id: '57', displayName: 'Front door', typeName: 'Generic Z-Wave Plus Lock',
-    attrs: [battery: '85', lock: 'locked', maxCodes: '250', codeLength: '4', lockCodes: plain12])
-def back = new FakeLock(id: '58', displayName: longLabel, typeName: 'Schlage BE469',
+// The front door also has attributes devices[] must never carry: code ones, and a
+// temperature Telemetry doesn't subscribe to on a lock
+def front = new FakeLock(id: '57', displayName: 'Front door', typeName: 'Generic Z-Wave Plus Lock', lastActivity: new Date(1_793_317_000_000L),
+    attrs: [battery: '85', lock: 'locked', maxCodes: '250', codeLength: '4', lockCodes: plain12, lastCodeName: "G: ORB101-${GUESTS[0]}".toString(),
+        codeChanged: "added ${CODES[0]}".toString(), temperature: 70, userName: GUESTS[1]])
+def back = new FakeLock(id: '58', displayName: longLabel, typeName: 'Schlage BE469', lastActivity: new Date(1_793_300_000_000L),
     attrs: [battery: 15.5, lock: 'Jammed', maxCodes: '30.0', codeLength: 6, lockCodes: enc3])
+// A contact and temperature sensor, as in the doc's devices[] example
+def door = new FakeLock(id: '63', displayName: 'Patio door', typeName: 'Generic Zigbee Contact Sensor', caps: ['ContactSensor', 'TemperatureMeasurement', 'Battery'],
+    lastActivity: new Date(1_793_310_000_000L), attrs: [contact: 'closed', battery: '92', temperature: '68.5', humidity: 40, illuminance: 'dim'])
+// Never active: no lastActivity, so no device state
+def idle = new FakeLock(id: '64', displayName: 'Idle sensor', typeName: 'Z', caps: ['ContactSensor'], attrs: [contact: 'open'])
 def odd = new FakeLock(id: '59', displayName: 'Shed', typeName: null,
     attrs: [battery: 'n/a', lock: 'weird', maxCodes: 'lots', lockCodes: 'not json'])
 def side = new FakeLock(id: '60', displayName: 'Side door', typeName: 'Kwikset 916', attrs: [lock: 'unlocked with timeout', lockCodes: '{}'])
 app.locks = [front, back, odd]
 app.codeLocks = [front, side]
+app.contactSensors = [door, idle]
+app.temperatureSensors = [door]
 app.maxManagedSlot = '25'
 app.state.sbToken = INGEST
 app.state.ingestUrl = 'https://ingest.example.invalid/v1/webhooks/hubitat'
@@ -295,7 +340,7 @@ check('daily: other booking app field names match the doc', r.apps.find { it.app
 check('daily: Integration app field names match the doc', r.apps.find { it.appId == '388' }.keySet() == docReport.apps[1].keySet())
 check('daily: full lock entry field names match the doc', r.locks.find { it.deviceId == '57' }.keySet() == docReport.locks[0].keySet())
 check('daily: schemaVersion 1, sentAt now, reason daily', r.schemaVersion == 1 && r.sentAt == app.clock && r.reason == 'daily')
-check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.9.4', maxManagedSlot: 25])
+check('daily: telemetry version and ceiling as a number', r.telemetry == [version: '1.9.5', maxManagedSlot: 25])
 check('daily: hub firmware, uptime, time zone', r.hub == [firmwareVersion: '2.4.3.152', uptimeSec: 864000, timeZone: 'America/New_York'])
 check('daily: apps as collected, with lastSeenAt', r.apps.find { it.appId == '412' } == docReport.apps[0] && r.apps.find { it.appId == '388' } == docReport.apps[1].findAll { k, v -> k != 'version' } + [version: '1.4.6'])
 // The doc's example rebuilt from this fake hub: same apps, the same front door
@@ -316,6 +361,26 @@ check('codeLock: every selected keypad lock is managed and a code lock', r.locks
 check('codeLock: the locks flagged are exactly codeLockDevices()', r.locks.findAll { it.codeLock }*.deviceId == app.codeLockDevices()*.id)
 check('locks: counts only, no slot or code keys', !allKeys(r.locks).any { it in ['code', 'codes', 'lockCodes', 'codeName', 'slots', 'pin'] || it ==~ /\d+/ })
 
+// --- Device states (signalbricks/platform#1533) ---
+Map dv = r.devices.collectEntries { [(it.deviceId): it] }
+check('devices: entry field names match the doc', r.devices.every { it.keySet() == docReport.devices[0].keySet() })
+check('devices: one per subscribed device with a last activity, by device id', r.devices*.deviceId == ['57', '58', '63'])
+check('devices: front door entry equals the doc example', dv['57'] == docReport.devices[0])
+check('devices: sensor entry equals the doc example (numbers coerced, unsubscribed humidity and illuminance left out)', dv['63'] == docReport.devices[1])
+check('devices: lastActivity is epoch ms', dv['58'].lastActivity == 1_793_300_000_000L && dv['58'].lastActivity instanceof Number)
+check('devices: words sent as the attribute gives them', dv['58'].attributes == [battery: 15.5, lock: 'Jammed'])
+check('devices: no code, PIN, user or name attribute, and only allow-listed names', r.devices.every { d ->
+    !d.attributes.keySet().any { (it =~ FORBIDDEN_ATTR).find() } && DEVICE_ATTR_RULES.keySet().containsAll(d.attributes.keySet()) })
+check('devices: a lock\'s temperature (not subscribed) left out', !dv['57'].attributes.containsKey('temperature'))
+check('devices: no device name or label', !allKeys(r.devices).any { it in ['name', 'label', 'displayName'] } &&
+    !JsonOutput.toJson(r.devices).contains('Front door') && !JsonOutput.toJson(r.devices).contains('Patio door'))
+// The attributes reported are the ones subscribeToEvents() subscribed to
+Map subscribedByStub = [:]
+app.subscriptions.findAll { !it.target.is(app.location) }.each { sub ->
+    (sub.target instanceof Collection ? sub.target : [sub.target]).each { d -> (subscribedByStub[d.id.toString()] = (subscribedByStub[d.id.toString()] ?: [] as Set)) << sub.attribute }
+}
+check('devices: subscribedAttributes() matches what subscribeToEvents() subscribed', app.subscribedAttributes().collectEntries { k, v -> [(k): v.attrs] } == subscribedByStub)
+
 // --- Nothing secret in the body or the log ---
 String raw = post.params.body
 check('secret: no door code in the body', !CODES.any { raw.contains(it) })
@@ -328,13 +393,13 @@ app.posts.clear()
 3.times { app.clock += 24L * 3600 * 1000; app.dailyCheckIn() }
 check('daily: a report every day, version unchanged', reports().size() == 3 && reports().every { bodyOf(it).reason == 'daily' })
 check('daily: no registration on a telemetry-only hub', !app.posts.any { it.cb == 'registerCallback' })
-check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.9.4'] })
+check('lock code management off: telemetry has no maxManagedSlot', reports().every { bodyOf(it).telemetry == [version: '1.9.5'] })
 app.maxManagedSlot = '40'
 app.posts.clear(); app.dailyCheckIn()
-check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.4'] && validateReport(lastReport()).isEmpty())
+check('lock code management off: no ceiling even when the setting has one', lastReport().telemetry == [version: '1.9.5'] && validateReport(lastReport()).isEmpty())
 app.lockManagementEnabled = true
 app.posts.clear(); app.dailyCheckIn()
-check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.4'])
+check('door code management ticked, no Done yet: no ceiling', lastReport().telemetry == [version: '1.9.5'])
 app.lockManagementEnabled = false
 app.maxManagedSlot = '25'
 
@@ -445,7 +510,7 @@ app.dailyCheckIn()
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 400, body: ''), [reason: 'daily'])
 check('400: not retried', retryJob() == null)
-check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.9.4')
+check('400: version recorded, so the HPM-update path stops resending', app.state.reportedVersion == '1.9.5')
 app.state.reportedVersion = '1.5.3'
 app.reportCallback(new FakeResp(status: 503, body: ''), [reason: 'daily'])
 check('503: version not recorded (retried instead)', app.state.reportedVersion == '1.5.3')
@@ -457,7 +522,7 @@ app.dailyCheckIn()
 app.reportCallback(new FakeResp(status: 408, body: ''), [reason: 'daily'])
 check('408 (timeout): retried', retryJob()?.secs == 30)
 app.reportCallback(new FakeResp(status: 202, body: '{"received":true}'), [reason: 'daily'])
-check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.9.4' && app.state.lastReportError == null)
+check('202: retry cleared, sent time and version recorded', retryJob() == null && app.state.reportRetry == null && app.state.lastReportAt == app.clock && app.state.reportedVersion == '1.9.5' && app.state.lastReportError == null)
 check('page: last sent shown', app.reportStatus()?.contains('last sent'))
 app.throwOnPost = true
 app.sendHubReport('daily')
@@ -502,6 +567,8 @@ check('apps: not seen for 7 days dropped', lastReport().apps*.appId == ['388'])
 // writes non-ASCII as \\uXXXX escapes (6 bytes a character), so the body is ASCII;
 // the guard counts UTF-8 bytes either way ---
 check('size: utf8Length counts bytes, not characters', app.utf8Length('\u00e9\u4e2d') == 5)
+app.contactSensors = null
+app.temperatureSensors = null
 List many = (1..230).collect { i -> new FakeLock(id: "${100000 + i}".toString(), displayName: ('é中' * 40), typeName: ('ü' * 70),
     attrs: [battery: '100', lock: 'unlocked with timeout', maxCodes: '1000', codeLength: '32', lockCodes: plain12]) }
 app.locks = many
@@ -514,11 +581,77 @@ check("size: body under 64 KB (${bigBody.getBytes('UTF-8').length} bytes)", bigB
 check('size: non-ASCII names escaped, so the body is ASCII', bigBody.getBytes('UTF-8').length == bigBody.length() && bigBody.contains('\\u00e9'))
 check("size: locks left out from the end (${big.locks.size()} of 200)", big.locks.size() > 50 && big.locks.size() < 200 && big.locks[0].deviceId == '100001')
 check('size: still valid, and the trimming is logged', validateReport(big).isEmpty() && app.logged.any { it.contains('hub report too large') })
-// Small locks: the size limit isn't reached, the 200-lock cap is
-app.locks = (1..230).collect { i -> new FakeLock(id: "${i}".toString(), displayName: "L${i}".toString(), typeName: 'Z', attrs: [battery: 90]) }
+// The same hub with every device active: the locks come first, device states fill what's left
+many.each { it.lastActivity = new Date(1_793_317_000_000L) }
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+String fullBody = reports()[-1].params.body
+Map full = new JsonSlurper().parseText(fullBody)
+check("size: with device states, body still under 64 KB (${fullBody.getBytes('UTF-8').length} bytes)", fullBody.getBytes('UTF-8').length <= 60000)
+check('size: device states never push a lock out', full.locks == big.locks)
+check("size: device states added in id order while they fit (${full.devices?.size()} of 200)", full.devices && full.devices.size() < 200 &&
+    full.devices*.deviceId == (1..full.devices.size()).collect { "${100000 + it}".toString() })
+check('size: one more device state would cross the cap', fullBody.getBytes('UTF-8').length + 1 + JsonOutput.toJson(app.reportDevices()[full.devices.size()]).length() > 60000)
+check('size: still valid, and the device trimming is logged', validateReport(full).isEmpty() &&
+    app.logged.any { it.contains("sending ${full.devices.size()} of 200 device states") })
+// Small locks: the size limit isn't reached, the 200-lock and 200-device caps are
+app.locks = (1..230).collect { i -> new FakeLock(id: "${i}".toString(), displayName: "L${i}".toString(), typeName: 'Z', attrs: [battery: 90], lastActivity: new Date(1_793_317_000_000L + i)) }
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+Map small = new JsonSlurper().parseText(reports()[-1].params.body)
+check('locks: at most 200, the first selected', small.locks.size() == 200 && small.locks[-1].deviceId == '200')
+check('devices: at most 200, the first 200 by numeric device id', small.devices.size() == 200 && small.devices*.deviceId == (1..200).collect { "${it}".toString() })
+check("devices: capped report valid, nothing logged as too large (${validateReport(small)})", validateReport(small).isEmpty() && !app.logged.any { it.contains('too large') })
+// Ids are sorted as numbers, whatever order they were selected in
+app.locks = ['1000', '9', '20'].collect { new FakeLock(id: it, displayName: 'L', typeName: 'Z', attrs: [lock: 'locked'], lastActivity: new Date(1_793_317_000_000L)) }
 app.posts.clear()
 app.dailyCheckIn()
-check('locks: at most 200, the first selected', { Map b = new JsonSlurper().parseText(reports()[-1].params.body); b.locks.size() == 200 && b.locks[-1].deviceId == '200' }())
+check('devices: sorted by numeric id', lastReport().devices*.deviceId == ['9', '20', '1000'])
+// A hub with no selected devices: no devices[], report still valid
+app.locks = []
+app.posts.clear()
+app.dailyCheckIn()
+check("devices: none selected, no devices field, report valid (${validateReport(lastReport())})", reports().size() == 1 && !lastReport().containsKey('devices') && validateReport(lastReport()).isEmpty())
+// Selected devices that were never active, or have no allow-listed value: no devices[]
+app.locks = [new FakeLock(id: '5', displayName: 'Quiet', typeName: 'Z', attrs: [lock: 'locked'])]
+app.contactSensors = [new FakeLock(id: '6', displayName: 'Empty', typeName: 'Z', attrs: [contact: null, lockCodes: plain12], lastActivity: new Date(1_793_317_000_000L))]
+app.posts.clear()
+app.dailyCheckIn()
+check('devices: no last activity or no value, no devices field', !lastReport().containsKey('devices') && lastReport().locks*.deviceId == ['5'])
+// An unreadable device is left out; the others are still sent
+app.locks = [new UnreadableLock(id: '7', displayName: 'Broken', typeName: 'Z', lastActivity: new Date(1_793_317_000_000L)),
+    new FakeLock(id: '8', displayName: 'Fine', typeName: 'Z', attrs: [lock: 'unlocked'], lastActivity: new Date(1_793_317_000_000L))]
+app.contactSensors = null
+app.posts.clear()
+app.dailyCheckIn()
+check('devices: unreadable device left out, report still sent', lastReport().devices == [[deviceId: '8', lastActivity: 1_793_317_000_000L, attributes: [lock: 'unlocked']]])
+// Words: only the platform's, trimmed; a longer or unknown value is left out
+app.locks = [new FakeLock(id: '9', displayName: 'L', typeName: 'Z', attrs: [lock: ' Locked ', battery: 50], lastActivity: new Date(1_793_317_000_000L)),
+    new FakeLock(id: '10', displayName: 'L', typeName: 'Z', attrs: [lock: 'locked' + (' ' * 30) + 'x', battery: 40], lastActivity: new Date(1_793_317_000_000L)),
+    new FakeLock(id: '11', displayName: 'L', typeName: 'Z', attrs: [lock: 'x' * 40], lastActivity: new Date(1_793_317_000_000L))]
+app.contactSensors = [new FakeLock(id: '12', displayName: 'S', typeName: 'Z', attrs: [contact: 'ajar', battery: 30], lastActivity: new Date(1_793_317_000_000L))]
+app.posts.clear()
+app.dailyCheckIn()
+check("devices: words checked against the platform's lists (${lastReport().devices})", lastReport().devices*.attributes == [[battery: 50, lock: 'Locked'], [battery: 40], [battery: 30]] &&
+    validateReport(lastReport()).isEmpty())
+app.contactSensors = null
+// The byte cap skips an entry that doesn't fit and keeps going, in order
+def smallD = { String id -> [deviceId: id, lastActivity: 1L, attributes: [lock: 'locked']] }
+Map bigD = [deviceId: '2', lastActivity: 1L, attributes: [battery: 100, temperature: 68.5, humidity: 40, illuminance: 1000, contact: 'closed', lock: 'unlocked with timeout']]
+int smallLen = JsonOutput.toJson(smallD('1')).length()
+List fit = app.devicesThatFit([smallD('1'), bigD, smallD('3'), smallD('4')], 60000 - (2 * smallLen + 1))
+check('byte cap: an entry too big is skipped, later ones that fit still go, in id order', fit*.deviceId == ['1', '3'])
+check('byte cap: everything fits with room to spare', app.devicesThatFit([smallD('1'), bigD], 100)*.deviceId == ['1', '2'])
+// Reading the selections fails: device states left out, the rest of the report sent
+app.locks = [front]
+app.controlSwitches = new UnreadableList()
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+app.controlSwitches = null
+check('devices: selections unreadable, report still sent with locks and apps, no devices field', reports().size() == 1 &&
+    lastReport().locks*.deviceId == ['57'] && lastReport().apps && !lastReport().containsKey('devices') && validateReport(lastReport()).isEmpty())
+check('devices: the failure is logged by class name only', app.logged.contains('SignalBricks Telemetry: device states left out of the hub report (IllegalStateException)') &&
+    !app.logged.any { it.contains('24681357') })
 
 // --- The announcement handling never breaks anything else ---
 app.locks = [front]

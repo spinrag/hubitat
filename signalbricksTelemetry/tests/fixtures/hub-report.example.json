@@ -39,5 +39,10 @@
       "managed": true,
       "codeLock": true
     }
+  ],
+  "devices": [
+    { "deviceId": "57", "lastActivity": 1793317000000, "attributes": { "lock": "locked", "battery": 85 } },
+    { "deviceId": "63", "lastActivity": 1793310000000, "attributes": { "contact": "closed", "battery": 92, "temperature": 68.5 } },
+    { "deviceId": "71", "lastActivity": 1793290000000, "attributes": { "motion": "inactive", "battery": 100 } }
   ]
 }

@@ -84,6 +84,7 @@ class FakeDevice {
     Boolean throwOnCommand = false
     Boolean hasCapability(String c) { caps.contains(c) }
     Boolean hasCommand(String c) { commands.contains(c) }
+    Boolean hasAttribute(String a) { attrs.containsKey(a) }
     Date getLastActivity() { lastActivity }
     def currentValue(String a, Boolean skipCache = false) { reads << [a, skipCache]; attrs[a] }
     def invokeMethod(String m, def args) {
@@ -173,7 +174,7 @@ app.updated()
 check('Done: access token replaced', app.state.accessToken != tokenBefore && app.state.lockControlOn == true && app.state.deviceControlOn == null)
 Map reg = registers()[-1]
 check('Done: registers lockControl on, deviceControl off, with the new token', reg.lockControl == true && reg.deviceControl == false && reg.appAccessToken == app.state.accessToken &&
-    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.4')
+    reg.capabilities.containsAll(['lock_control', 'device_control']) && reg.version == '1.9.5')
 check('token replaced is logged without the token', app.logged.any { it == 'SignalBricks Telemetry: lock control turned on; access token rotated' } && !app.logged.any { it.contains('fake-app-token') })
 String tokenOn = app.state.accessToken
 app.updated()
@@ -426,6 +427,8 @@ check('telemetry: controlled devices report what their commands change', subs['2
     subs['21'].containsAll(['switch', 'level']) && subs['22'].contains('door') && subs['24'].containsAll(['thermostatMode', 'heatingSetpoint', 'coolingSetpoint']) && subs['25'].contains('valve'))
 check('telemetry: every selected lock reports lock state, never lockCodes', ['10', '12', '13', '14'].every { subs[it].contains('lock') } && !app.subscriptions.any { it.attribute == 'lockCodes' })
 check('telemetry: battery once per device', app.subscriptions.findAll { it.attribute == 'battery' }*.id.size() == app.subscriptions.findAll { it.attribute == 'battery' }*.id.unique().size())
+check('telemetry: the hub report\'s device states use the same attributes (signalbricks/platform#1533)',
+    app.subscribedAttributes().collectEntries { k, v -> [(k): v.attrs as Set] } == subs)
 
 // No code anywhere
 String everything = (app.posts.collect { it.params.body } + app.logged + responses.collect { it.data?.toString() }).join('\n')
