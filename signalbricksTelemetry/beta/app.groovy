@@ -243,12 +243,13 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int REPORT_NAME_MAX = 64
 @Field static final List<String> REPORT_LOCK_STATES = ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed']
 // Device states (signalbricks/platform#1533): the attributes devices[] may
-// carry, each sent as a number or a word. Nothing about codes or names.
+// carry, each a number or one of the platform's words. Nothing about codes or names.
 @Field static final int MAX_REPORT_DEVICES = 200
-@Field static final Map<String, String> DEVICE_STATE_ATTRS = [
+@Field static final Map<String, Object> DEVICE_STATE_ATTRS = [
     battery: 'number', temperature: 'number', humidity: 'number', illuminance: 'number',
-    contact: 'word', motion: 'word', acceleration: 'word', water: 'word', smoke: 'word',
-    carbonMonoxide: 'word', tamper: 'word', presence: 'word', switch: 'word', lock: 'word',
+    contact: ['open', 'closed'], motion: ['active', 'inactive'], acceleration: ['active', 'inactive'], water: ['wet', 'dry'],
+    smoke: ['clear', 'detected', 'tested'], carbonMonoxide: ['clear', 'detected', 'tested'], tamper: ['clear', 'detected'],
+    presence: ['present', 'not present'], switch: ['on', 'off'], lock: REPORT_LOCK_STATES,
 ]
 // A new or changed app announcement is reported this long after it arrives.
 @Field static final int APP_INFO_REPORT_DELAY_SECONDS = 60
@@ -1756,7 +1757,7 @@ Map deviceState(d, Collection subscribed) {
     Long last = d.getLastActivity()?.getTime()
     if (last == null) return null
     Map attrs = [:]
-    DEVICE_STATE_ATTRS.each { String name, String kind ->
+    DEVICE_STATE_ATTRS.each { String name, kind ->
         if (!subscribed.contains(name) || !d.hasAttribute(name)) return
         def v = d.currentValue(name)
         if (v == null) return
@@ -1764,14 +1765,26 @@ Map deviceState(d, Collection subscribed) {
             BigDecimal n = reportNumber(v)
             if (n != null) attrs[name] = n
         } else {
-            attrs[name] = v.toString()
+            // Only the platform's words; anything else is left out
+            String word = v.toString().trim()
+            if (kind.contains(word.toLowerCase())) attrs[name] = word
         }
     }
     return attrs ? [deviceId: d.id.toString(), lastActivity: last, attributes: attrs] : null
 }
 
-// Up to 200 device states, by device id
+// Up to 200 device states, by device id. A failure leaves them all out; the
+// rest of the report is still sent.
 List reportDevices() {
+    try {
+        return deviceStates()
+    } catch (Exception e) {
+        log.warn "SignalBricks Telemetry: device states left out of the hub report (${e.class.simpleName})"
+        return []
+    }
+}
+
+List deviceStates() {
     Map subs = subscribedAttributes()
     List ids = subs.keySet().findAll { it ==~ /[0-9]{1,20}/ }.sort { a, b -> a.length() <=> b.length() ?: a <=> b }
     List out = []
@@ -1820,6 +1833,19 @@ Map buildHubReport(String reason) {
     ]
 }
 
+// The device states that keep a report of `size` bytes (with an empty
+// devices[]) under REPORT_MAX_BYTES, in order: one that doesn't fit is skipped
+List devicesThatFit(List devices, int size) {
+    List kept = []
+    for (Map d in devices) {
+        int add = utf8Length(JsonOutput.toJson(d)) + (kept ? 1 : 0)
+        if (size + add > REPORT_MAX_BYTES) continue
+        kept << d
+        size += add
+    }
+    return kept
+}
+
 int utf8Length(String s) {
     return s.getBytes('UTF-8').length
 }
@@ -1842,13 +1868,7 @@ String hubReportBody(String reason) {
     List devices = reportDevices()
     if (!devices) return JsonOutput.toJson(report)
     report.devices = []
-    size = utf8Length(JsonOutput.toJson(report))
-    for (Map d in devices) {
-        int add = utf8Length(JsonOutput.toJson(d)) + (report.devices ? 1 : 0)
-        if (size + add > REPORT_MAX_BYTES) break
-        report.devices << d
-        size += add
-    }
+    report.devices = devicesThatFit(devices, utf8Length(JsonOutput.toJson(report)))
     if (report.devices.size() < devices.size()) log.warn "SignalBricks Telemetry: hub report too large, sending ${report.devices.size()} of ${devices.size()} device states"
     if (!report.devices) report.remove('devices')
     return JsonOutput.toJson(report)

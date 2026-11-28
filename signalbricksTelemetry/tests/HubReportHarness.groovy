@@ -123,6 +123,12 @@ class FakeLock {
     Date getLastActivity() { lastActivity }
 }
 
+// A selection that can't be read: iterating it throws
+class UnreadableList extends ArrayList {
+    UnreadableList() { super([new FakeLock(id: '1')]) }
+    Iterator iterator() { throw new IllegalStateException('unreadable 24681357') }
+}
+
 // A device the app can't read: reportLock throws
 class UnreadableLock extends FakeLock {
     def currentValue(String a, Boolean skipCache = false) { throw new IllegalStateException('unreadable') }
@@ -619,6 +625,33 @@ app.contactSensors = null
 app.posts.clear()
 app.dailyCheckIn()
 check('devices: unreadable device left out, report still sent', lastReport().devices == [[deviceId: '8', lastActivity: 1_793_317_000_000L, attributes: [lock: 'unlocked']]])
+// Words: only the platform's, trimmed; a longer or unknown value is left out
+app.locks = [new FakeLock(id: '9', displayName: 'L', typeName: 'Z', attrs: [lock: ' Locked ', battery: 50], lastActivity: new Date(1_793_317_000_000L)),
+    new FakeLock(id: '10', displayName: 'L', typeName: 'Z', attrs: [lock: 'locked' + (' ' * 30) + 'x', battery: 40], lastActivity: new Date(1_793_317_000_000L)),
+    new FakeLock(id: '11', displayName: 'L', typeName: 'Z', attrs: [lock: 'x' * 40], lastActivity: new Date(1_793_317_000_000L))]
+app.contactSensors = [new FakeLock(id: '12', displayName: 'S', typeName: 'Z', attrs: [contact: 'ajar', battery: 30], lastActivity: new Date(1_793_317_000_000L))]
+app.posts.clear()
+app.dailyCheckIn()
+check("devices: words checked against the platform's lists (${lastReport().devices})", lastReport().devices*.attributes == [[battery: 50, lock: 'Locked'], [battery: 40], [battery: 30]] &&
+    validateReport(lastReport()).isEmpty())
+app.contactSensors = null
+// The byte cap skips an entry that doesn't fit and keeps going, in order
+def smallD = { String id -> [deviceId: id, lastActivity: 1L, attributes: [lock: 'locked']] }
+Map bigD = [deviceId: '2', lastActivity: 1L, attributes: [battery: 100, temperature: 68.5, humidity: 40, illuminance: 1000, contact: 'closed', lock: 'unlocked with timeout']]
+int smallLen = JsonOutput.toJson(smallD('1')).length()
+List fit = app.devicesThatFit([smallD('1'), bigD, smallD('3'), smallD('4')], 60000 - (2 * smallLen + 1))
+check('byte cap: an entry too big is skipped, later ones that fit still go, in id order', fit*.deviceId == ['1', '3'])
+check('byte cap: everything fits with room to spare', app.devicesThatFit([smallD('1'), bigD], 100)*.deviceId == ['1', '2'])
+// Reading the selections fails: device states left out, the rest of the report sent
+app.locks = [front]
+app.controlSwitches = new UnreadableList()
+app.posts.clear(); app.logged.clear()
+app.dailyCheckIn()
+app.controlSwitches = null
+check('devices: selections unreadable, report still sent with locks and apps, no devices field', reports().size() == 1 &&
+    lastReport().locks*.deviceId == ['57'] && lastReport().apps && !lastReport().containsKey('devices') && validateReport(lastReport()).isEmpty())
+check('devices: the failure is logged by class name only', app.logged.contains('SignalBricks Telemetry: device states left out of the hub report (IllegalStateException)') &&
+    !app.logged.any { it.contains('24681357') })
 
 // --- The announcement handling never breaks anything else ---
 app.locks = [front]
