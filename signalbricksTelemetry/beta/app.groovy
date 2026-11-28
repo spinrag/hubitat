@@ -95,7 +95,10 @@
  * service's /report: its version and ceiling, those app infos, the hub's
  * firmware, uptime and time zone, and per lock its battery, lock state,
  * maxCodes, code length, driver and the NUMBER of occupied code slots. Never
- * a code, code name, token or guest name. Contract: the platform's
+ * a code, code name, token or guest name. Since 1.9.5 it also carries the
+ * current state of each device the app sends events for (allow-listed
+ * attributes only, no names), so SignalBricks can repair a lost event
+ * (signalbricks/platform#1533). Contract: the platform's
  * docs/hub-reporting.md.
  *
  * Setup uses Hubitat's documented OAuth "stateredirect" pattern with
@@ -131,7 +134,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 @Field static final String APP_NAME = 'SignalBricks Telemetry'
-@Field static final String APP_VERSION = '1.9.4'
+@Field static final String APP_VERSION = '1.9.5'
 @Field static final String SB_PORTAL_URL = 'https://app.signalbricks.co'
 // Public OAuth client (this source is public): no client secret. Each connect
 // is protected by PKCE (S256) plus a signed-in SignalBricks admin's consent.
@@ -239,6 +242,14 @@ import javax.crypto.spec.SecretKeySpec
 @Field static final int REPORT_MAX_BYTES = 60000
 @Field static final int REPORT_NAME_MAX = 64
 @Field static final List<String> REPORT_LOCK_STATES = ['locked', 'unlocked', 'unlocked with timeout', 'unknown', 'jammed']
+// Device states (signalbricks/platform#1533): the attributes devices[] may
+// carry, each sent as a number or a word. Nothing about codes or names.
+@Field static final int MAX_REPORT_DEVICES = 200
+@Field static final Map<String, String> DEVICE_STATE_ATTRS = [
+    battery: 'number', temperature: 'number', humidity: 'number', illuminance: 'number',
+    contact: 'word', motion: 'word', acceleration: 'word', water: 'word', smoke: 'word',
+    carbonMonoxide: 'word', tamper: 'word', presence: 'word', switch: 'word', lock: 'word',
+]
 // A new or changed app announcement is reported this long after it arrives.
 @Field static final int APP_INFO_REPORT_DELAY_SECONDS = 60
 
@@ -1721,6 +1732,61 @@ List reportLocks() {
     }
 }
 
+// The attributes subscribeToEvents() subscribes to, by device id: [device, attrs]
+Map subscribedAttributes() {
+    Map out = [:]
+    def add = { devs, Collection attrs ->
+        (devs ?: []).each { d ->
+            String id = d.id.toString()
+            if (!out[id]) out[id] = [device: d, attrs: [] as Set]
+            out[id].attrs.addAll(attrs)
+        }
+    }
+    add(allLocks(), ['lock', 'lastCodeName', 'battery'])
+    add(contactSensors, ['contact', 'battery'])
+    add(temperatureSensors, ['temperature', 'battery'])
+    add(humiditySensors, ['humidity', 'battery'])
+    controlledDevices().values().each { Map c -> add([c.device], c.caps.collectMany { CONTROL_ATTRIBUTES[it] } + ['battery']) }
+    return out
+}
+
+// One devices[] entry: the device's allow-listed, subscribed attributes, or
+// null when it has no last activity or none of them has a value
+Map deviceState(d, Collection subscribed) {
+    Long last = d.getLastActivity()?.getTime()
+    if (last == null) return null
+    Map attrs = [:]
+    DEVICE_STATE_ATTRS.each { String name, String kind ->
+        if (!subscribed.contains(name) || !d.hasAttribute(name)) return
+        def v = d.currentValue(name)
+        if (v == null) return
+        if (kind == 'number') {
+            BigDecimal n = reportNumber(v)
+            if (n != null) attrs[name] = n
+        } else {
+            attrs[name] = v.toString()
+        }
+    }
+    return attrs ? [deviceId: d.id.toString(), lastActivity: last, attributes: attrs] : null
+}
+
+// Up to 200 device states, by device id
+List reportDevices() {
+    Map subs = subscribedAttributes()
+    List ids = subs.keySet().findAll { it ==~ /[0-9]{1,20}/ }.sort { a, b -> a.length() <=> b.length() ?: a <=> b }
+    List out = []
+    for (String id in ids) {
+        if (out.size() >= MAX_REPORT_DEVICES) break
+        try {
+            Map e = deviceState(subs[id].device, subs[id].attrs)
+            if (e) out << e
+        } catch (Exception e) {
+            // One unreadable device doesn't hold up the report
+        }
+    }
+    return out
+}
+
 Map reportHub() {
     Map hub = [:]
     String firmware = hubFirmwareVersion()
@@ -1758,20 +1824,33 @@ int utf8Length(String s) {
     return s.getBytes('UTF-8').length
 }
 
-// The report as JSON, under REPORT_MAX_BYTES: locks are left out from the end if needed
+// The report as JSON, under REPORT_MAX_BYTES: locks are left out from the end
+// if needed, then device states are added while they fit
 String hubReportBody(String reason) {
     Map report = buildHubReport(reason)
-    String body = JsonOutput.toJson(report)
-    int size = utf8Length(body)
-    if (size <= REPORT_MAX_BYTES) return body
-    List all = report.locks
-    int keep = all.size()
-    while (keep > 0 && size > REPORT_MAX_BYTES) {
-        keep--
-        size -= utf8Length(JsonOutput.toJson(all[keep])) + 1
+    int size = utf8Length(JsonOutput.toJson(report))
+    if (size > REPORT_MAX_BYTES) {
+        List all = report.locks
+        int keep = all.size()
+        while (keep > 0 && size > REPORT_MAX_BYTES) {
+            keep--
+            size -= utf8Length(JsonOutput.toJson(all[keep])) + 1
+        }
+        report.locks = all.take(keep)
+        log.warn "SignalBricks Telemetry: hub report too large, sending ${keep} of ${all.size()} locks"
     }
-    report.locks = all.take(keep)
-    log.warn "SignalBricks Telemetry: hub report too large, sending ${keep} of ${all.size()} locks"
+    List devices = reportDevices()
+    if (!devices) return JsonOutput.toJson(report)
+    report.devices = []
+    size = utf8Length(JsonOutput.toJson(report))
+    for (Map d in devices) {
+        int add = utf8Length(JsonOutput.toJson(d)) + (report.devices ? 1 : 0)
+        if (size + add > REPORT_MAX_BYTES) break
+        report.devices << d
+        size += add
+    }
+    if (report.devices.size() < devices.size()) log.warn "SignalBricks Telemetry: hub report too large, sending ${report.devices.size()} of ${devices.size()} device states"
+    if (!report.devices) report.remove('devices')
     return JsonOutput.toJson(report)
 }
 

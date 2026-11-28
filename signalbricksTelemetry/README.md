@@ -21,6 +21,7 @@ Highlights by version:
 - **1.9.2** booking codes under the OwnerRez app's `GO:` prefix are protected as well, and the daily hub report includes SignalBricks Integration's previous code name prefix.
 - **1.9.3** the daily hub report says which locks are managed and which hold door codes, so SignalBricks counts keypad locks correctly.
 - **1.9.4** registration includes the hub's local address, so SignalBricks can reach the hub without Hubitat cloud where your setup allows it.
+- **1.9.5** the daily hub report includes the current state of the devices the app sends events for, so SignalBricks can correct a state whose event was lost.
 
 ## Requirements
 
@@ -144,6 +145,7 @@ Since 1.6.0 the app sends SignalBricks a short report about the hub once a day, 
 - the versions and slot settings of SignalBricks Telemetry and of booking apps on the hub that announce themselves;
 - hub firmware, uptime and time zone;
 - for each selected lock: battery, lock state, jammed, capacity, driver, the **number** of occupied slots, and (since 1.9.3) whether it's managed and holds door codes.
+- (since 1.9.5) the current state of each device the app sends events for: when it was last active and the values of the attributes it already sends as events (for example battery, contact, temperature, lock), never its name or anything about codes. SignalBricks uses it to correct a state whose event didn't arrive.
 
 It never contains codes, code names or guest names. SignalBricks raises alerts from it, for example when a booking app's slots overlap the ones SignalBricks manages, a lock is jammed or low on battery, or the hub stops reporting. A report that fails is retried a few times, and the **Connection** section shows the error.
 
